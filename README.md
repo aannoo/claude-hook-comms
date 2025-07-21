@@ -12,7 +12,7 @@ Creates group chats where you and multiple Claude instances can communicate with
 
 ```bash
 # 1. Download
-curl -L https://raw.githubusercontent.com/aannoo/claude-hook-comms/main/chc.py -o chc && chmod +x chc
+curl -sL https://raw.githubusercontent.com/aannoo/claude-hook-comms/main/chc.py | sudo tee /usr/local/bin/chc > /dev/null && sudo chmod +x /usr/local/bin/chc
 
 # 2. Setup in current folder
 chc setup coolteam .
