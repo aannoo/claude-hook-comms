@@ -10,12 +10,15 @@ Creates group chats where you and multiple Claude instances can communicate with
 
 ## 🎪 Quick Start
 
+#### Download
 ```bash
-# 1. Download
 curl -sL https://raw.githubusercontent.com/aannoo/claude-hook-comms/main/chc.py | sudo tee /usr/local/bin/chc > /dev/null && sudo chmod +x /usr/local/bin/chc
+```
+```bash
+# 1. Setup in current folder
+chc setup coolgroup .
 
-# 2. Setup in current folder
-chc setup coolteam .
+# 2. Start claude
 claude 'say hi'  # Terminal 1
 claude 'say hi'  # Terminal 2
 
@@ -31,15 +34,10 @@ chc
 Invoke-WebRequest -Uri "https://raw.githubusercontent.com/aannoo/claude-hook-comms/main/chc.py" -OutFile "chc.py"
 
 # Run python file directly
-python path/to/chc.py setup team folder1
+python path/to/chc.py setup coolgroup folder1
 ```
 </details>
 
-
-## 🦐 Requirements
-
-- Python 3.6+
-- [Claude Code](https://claude.ai/code)
 
 ## 🥨 Commands
 
@@ -56,7 +54,13 @@ python path/to/chc.py setup team folder1
 | `chc send <group> <message>` | Send message from CLI |
 | `chc watch <group>` | View group status (non-interactive) |
 | `chc watch <group> --logs` | View message history (non-interactive) |
+| `chc watch <group> --logs --wait [timeout]` | Wait and notify for new messages |
 
+
+## 🦐 Requirements
+
+- Python 3.6+
+- [Claude Code](https://claude.ai/code)
 
 <details>
 <summary><strong>🦖 Configuration</strong></summary>
@@ -94,6 +98,8 @@ export CHC_CLI_HINTS=""                  # Appended to CLI outputs
 <details>
 <summary><strong>🎲 How It Works</strong></summary>
 
+## Hooks!
+
 CHC adds hooks to your project directory's `.claude/settings.local.json`:
 
 1. **Sending**: Claude writes messages with `echo "CHC_SEND:message"` - captured by PostToolUse hook
@@ -105,7 +111,7 @@ CHC adds hooks to your project directory's `.claude/settings.local.json`:
 - **Status Detection**: Notification hook tracks permission requests and activity
 
 ### Group Structure
-- **Groups** organize communication channels (e.g., `team`, `project-cool`)
+- **Groups** organize communication channels (e.g., `team1`, `project-cool`)
 - **Folders** can be configured to participate in a group via `chc setup`
 - **Claude instances** in configured folders automatically join their group's conversation
 - Multiple folders can share the same group, enabling cross-directory collaboration
@@ -145,7 +151,8 @@ Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd C:\project\fro
 <details>
 <summary><strong>🥚 Troubleshooting</strong></summary>
 
-**Issues:**
+ ## Issues 
+
 - **No messages received**: Run `chc setup <group> <folder(s)>` before starting Claude
 - **Claude stops responding**: Default idle timeout is 10 minutes (configure via `CHC_WAIT_TIMEOUT`)
 - **Message truncated**: Message size limit is 4096 chars (configure via `CHC_MAX_MESSAGE_SIZE`)

@@ -280,7 +280,13 @@ def update_instance_position(group, instance, update_fields):
     positions = load_positions(pos_file)
     
     pos_data = positions.get(instance, {})
-    pos_data.update(update_fields)
+    
+    # Only update fields that actually changed
+    for key, value in update_fields.items():
+        if key == "session_id" and value and value == pos_data.get("session_id"):
+            continue  # Skip if session_id hasn't changed
+        pos_data[key] = value
+    
     positions[instance] = pos_data
     atomic_write(pos_file, json.dumps(positions, indent=2))
 
@@ -707,7 +713,10 @@ def show_instances_by_directory(group):
                 last_tool_name = pos_data.get("last_tool_name", "unknown")
                 last_tool_str = datetime.datetime.fromtimestamp(last_tool).strftime("%H:%M:%S") if last_tool else "unknown"
                 
-                print(f"   {FG_GREEN}->{RESET} {BOLD}{instance_name}{RESET} {status_block} {DIM}{status_type} {age} - last tool use: {last_tool_name} {last_tool_str}{RESET}")
+                sid = pos_data.get("session_id", "")
+                session_info = f" | {sid}" if sid else ""
+                
+                print(f"   {FG_GREEN}->{RESET} {BOLD}{instance_name}{RESET} {status_block} {DIM}{status_type} {age}- used {last_tool_name} at {last_tool_str}{session_info}{RESET}")
             print()
     else:
         print(f"   {DIM}Error reading instance data{RESET}")
@@ -887,7 +896,8 @@ def handle_hook_post():
                 "last_tool": int(time.time()),
                 "last_tool_name": tool_name,
                 "transcript_path": transcript_path,
-                "conversation_uuid": conversation_uuid
+                "conversation_uuid": conversation_uuid,
+                "session_id": hook_data.get('session_id', '')
             })
         
         # Check for CHC_SEND pattern in Bash commands first
@@ -936,7 +946,8 @@ def handle_hook_notification():
             update_instance_position(group, instance, {
                 "last_permission_request": int(time.time()),
                 "notification_message": hook_data.get('message', ''),
-                "transcript_path": transcript_path
+                "transcript_path": transcript_path,
+                "session_id": hook_data.get('session_id', '')
             })
             
             # Show welcome message if needed
@@ -962,7 +973,7 @@ def format_hook_messages(messages, instance):
 def handle_hook_stop():
     """Handle Stop hook - check for messages and wait"""
     try:
-        _, conversation_uuid, instance, group, transcript_path = parse_hook_input()
+        hook_data, conversation_uuid, instance, group, transcript_path = parse_hook_input()
         
         if not group or not instance:
             return
@@ -973,9 +984,10 @@ def handle_hook_stop():
         # Initialize instance in position file if needed
         initialize_instance_in_position_file(group, instance, conversation_uuid)
         
-        # Update transcript path for status tracking
+        # Update transcript path and session_id for status tracking
         update_instance_position(group, instance, {
-            "transcript_path": transcript_path
+            "transcript_path": transcript_path,
+            "session_id": hook_data.get('session_id', '')
         })
         
         # Check for unread messages
@@ -1045,6 +1057,7 @@ def show_help():
     print("Non-interactive commands:")
     print("  chc watch <group>             - View group status")
     print("  chc watch <group> --logs      - View message history")
+    print("  chc watch <group> --logs --wait [timeout] - Wait for new messages")
     print(f"  chc send <group> <msg>        - Send message as {SENDER_NAME}")
     print()
     print("Conversation log files stored in ~/.chc/{group}.log")
@@ -1089,11 +1102,19 @@ def main():
             sys.exit(1)
             
     elif cmd == 'watch':
-        require_args(3, "chc watch <group> [--logs]", "For interactive dashboard, use: chc")
+        require_args(3, "chc watch <group> [--logs] [--wait [timeout]]", "For interactive dashboard, use: chc")
             
         group = sys.argv[2]
         
         show_logs_only = '--logs' in sys.argv[3:]
+        
+        # Parse wait timeout if provided
+        wait_timeout = None
+        if '--wait' in sys.argv[3:]:
+            wait_timeout = WAIT_TIMEOUT  # default
+            wait_idx = sys.argv.index('--wait')
+            if wait_idx + 1 < len(sys.argv) and sys.argv[wait_idx + 1].isdigit():
+                wait_timeout = int(sys.argv[wait_idx + 1])
         
         try:
             group = validate_group_name(group)
@@ -1101,6 +1122,18 @@ def main():
             if not is_interactive():
                 if show_logs_only:
                     log_file = get_log_file(group)
+                    
+                    # Wait for new messages if requested
+                    if wait_timeout is not None and log_file.exists():
+                        initial_size = log_file.stat().st_size
+                        start_time = time.time()
+                        
+                        while log_file.stat().st_size == initial_size:
+                            if time.time() - start_time > wait_timeout:
+                                print(f"Timeout after {wait_timeout}s waiting for new messages")
+                                sys.exit(1)
+                            time.sleep(0.5)
+                    
                     if log_file.exists():
                         messages = parse_log_messages(log_file)
                         for msg in messages[-20:]:
