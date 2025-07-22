@@ -4,16 +4,17 @@ Lightweight CLI tool for real-time messaging between Claude Code instances using
 
 ## 🦆 What It Does
 
-Creates group chats where you and multiple Claude instances can communicate with each other across different folders on your computer. Works on Mac, Linux, and Windows with zero dependencies.
+Creates group chats where you and multiple Claude Code instances can communicate with each other across different folders on your computer. Works on Mac, Linux, and Windows with zero dependencies.
 
-![CHC Example](screenshot.jpg)
+![Claude Hook Comms Example](screenshot.jpg)
 
 ## 🎪 Quick Start
 
-#### Download
+#### Download:
 ```bash
 curl -sL https://raw.githubusercontent.com/aannoo/claude-hook-comms/main/chc.py | sudo tee /usr/local/bin/chc > /dev/null && sudo chmod +x /usr/local/bin/chc
 ```
+#### Usage:
 ```bash
 # 1. Setup in current folder
 chc setup coolgroup .
@@ -39,28 +40,30 @@ python path/to/chc.py setup coolgroup folder1
 </details>
 
 
+## 🦐 Requirements
+
+- Python 3.6+
+- [Claude Code](https://claude.ai/code)
+
+
 ## 🥨 Commands
 
 ### Core Commands
 | Command | Description |
 |---------|-------------|
-| `chc` | Interactive dashboard for messaging and status |
+| `chc` | Dashboard for messaging and status |
 | `chc setup <group> <folder(s)>` | Configure folders for group |
 | `chc delete <group>` | Delete group and conversation history |
 
 ### Automation Commands (for scripts/Claude)
 | Command | Description |
 |---------|-------------|
-| `chc send <group> <message>` | Send message from CLI |
+| `chc send <group> <message>` | Send message |
 | `chc watch <group>` | View group status (non-interactive) |
 | `chc watch <group> --logs` | View message history (non-interactive) |
 | `chc watch <group> --logs --wait [timeout]` | Wait and notify for new messages |
 
-
-## 🦐 Requirements
-
-- Python 3.6+
-- [Claude Code](https://claude.ai/code)
+---
 
 <details>
 <summary><strong>🦖 Configuration</strong></summary>
@@ -130,7 +133,7 @@ your-project/
 </details>
 
 <details>
-<summary><strong>🧈 Launching Claude Instances</strong></summary>
+<summary><strong>🧈 Launching Claude Code</strong></summary>
 
 ## Spawning Claude Instances
 
@@ -177,12 +180,12 @@ cat ~/.chc/myteam.json
 
 **Remove a group:**
 ```bash
-chc delete teamname
+chc delete coolgroup
 ```
 
 **Remove CHC completely:**
 1. Remove CHC: `rm /usr/local/bin/chc` (or wherever you installed chc)
-2. Remove data: `rm -rf ~/.chc`
+2. Remove all data: `rm -rf ~/.chc`
 
 </details>
 
