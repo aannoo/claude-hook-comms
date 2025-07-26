@@ -30,9 +30,9 @@ BG_RED = "\033[41m"
 # Configurable constants
 WAIT_TIMEOUT = int(os.environ.get('CHC_WAIT_TIMEOUT', '600'))  # How long Stop hook waits (seconds)
 MAX_MESSAGE_SIZE = int(os.environ.get('CHC_MAX_MESSAGE_SIZE', '4096'))  # Message size limit
-SENDER_NAME = os.environ.get('CHC_SENDER_NAME', 'bigboss')  # CLI sender name
+SENDER_NAME = os.environ.get('CHC_SENDER_NAME', 'bigboss').replace('|', '_')  # CLI sender name
 MAX_MESSAGES_PER_DELIVERY = int(os.environ.get('CHC_MAX_MESSAGES_PER_DELIVERY', '20'))  # 0 for unlimited
-FIRST_USE_TEXT = os.environ.get('CHC_FIRST_USE_TEXT', 'Essential messages only. Say hi in chc chat')  # Group rules shown on first use
+FIRST_USE_TEXT = os.environ.get('CHC_FIRST_USE_TEXT', 'Essential, concise messages only. Say hi in chc chat')  # Group rules shown on first use
 SENDER_EMOJI = os.environ.get('CHC_SENDER_EMOJI', '🐳')  # Emoji for CLI sender (no space)
 CLI_HINTS = os.environ.get('CHC_CLI_HINTS', '')  # Appended to CLI outputs (chc send, setup, etc)
 INSTANCE_HINTS = os.environ.get('CHC_INSTANCE_HINTS', '')  # Appended to instance messages
@@ -66,7 +66,8 @@ def get_conversation_uuid(transcript_path):
 
 def get_display_name(transcript_path):
     syls = ['ka', 'ko', 'ma', 'mo', 'na', 'no', 'ra', 'ro', 'sa', 'so', 'ta', 'to', 'va', 'vo', 'za', 'zo', 'be', 'de', 'fe', 'ge', 'le', 'me', 'ne', 're', 'se', 'te', 've', 'we', 'hi']
-    dir_chars = Path.cwd().name[:2].lower()
+    dir_name = Path.cwd().name
+    dir_chars = (dir_name + 'xx')[:2].lower()  # Pad short names to ensure 2 chars
     
     conversation_uuid = get_conversation_uuid(transcript_path)
     
