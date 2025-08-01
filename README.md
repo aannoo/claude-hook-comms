@@ -1,43 +1,45 @@
-# Claude Hook Comms
+# Claude Code Hook Comms
 
-Lightweight CLI tool for real-time messaging between Claude Code instances using [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks).
+Lightweight CLI tool for real-time communication between claude code [subagents](https://docs.anthropic.com/en/docs/claude-code/sub-agents) using [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks).
 
 ## 🦆 What It Does
 
-Creates group chats where you and multiple Claude Code instances can communicate with each other across different folders on your computer. Works on Mac, Linux, and Windows with zero dependencies.
+Creates a group chat where you and multiple interactive Claude Code subagents can communicate with each other across different folders on your computer. Works on Mac, Linux, and Windows with zero dependencies.
 
-![Claude Hook Comms Example](screenshot.jpg)
+![Claude Hook Comms Example](https://raw.githubusercontent.com/aannoo/claude-hook-comms/main/screenshot.jpg)
+
+## 🦷 Features
+
+- **Multi-Terminal Launch** - Launch claude code subagents in new terminals
+- **Live Dashboard** - Real-time monitoring of all instances
+- **Multi-Agent Communication** - Claude instances talk to each other across projects
+- **@Mention Targeting** - Send messages to specific subagents or teams
+- **Zero Dependencies** - Pure Python stdlib, works everywhere
 
 ## 🎪 Quick Start
 
-#### Download:
+### Use Without Installing
 ```bash
-curl -sL https://raw.githubusercontent.com/aannoo/claude-hook-comms/main/chc.py | sudo tee /usr/local/bin/chc > /dev/null && sudo chmod +x /usr/local/bin/chc
+# Launch 3 default Claude instances connected to group chat
+uvx hcom open 3
+
+# Launch researcher and code-writer from your .claude/agents
+uvx hcom open researcher code-writer
+
+# View/send messages in dashboard
+uvx hcom watch
 ```
-#### Usage:
+
+### Install
+
 ```bash
-# 1. Setup in current folder
-chc setup coolgroup .
-
-# 2. Start claude
-claude 'say hi'  # Terminal 1
-claude 'say hi'  # Terminal 2
-
-# 3. View messages
-chc
+# uv
+uv tool install hcom
+# or pip
+pip install hcom
+# then use with:
+hcom open 3
 ```
-
-<details>
-<summary><strong>🦑 Windows</strong></summary>
-
-```powershell
-# Download Python file
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/aannoo/claude-hook-comms/main/chc.py" -OutFile "chc.py"
-
-# Run python file directly
-python path/to/chc.py setup coolgroup folder1
-```
-</details>
 
 
 ## 🦐 Requirements
@@ -46,47 +48,107 @@ python path/to/chc.py setup coolgroup folder1
 - [Claude Code](https://claude.ai/code)
 
 
+## 🗿 More Examples
+
+```bash
+# Launch 2 generic instances + 2 specific agents
+hcom open 2 backend-coder frontend-coder
+
+# Launch multiple of the same agent
+hcom open reviewer reviewer reviewer  # 3 separate reviewers
+
+# Launch agents in background with specific prompts
+hcom open test-writer --claude-args "-p 'write tests for any new code'"
+
+# Launch watchers that respond to notifications
+hcom open reviewer --claude-args "-p 'review when @mentioned'"
+
+# Pass multiple Claude flags
+hcom open orchestrator --claude-args "--model claude-3-opus 
+--resume session_id"
+
+# Launch in specific directories
+cd backend && hcom open api-specialist
+cd ../frontend && hcom open ui-specialist
+
+# Create named teams that can be @mentioned
+cd ~/api && hcom open --prefix api debugger
+cd ~/auth && hcom open --prefix auth debugger
+
+# Message specific teams
+hcom send "@api login works but API fails" # or in dashboard: hcom watch
+```
+
+
 ## 🥨 Commands
 
-### Core Commands
 | Command | Description |
 |---------|-------------|
-| `chc` | Dashboard for messaging and status |
-| `chc setup <group> <folder(s)>` | Configure folders for group |
-| `chc delete <group>` | Delete group and conversation history |
+| `hcom open [n]` | Launch n Claude instances (or named agents) |
+| `hcom watch` | Conversation/status dashboard |
+| `hcom clear` | Clear and archive conversation |
+| `hcom cleanup` | Remove HCOM hooks from current directory |
 
-### Automation Commands (for scripts/Claude)
+### Automation Commands
 | Command | Description |
 |---------|-------------|
-| `chc send <group> <message>` | Send message |
-| `chc watch <group>` | View group status (non-interactive) |
-| `chc watch <group> --logs` | View message history (non-interactive) |
-| `chc watch <group> --logs --wait [timeout]` | Wait and notify for new messages |
+| `hcom send 'message'` | Send message |
+| `hcom watch --logs` | View message history (non-interactive) |
+| `hcom watch --status` | Show instance status (non-interactive) |
+| `hcom watch --wait [timeout]` | Wait and notify for new messages |
 
 ---
 
 <details>
 <summary><strong>🦖 Configuration</strong></summary>
 
-### Environment Variables
+### Configuration
 
-Set these in your shell (temporary) before running CHC commands or launching Claude:
+Settings can be changed two ways:
+
+#### Method 1: Environment variable (temporary, per-command/instance)
+
 
 ```bash
-# Claude instance behavior
-# (you can also modify these per folder in .claude/settings.local.json)
-export CHC_WAIT_TIMEOUT=600              # How long Claude waits in seconds
-export CHC_MAX_MESSAGE_SIZE=4096         # Max message length in chars
-export CHC_MAX_MESSAGES_PER_DELIVERY=20  # Messages per delivery (0=unlimited)
-export CHC_FIRST_USE_TEXT="Brief msgs only"  # Welcome message
-export CHC_INSTANCE_HINTS=""             # Appended to Claude messages
-
-# CLI behavior
-export CHC_SENDER_NAME=coordinator       # CLI sender name (default: bigboss)
-export CHC_SENDER_EMOJI=🎯               # CLI sender emoji (default: 🐳)
-export CHC_CLI_HINTS=""                  # Appended to CLI outputs
+HCOM_INSTANCE_HINTS="always update chat with progress" hcom open nice-subagent-but-not-great-with-updates
 ```
 
+#### Method 2: Config file (persistent, affects all instances)
+
+### Config File Location
+
+`~/.hcom/config.json`
+
+| Setting | Default | Environment Variable | Description |
+|---------|---------|---------------------|-------------|
+| `wait_timeout` | 600 | `HCOM_WAIT_TIMEOUT` | How long instances wait for messages (seconds) |
+| `max_message_size` | 4096 | `HCOM_MAX_MESSAGE_SIZE` | Maximum message length |
+| `max_messages_per_delivery` | 20 | `HCOM_MAX_MESSAGES_PER_DELIVERY` | Messages delivered per batch |
+| `sender_name` | "bigboss" | `HCOM_SENDER_NAME` | Your name in chat |
+| `sender_emoji` | "🐳" | `HCOM_SENDER_EMOJI` | Your emoji icon |
+| `initial_prompt` | "Say hi" | `HCOM_INITIAL_PROMPT` | What new instances are told to do |
+| `first_use_text` | "Essential, concise messages only" | `HCOM_FIRST_USE_TEXT` | Welcome message for instances |
+| `terminal_mode` | "new_window" | `HCOM_TERMINAL_MODE` | How to launch terminals ("new_window", "same_terminal", "show_commands") |
+| `terminal_command` | null | `HCOM_TERMINAL_COMMAND` | Custom terminal command (see Terminal Options) |
+| `cli_hints` | "" | `HCOM_CLI_HINTS` | Extra text added to CLI outputs |
+| `instance_hints` | "" | `HCOM_INSTANCE_HINTS` | Extra text added to instance messages |
+| `env_overrides` | {} | - | Additional environment variables for Claude Code |
+
+### Examples
+
+```bash
+# Change your name for one command
+HCOM_SENDER_NAME="reviewer" hcom send "LGTM!"
+
+# Make instances wait 30 minutes instead of 10
+HCOM_WAIT_TIMEOUT=1800 hcom open 3
+
+# Custom welcome message
+HCOM_FIRST_USE_TEXT="Debug session for issue #123" hcom open 2
+
+# Bigger messages
+HCOM_MAX_MESSAGE_SIZE=8192 hcom send "$(cat long_report.txt)"
+```
 
 ### Status Indicators
 - ◉ **thinking** (cyan) - Processing input
@@ -101,91 +163,135 @@ export CHC_CLI_HINTS=""                  # Appended to CLI outputs
 <details>
 <summary><strong>🎲 How It Works</strong></summary>
 
-## Hooks!
+### Hooks!
 
-CHC adds hooks to your project directory's `.claude/settings.local.json`:
+hcom adds hooks to your project directory's `.claude/settings.local.json`:
 
-1. **Sending**: Claude writes messages with `echo "CHC_SEND:message"` - captured by PostToolUse hook
-2. **Receiving**: Other Claudes get notified in their PostToolUse hook
+1. **Sending**: Claude writes messages with `echo "HCOM_SEND:message"` - captured by PostToolUse hook
+2. **Receiving**: Other Claudes get notified via Stop hook
 3. **Waiting**: Stop hook keeps Claude in a waiting state for new messages
 
 - **Identity**: Each instance gets a unique name based on conversation UUID (e.g., "hovoa7")
-- **Persistence**: Names persist across `claude --resume` maintaining conversation context
+- **Persistence**: Names persist across `--resume` maintaining conversation context
 - **Status Detection**: Notification hook tracks permission requests and activity
+- **Agents**: When you run `hcom open researcher`, it loads an interactive claude session with a system prompt from `.claude/agents/researcher.md` (local) or `~/.claude/agents/researcher.md` (global)
 
-### Group Structure
-- **Groups** organize communication channels (e.g., `team1`, `project-cool`)
-- **Folders** can be configured to participate in a group via `chc setup`
-- **Claude instances** in configured folders automatically join their group's conversation
-- Multiple folders can share the same group, enabling cross-directory collaboration
+### Architecture
+- **Single conversation** - All instances share one global conversation
+- **Opt-in participation** - Only claude code instances launched with `hcom open` join the chat
+- **@-mention filtering** - Target messages to specific instances or teams
 
 ### File Structure
 ```
-~/.chc/                             
-├── coolgroup.log    # Conversation log
-└── coolgroup.json   # Group info
+~/.hcom/                             
+├── hcom.log       # Conversation log
+├── hcom.json      # Instance tracking
+└── config.json    # Configuration
 
 your-project/  
 └── .claude/
-    └── settings.local.json  # CHC hooks and group configuration
+    └── settings.local.json  # hcom hooks configuration
 ```
 
 </details>
+
 
 <details>
-<summary><strong>🧈 Launching Claude Code</strong></summary>
+<summary><strong>🥔 Terminal Options</strong></summary>
 
-## Spawning Claude Instances
+### Terminal Mode
 
-### Terminal (macOS)
+Configure terminal behavior in `~/.hcom/config.json`:
+- `"terminal_mode": "new_window"` - Opens new terminal windows (default)
+- `"terminal_mode": "same_terminal"` - Opens in current terminal
+- `"terminal_mode": "show_commands"` - Prints commands without executing
+
+### Default Terminals
+
+- **macOS**: Terminal.app
+- **Linux**: gnome-terminal, konsole, or xterm
+- **Windows**: Windows Terminal / PowerShell
+
+### Running in Current Terminal
 ```bash
-# AppleScript to launch in new terminal window
-osascript -e 'tell app "Terminal" to do script "cd /absolute/path/to/project && claude \"say hi\""'
+# For single instances
+HCOM_TERMINAL_MODE=same_terminal hcom open
 ```
 
-### PowerShell (Windows)
-```powershell
-# Launch in new window
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd C:\project\frontend; claude hi"
+### Custom Terminal Examples
+
+Configure `terminal_command` in `~/.hcom/config.json` to use your preferred terminal:
+
+### iTerm2
+```json
+{
+  "terminal_command": "osascript -e 'tell app \"iTerm2\" to create window with default profile' -e 'tell current session of current window to write text \"{env} {cmd}\"'"
+}
 ```
+
+### Alacritty
+```json
+{
+  "terminal_command": "alacritty -e sh -c '{env} {cmd}'"
+}
+```
+
+### Kitty
+```json
+{
+  "terminal_command": "kitty sh -c '{env} {cmd}'"
+}
+```
+
+### WezTerm
+```json
+{
+  "terminal_command": "wezterm cli spawn --new-window -- sh -c '{env} {cmd}'"
+}
+```
+
+### tmux
+```json
+{
+  "terminal_command": "tmux new-window -n hcom sh -c '{env} {cmd}'"
+}
+```
+
+### Available Placeholders
+- `{cmd}` - The claude command to execute
+- `{env}` - Environment variables (pre-formatted as `VAR1='value1' VAR2='value2'`)
+- `{cwd}` - Current working directory
+
+### Notes
+- Custom commands must exit with code 0 for success
+- The `{env}` placeholder contains shell-quoted environment variables
+- Most terminals require wrapping the command in `sh -c` to handle environment variables correctly
 
 </details>
 
-<details>
-<summary><strong>🥚 Troubleshooting</strong></summary>
-
- ## Issues 
-
-- **No messages received**: Run `chc setup <group> <folder(s)>` before starting Claude
-- **Claude stops responding**: Default idle timeout is 10 minutes (configure via `CHC_WAIT_TIMEOUT`)
-- **Message truncated**: Message size limit is 4096 chars (configure via `CHC_MAX_MESSAGE_SIZE`)
-
-**Debug Commands:**
-```bash
-# Run Claude in debug mode to see hook execution
-claude --debug
-
-# View conversation log
-tail -f ~/.chc/myteam.log
-
-# Check group status
-cat ~/.chc/myteam.json
-
-```
-</details>
 
 <details>
 <summary><strong>🦆 Remove</strong></summary>
 
 
-**Remove a group:**
+### Archive Conversation / Start New
 ```bash
-chc delete coolgroup
+hcom clear
 ```
 
-**Remove CHC completely:**
-1. Remove CHC: `rm /usr/local/bin/chc` (or wherever you installed chc)
-2. Remove all data: `rm -rf ~/.chc`
+### Remove HCOM hooks from current directory
+```bash
+hcom cleanup
+```
+
+### Remove HCOM hooks from all directories
+```bash
+hcom cleanup --all
+```
+
+### Remove hcom Completely
+1. Remove hcom: `rm /usr/local/bin/hcom` (or wherever you installed hcom)
+2. Remove all data: `rm -rf ~/.hcom`
 
 </details>
 
