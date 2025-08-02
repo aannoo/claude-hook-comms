@@ -25,7 +25,6 @@ IS_WINDOWS = sys.platform == 'win32'
 HCOM_ACTIVE_ENV = 'HCOM_ACTIVE'
 HCOM_ACTIVE_VALUE = '1'
 
-
 EXIT_SUCCESS = 0
 EXIT_ERROR = 1
 EXIT_BLOCK = 2
@@ -68,9 +67,9 @@ DEFAULT_CONFIG = {
     "sender_name": "bigboss",
     "sender_emoji": "🐳",
     "cli_hints": "",
-    "wait_timeout": 600,
+    "wait_timeout": 1800,
     "max_message_size": 4096,
-    "max_messages_per_delivery": 20,
+    "max_messages_per_delivery": 50,
     "first_use_text": "Essential, concise messages only, say hi in hcom chat now",
     "instance_hints": "",
     "env_overrides": {}
@@ -170,6 +169,29 @@ def get_config_value(key, default=None):
     config = get_cached_config()
     return config.get(key, default)
 
+def get_hook_command():
+    """Determine the best hook command approach based on paths"""
+    python_path = sys.executable
+    script_path = os.path.abspath(__file__)
+    
+    # Characters that cause issues in shell expansion
+    problematic_chars = [' ', '`', '"', "'", '\\', '\n', ';', '&', '|', '(', ')', ':', 
+                        '$', '*', '?', '[', ']', '{', '}', '!', '~', '<', '>']
+    
+    has_problematic_chars = any(char in python_path or char in script_path 
+                               for char in problematic_chars)
+    
+    if has_problematic_chars:
+        # Use direct paths with proper escaping
+        # Escape backslashes first, then quotes
+        escaped_python = python_path.replace('\\', '\\\\').replace('"', '\\"')
+        escaped_script = script_path.replace('\\', '\\\\').replace('"', '\\"')
+        return f'"{escaped_python}" "{escaped_script}"', {}
+    else:
+        # Use single clean env var
+        env_vars = {'HCOM': f'{python_path} {script_path}'}
+        return '$HCOM', env_vars
+
 def build_claude_env():
     """Build environment variables for Claude instances"""
     env = {HCOM_ACTIVE_ENV: HCOM_ACTIVE_VALUE}
@@ -183,6 +205,10 @@ def build_claude_env():
                 env[env_var] = str(config_value)
     
     env.update(config.get('env_overrides', {}))
+    
+    # Add hook-specific env vars if using that approach
+    _, hook_env_vars = get_hook_command()
+    env.update(hook_env_vars)
     
     return env
 
@@ -363,6 +389,22 @@ def _remove_hcom_hooks_from_settings(settings):
     if 'hooks' not in settings:
         return
     
+    import re
+    
+    # Patterns to match any hcom hook command
+    # - $HCOM post/stop/notify
+    # - hcom post/stop/notify  
+    # - /path/to/hcom.py post/stop/notify
+    # - "/path with spaces/python" "/path with spaces/hcom.py" post/stop/notify
+    # - '/path/to/python' '/path/to/hcom.py' post/stop/notify
+    hcom_patterns = [
+        r'\$HCOM\s+(post|stop|notify)\b',           # Environment variable
+        r'\bhcom\s+(post|stop|notify)\b',           # Direct hcom command
+        r'hcom\.py["\']?\s+(post|stop|notify)\b',   # hcom.py with optional quote
+        r'["\'][^"\']*hcom\.py["\']?\s+(post|stop|notify)\b',  # Quoted path with hcom.py
+    ]
+    compiled_patterns = [re.compile(pattern) for pattern in hcom_patterns]
+    
     for event in ['PostToolUse', 'Stop', 'Notification']:
         if event not in settings['hooks']:
             continue
@@ -370,11 +412,12 @@ def _remove_hcom_hooks_from_settings(settings):
         settings['hooks'][event] = [
             matcher for matcher in settings['hooks'][event]
             if not any(
-                any(pattern in hook.get('command', '') 
-                    for pattern in ['hcom post', 'hcom stop', 'hcom notify',
-                                   'hcom.py post', 'hcom.py stop', 'hcom.py notify',
-                                   'hcom.py" post', 'hcom.py" stop', 'hcom.py" notify'])
-                for hook in matcher.get('hooks', []))
+                any(
+                    pattern.search(hook.get('command', ''))
+                    for pattern in compiled_patterns
+                )
+                for hook in matcher.get('hooks', [])
+            )
         ]
         
         if not settings['hooks'][event]:
@@ -619,20 +662,8 @@ def setup_hooks():
     if hcom_send_permission not in settings['permissions']['allow']:
         settings['permissions']['allow'].append(hcom_send_permission)
     
-    # Detect hcom executable path
-    try:
-        import subprocess
-        # First, try regular hcom command
-        subprocess.run(['hcom', 'help'], capture_output=True, check=True, timeout=5)
-        hcom_cmd = 'hcom'
-    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-        try:
-            # Try uvx hcom
-            subprocess.run(['uvx', 'hcom', 'help'], capture_output=True, check=True, timeout=10)
-            hcom_cmd = 'uvx hcom'
-        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-            # Last resort: use full path
-            hcom_cmd = f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+    # Get the hook command approach (env vars or direct paths based on spaces)
+    hook_cmd_base, _ = get_hook_command()
     
     # Add PostToolUse hook
     if 'PostToolUse' not in settings['hooks']:
@@ -642,7 +673,7 @@ def setup_hooks():
         'matcher': '.*',
         'hooks': [{
             'type': 'command',
-            'command': f'{hcom_cmd} post'
+            'command': f'{hook_cmd_base} post'
         }]
     })
     
@@ -650,13 +681,13 @@ def setup_hooks():
     if 'Stop' not in settings['hooks']:
         settings['hooks']['Stop'] = []
     
-    wait_timeout = get_config_value('wait_timeout', 600)
+    wait_timeout = get_config_value('wait_timeout', 1800)
     
     settings['hooks']['Stop'].append({
         'matcher': '',
         'hooks': [{
             'type': 'command',
-            'command': f'{hcom_cmd} stop',
+            'command': f'{hook_cmd_base} stop',
             'timeout': wait_timeout
         }]
     })
@@ -669,7 +700,7 @@ def setup_hooks():
         'matcher': '',
         'hooks': [{
             'type': 'command',
-            'command': f'{hcom_cmd} notify'
+            'command': f'{hook_cmd_base} notify'
         }]
     })
     
@@ -846,7 +877,7 @@ def get_transcript_status(transcript_path):
 def get_instance_status(pos_data):
     """Get current status of instance"""
     now = int(time.time())
-    wait_timeout = get_config_value('wait_timeout', 600)
+    wait_timeout = get_config_value('wait_timeout', 1800)
     
     last_permission = pos_data.get("last_permission_request", 0)
     last_stop = pos_data.get("last_stop", 0)
@@ -1377,7 +1408,7 @@ def cmd_watch(*args):
     
     # Interactive dashboard mode
     last_pos = 0
-    status_suffix = f"{DIM} [⏎] chat...{RESET}"
+    status_suffix = f"{DIM} [⏎]...{RESET}"
 
     all_messages = show_main_screen_header()
     
@@ -1575,6 +1606,7 @@ def cleanup_directory_hooks(directory):
     except Exception as e:
         return 1, format_error(f"Cannot modify settings.local.json: {e}")
 
+
 def cmd_cleanup(*args):
     """Remove hcom hooks from current directory or all directories"""
     if args and args[0] == '--all':
@@ -1683,6 +1715,21 @@ def cmd_send(message):
 
 # ==================== Hook Functions ====================
 
+def format_hook_messages(messages, instance_name):
+    """Format messages for hook feedback"""
+    if len(messages) == 1:
+        msg = messages[0]
+        reason = f"{msg['from']} → {instance_name}: {msg['message']}"
+    else:
+        parts = [f"{msg['from']}: {msg['message']}" for msg in messages]
+        reason = f"{len(messages)} messages → {instance_name}: " + " | ".join(parts)
+    
+    instance_hints = get_config_value('instance_hints', '')
+    if instance_hints:
+        reason = f"{reason} {instance_hints}"
+    
+    return reason
+
 def handle_hook_post():
     """Handle PostToolUse hook"""
     # Check if active
@@ -1713,7 +1760,8 @@ def handle_hook_post():
                 'directory': str(Path.cwd())
             })
         
-        # Check for HCOM_SEND in Bash commands
+        # Check for HCOM_SEND in Bash commands  
+        sent_reason = None
         if hook_data.get('tool_name') == 'Bash':
             command = hook_data.get('tool_input', {}).get('command', '')
             if 'HCOM_SEND:' in command:
@@ -1749,21 +1797,27 @@ def handle_hook_post():
                             sys.exit(EXIT_BLOCK)
                         
                         send_message(instance_name, message)
+                        sent_reason = "✓ Sent"
         
         # Check for pending messages to deliver
         if not instance_name.endswith("claude"):
             messages = get_new_messages(instance_name)
             
-            if messages:
-                # Deliver messages via exit code 2
-                max_messages = get_config_value('max_messages_per_delivery', 20)
-                messages_to_show = messages[:max_messages]
-                
-                output = {
-                    "decision": HOOK_DECISION_BLOCK,
-                    "reason": f"New messages from hcom:\n" + 
-                             "\n".join([f"{m['from']}: {m['message']}" for m in messages_to_show])
-                }
+            if messages and sent_reason:
+                # Both sent and received
+                reason = f"{sent_reason} | {format_hook_messages(messages, instance_name)}"
+                output = {"decision": HOOK_DECISION_BLOCK, "reason": reason}
+                print(json.dumps(output, ensure_ascii=False), file=sys.stderr)
+                sys.exit(EXIT_BLOCK)
+            elif messages:
+                # Just received
+                reason = format_hook_messages(messages, instance_name)
+                output = {"decision": HOOK_DECISION_BLOCK, "reason": reason}
+                print(json.dumps(output, ensure_ascii=False), file=sys.stderr)
+                sys.exit(EXIT_BLOCK)
+            elif sent_reason:
+                # Just sent
+                output = {"reason": sent_reason}
                 print(json.dumps(output, ensure_ascii=False), file=sys.stderr)
                 sys.exit(EXIT_BLOCK)
     
@@ -1806,7 +1860,7 @@ def handle_hook_stop():
         check_and_show_first_use_help(instance_name)
         
         # Simple polling loop with parent check
-        timeout = get_config_value('wait_timeout', 600)
+        timeout = get_config_value('wait_timeout', 1800)
         start_time = time.time()
         
         while time.time() - start_time < timeout:
@@ -1819,14 +1873,11 @@ def handle_hook_stop():
             
             if messages:
                 # Deliver messages
-                max_messages = get_config_value('max_messages_per_delivery', 20)
+                max_messages = get_config_value('max_messages_per_delivery', 50)
                 messages_to_show = messages[:max_messages]
                 
-                output = {
-                    "decision": HOOK_DECISION_BLOCK,
-                    "reason": f"New messages from hcom:\n" + 
-                             "\n".join([f"{m['from']}: {m['message']}" for m in messages_to_show])
-                }
+                reason = format_hook_messages(messages_to_show, instance_name)
+                output = {"decision": HOOK_DECISION_BLOCK, "reason": reason}
                 print(json.dumps(output, ensure_ascii=False), file=sys.stderr)
                 sys.exit(EXIT_BLOCK)
             
@@ -1917,6 +1968,7 @@ def main(argv=None):
     elif cmd == 'notify':
         handle_hook_notification()
         return 0
+    
     
     # Unknown command
     else:

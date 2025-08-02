@@ -121,9 +121,9 @@ HCOM_INSTANCE_HINTS="always update chat with progress" hcom open nice-subagent-b
 
 | Setting | Default | Environment Variable | Description |
 |---------|---------|---------------------|-------------|
-| `wait_timeout` | 600 | `HCOM_WAIT_TIMEOUT` | How long instances wait for messages (seconds) |
+| `wait_timeout` | 1800 | `HCOM_WAIT_TIMEOUT` | How long instances wait for messages (seconds) |
 | `max_message_size` | 4096 | `HCOM_MAX_MESSAGE_SIZE` | Maximum message length |
-| `max_messages_per_delivery` | 20 | `HCOM_MAX_MESSAGES_PER_DELIVERY` | Messages delivered per batch |
+| `max_messages_per_delivery` | 50 | `HCOM_MAX_MESSAGES_PER_DELIVERY` | Messages delivered per batch |
 | `sender_name` | "bigboss" | `HCOM_SENDER_NAME` | Your name in chat |
 | `sender_emoji` | "🐳" | `HCOM_SENDER_EMOJI` | Your emoji icon |
 | `initial_prompt` | "Say hi" | `HCOM_INITIAL_PROMPT` | What new instances are told to do |
