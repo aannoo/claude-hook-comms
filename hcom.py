@@ -335,6 +335,35 @@ def parse_open_args(args):
     
     return instances, prefix, claude_args
 
+def extract_agent_config(content):
+    """Extract configuration from agent YAML frontmatter"""
+    if not content.startswith('---'):
+        return {}
+    
+    # Find YAML section between --- markers
+    yaml_end = content.find('\n---', 3)
+    if yaml_end < 0:
+        return {}  # No closing marker
+    
+    yaml_section = content[3:yaml_end]
+    config = {}
+    
+    # Extract model field
+    model_match = re.search(r'^model:\s*(.+)$', yaml_section, re.MULTILINE)
+    if model_match:
+        value = model_match.group(1).strip()
+        if value and value.lower() != 'inherit':
+            config['model'] = value
+    
+    # Extract tools field
+    tools_match = re.search(r'^tools:\s*(.+)$', yaml_section, re.MULTILINE)
+    if tools_match:
+        value = tools_match.group(1).strip()
+        if value:
+            config['tools'] = value.replace(', ', ',')
+    
+    return config
+
 def resolve_agent(name):
     """Resolve agent file by name
     
@@ -342,16 +371,17 @@ def resolve_agent(name):
     1. .claude/agents/{name}.md (local)
     2. ~/.claude/agents/{name}.md (global)
     
-    Returns the content after stripping YAML frontmatter
+    Returns tuple: (content after stripping YAML frontmatter, config dict)
     """
     for base_path in [Path('.'), Path.home()]:
         agent_path = base_path / '.claude/agents' / f'{name}.md'
         if agent_path.exists():
             content = agent_path.read_text()
+            config = extract_agent_config(content)
             stripped = strip_frontmatter(content)
             if not stripped.strip():
                 raise ValueError(format_error(f"Agent '{name}' has empty content", 'Check the agent file contains a system prompt'))
-            return stripped
+            return stripped, config
     
     raise FileNotFoundError(format_error(f'Agent not found: {name}', 'Check available agents or create the agent file'))
 
@@ -452,7 +482,7 @@ def format_warning(message):
     """Format warning message consistently"""
     return f"Warning: {message}"
 
-def build_claude_command(agent_content=None, claude_args=None, initial_prompt="Say hi in chat"):
+def build_claude_command(agent_content=None, claude_args=None, initial_prompt="Say hi in chat", model=None, tools=None):
     """Build Claude command with proper argument handling
     
     Returns tuple: (command_string, temp_file_path_or_none)
@@ -460,6 +490,27 @@ def build_claude_command(agent_content=None, claude_args=None, initial_prompt="S
     """
     cmd_parts = ['claude']
     temp_file_path = None
+    
+    # Add model if specified and not already in claude_args
+    if model:
+        # Check if model already specified in args (more concise)
+        has_model = claude_args and any(
+            arg in ['--model', '-m'] or 
+            arg.startswith(('--model=', '-m=')) 
+            for arg in claude_args
+        )
+        if not has_model:
+            cmd_parts.extend(['--model', model])
+    
+    # Add allowed tools if specified and not already in claude_args
+    if tools:
+        has_tools = claude_args and any(
+            arg in ['--allowedTools', '--allowed-tools'] or
+            arg.startswith(('--allowedTools=', '--allowed-tools='))
+            for arg in claude_args
+        )
+        if not has_tools:
+            cmd_parts.extend(['--allowedTools', tools])
     
     if claude_args:
         for arg in claude_args:
@@ -718,16 +769,36 @@ def get_archive_timestamp():
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 def get_conversation_uuid(transcript_path):
-    """Get conversation UUID from transcript"""
+    """Get conversation UUID from transcript
+    
+    For resumed sessions, the first line may be a summary with a different leafUuid.
+    We need to find the first user entry which contains the stable conversation UUID.
+    """
     try:
         if not transcript_path or not os.path.exists(transcript_path):
             return None
         
+        # First, try to find the UUID from the first user entry
+        with open(transcript_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    # Look for first user entry with a UUID - this is the stable identifier
+                    if entry.get('type') == 'user' and entry.get('uuid'):
+                        return entry.get('uuid')
+                except json.JSONDecodeError:
+                    continue
+        
+        # Fallback: If no user entry found, try the first line (original behavior)
         with open(transcript_path, 'r') as f:
             first_line = f.readline().strip()
             if first_line:
                 entry = json.loads(first_line)
-                return entry.get('uuid')
+                # Try both 'uuid' and 'leafUuid' fields
+                return entry.get('uuid') or entry.get('leafUuid')
     except Exception:
         pass
     return None
@@ -1119,7 +1190,8 @@ def migrate_instance_name_if_needed(instance_name, conversation_uuid, transcript
     if instance_name.endswith("claude") and conversation_uuid:
         new_instance = get_display_name(transcript_path)
         if new_instance != instance_name and not new_instance.endswith("claude"):
-            # Migrate from fallback name to UUID-based name
+            # Always return the new name if we can generate it
+            # Migration of data only happens if old name exists
             pos_file = get_hcom_dir() / "hcom.json"
             positions = load_positions(pos_file)
             if instance_name in positions:
@@ -1128,8 +1200,7 @@ def migrate_instance_name_if_needed(instance_name, conversation_uuid, transcript
                 # Update the conversation UUID in the migrated data
                 positions[new_instance]["conversation_uuid"] = conversation_uuid
                 atomic_write(pos_file, json.dumps(positions, indent=2))
-                # Instance name migrated
-                return new_instance
+            return new_instance
     return instance_name
 
 def update_instance_position(instance_name, update_fields):
@@ -1282,11 +1353,16 @@ def cmd_open(*args):
             else:
                 # Agent instance
                 try:
-                    agent_content = resolve_agent(instance_type)
+                    agent_content, agent_config = resolve_agent(instance_type)
+                    # Use agent's model and tools if specified and not overridden in claude_args
+                    agent_model = agent_config.get('model')
+                    agent_tools = agent_config.get('tools')
                     claude_cmd, temp_file = build_claude_command(
                         agent_content=agent_content,
                         claude_args=claude_args,
-                        initial_prompt=initial_prompt
+                        initial_prompt=initial_prompt,
+                        model=agent_model,
+                        tools=agent_tools
                     )
                     if temp_file:
                         temp_files_to_cleanup.append(temp_file)
@@ -1746,12 +1822,9 @@ def handle_hook_post():
         # Migrate instance name if needed (from fallback to UUID-based)
         instance_name = migrate_instance_name_if_needed(instance_name, conversation_uuid, transcript_path)
         
-        # Initialize instance if needed
-        if not instance_name.endswith("claude") or conversation_uuid:
-            initialize_instance_in_position_file(instance_name, conversation_uuid)
-            
-            # Update instance position
-            update_instance_position(instance_name, {
+        initialize_instance_in_position_file(instance_name, conversation_uuid)
+        
+        update_instance_position(instance_name, {
                 'last_tool': int(time.time()),
                 'last_tool_name': hook_data.get('tool_name', 'unknown'),
                 'session_id': hook_data.get('session_id', ''),
@@ -1788,8 +1861,7 @@ def handle_hook_post():
                     elif message and message[-1] in '"\'':
                         message = message[:-1]
                     
-                    if message and not instance_name.endswith("claude"):
-                        # Validate message
+                    if message:
                         error = validate_message(message)
                         if error:
                             output = {"reason": f"❌ {error}"}
@@ -1799,27 +1871,25 @@ def handle_hook_post():
                         send_message(instance_name, message)
                         sent_reason = "✓ Sent"
         
-        # Check for pending messages to deliver
-        if not instance_name.endswith("claude"):
-            messages = get_new_messages(instance_name)
-            
-            if messages and sent_reason:
-                # Both sent and received
-                reason = f"{sent_reason} | {format_hook_messages(messages, instance_name)}"
-                output = {"decision": HOOK_DECISION_BLOCK, "reason": reason}
-                print(json.dumps(output, ensure_ascii=False), file=sys.stderr)
-                sys.exit(EXIT_BLOCK)
-            elif messages:
-                # Just received
-                reason = format_hook_messages(messages, instance_name)
-                output = {"decision": HOOK_DECISION_BLOCK, "reason": reason}
-                print(json.dumps(output, ensure_ascii=False), file=sys.stderr)
-                sys.exit(EXIT_BLOCK)
-            elif sent_reason:
-                # Just sent
-                output = {"reason": sent_reason}
-                print(json.dumps(output, ensure_ascii=False), file=sys.stderr)
-                sys.exit(EXIT_BLOCK)
+        messages = get_new_messages(instance_name)
+        
+        if messages and sent_reason:
+            # Both sent and received
+            reason = f"{sent_reason} | {format_hook_messages(messages, instance_name)}"
+            output = {"decision": HOOK_DECISION_BLOCK, "reason": reason}
+            print(json.dumps(output, ensure_ascii=False), file=sys.stderr)
+            sys.exit(EXIT_BLOCK)
+        elif messages:
+            # Just received
+            reason = format_hook_messages(messages, instance_name)
+            output = {"decision": HOOK_DECISION_BLOCK, "reason": reason}
+            print(json.dumps(output, ensure_ascii=False), file=sys.stderr)
+            sys.exit(EXIT_BLOCK)
+        elif sent_reason:
+            # Just sent
+            output = {"reason": sent_reason}
+            print(json.dumps(output, ensure_ascii=False), file=sys.stderr)
+            sys.exit(EXIT_BLOCK)
     
     except Exception:
         pass
@@ -1838,9 +1908,6 @@ def handle_hook_stop():
         transcript_path = hook_data.get('transcript_path', '')
         instance_name = get_display_name(transcript_path) if transcript_path else f"{Path.cwd().name[:2].lower()}claude"
         conversation_uuid = get_conversation_uuid(transcript_path)
-        
-        if instance_name.endswith("claude") and not conversation_uuid:
-            sys.exit(EXIT_SUCCESS)
         
         # Initialize instance if needed
         initialize_instance_in_position_file(instance_name, conversation_uuid)
@@ -1905,9 +1972,6 @@ def handle_hook_notification():
         transcript_path = hook_data.get('transcript_path', '')
         instance_name = get_display_name(transcript_path) if transcript_path else f"{Path.cwd().name[:2].lower()}claude"
         conversation_uuid = get_conversation_uuid(transcript_path)
-        
-        if instance_name.endswith("claude") and not conversation_uuid:
-            sys.exit(EXIT_SUCCESS)
         
         # Initialize instance if needed
         initialize_instance_in_position_file(instance_name, conversation_uuid)

@@ -126,7 +126,7 @@ HCOM_INSTANCE_HINTS="always update chat with progress" hcom open nice-subagent-b
 | `max_messages_per_delivery` | 50 | `HCOM_MAX_MESSAGES_PER_DELIVERY` | Messages delivered per batch |
 | `sender_name` | "bigboss" | `HCOM_SENDER_NAME` | Your name in chat |
 | `sender_emoji` | "🐳" | `HCOM_SENDER_EMOJI` | Your emoji icon |
-| `initial_prompt` | "Say hi" | `HCOM_INITIAL_PROMPT` | What new instances are told to do |
+| `initial_prompt` | "Say hi in chat" | `HCOM_INITIAL_PROMPT` | What new instances are told to do |
 | `first_use_text` | "Essential, concise messages only" | `HCOM_FIRST_USE_TEXT` | Welcome message for instances |
 | `terminal_mode` | "new_window" | `HCOM_TERMINAL_MODE` | How to launch terminals ("new_window", "same_terminal", "show_commands") |
 | `terminal_command` | null | `HCOM_TERMINAL_COMMAND` | Custom terminal command (see Terminal Options) |
@@ -174,7 +174,7 @@ hcom adds hooks to your project directory's `.claude/settings.local.json`:
 - **Identity**: Each instance gets a unique name based on conversation UUID (e.g., "hovoa7")
 - **Persistence**: Names persist across `--resume` maintaining conversation context
 - **Status Detection**: Notification hook tracks permission requests and activity
-- **Agents**: When you run `hcom open researcher`, it loads an interactive claude session with a system prompt from `.claude/agents/researcher.md` (local) or `~/.claude/agents/researcher.md` (global)
+- **Agents**: When you run `hcom open researcher`, it loads an interactive claude session with a system prompt from `.claude/agents/researcher.md` (local) or `~/.claude/agents/researcher.md` (global). Agents can specify `model:` and `tools:` in YAML frontmatter
 
 ### Architecture
 - **Single conversation** - All instances share one global conversation
