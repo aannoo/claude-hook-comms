@@ -1,6 +1,6 @@
-# Claude Code Hook Comms
+# hcom - Claude Hook Comms
 
-Lightweight CLI tool for real-time communication between claude code [subagents](https://docs.anthropic.com/en/docs/claude-code/sub-agents) using [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks).
+Lightweight CLI tool for real-time communication between Claude Code [subagents](https://docs.anthropic.com/en/docs/claude-code/sub-agents) using [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks).
 
 ## 🦆 What It Does
 
@@ -10,7 +10,7 @@ Creates a group chat where you and multiple interactive Claude Code subagents ca
 
 ## 🦷 Features
 
-- **Multi-Terminal Launch** - Launch claude code subagents in new terminals
+- **Multi-Terminal Launch** - Launch Claude Code subagents in new terminals
 - **Live Dashboard** - Real-time monitoring of all instances
 - **Multi-Agent Communication** - Claude instances talk to each other across projects
 - **@Mention Targeting** - Send messages to specific subagents or teams
@@ -72,11 +72,12 @@ cd backend && hcom open api-specialist
 cd ../frontend && hcom open ui-specialist
 
 # Create named teams that can be @mentioned
-cd ~/api && hcom open --prefix api debugger
-cd ~/auth && hcom open --prefix auth debugger
+cd ~/api && hcom open --prefix api debugger  # Creates api-hovoa7
+cd ~/auth && hcom open --prefix auth debugger  # Creates auth-hovob8
 
-# Message specific teams
-hcom send "@api login works but API fails" # or in dashboard: hcom watch
+# Message specific teams or instances
+hcom send "@api login works but API fails"  # Messages all api-* instances
+hcom send "@hovoa7 can you check this?"     # Message specific instance by name
 ```
 
 
@@ -92,7 +93,7 @@ hcom send "@api login works but API fails" # or in dashboard: hcom watch
 ### Automation Commands
 | Command | Description |
 |---------|-------------|
-| `hcom send 'message'` | Send message |
+| `hcom send 'message'` | Send message to chat |
 | `hcom watch --logs` | View message history (non-interactive) |
 | `hcom watch --status` | Show instance status (non-interactive) |
 | `hcom watch --wait [timeout]` | Wait and notify for new messages |
@@ -167,18 +168,18 @@ HCOM_MAX_MESSAGE_SIZE=8192 hcom send "$(cat long_report.txt)"
 
 hcom adds hooks to your project directory's `.claude/settings.local.json`:
 
-1. **Sending**: Claude writes messages with `echo "HCOM_SEND:message"` - captured by PostToolUse hook
+1. **Sending**: Claude agents use `echo "HCOM_SEND:message"` internally (you use `hcom send` from terminal)
 2. **Receiving**: Other Claudes get notified via Stop hook
 3. **Waiting**: Stop hook keeps Claude in a waiting state for new messages
 
 - **Identity**: Each instance gets a unique name based on conversation UUID (e.g., "hovoa7")
 - **Persistence**: Names persist across `--resume` maintaining conversation context
 - **Status Detection**: Notification hook tracks permission requests and activity
-- **Agents**: When you run `hcom open researcher`, it loads an interactive claude session with a system prompt from `.claude/agents/researcher.md` (local) or `~/.claude/agents/researcher.md` (global). Agents can specify `model:` and `tools:` in YAML frontmatter
+- **Agents**: When you run `hcom open researcher`, it loads an interactive Claude session with a system prompt from `.claude/agents/researcher.md` (local) or `~/.claude/agents/researcher.md` (global). Agents can specify `model:` and `tools:` in YAML frontmatter
 
 ### Architecture
 - **Single conversation** - All instances share one global conversation
-- **Opt-in participation** - Only claude code instances launched with `hcom open` join the chat
+- **Opt-in participation** - Only Claude Code instances launched with `hcom open` join the chat
 - **@-mention filtering** - Target messages to specific instances or teams
 
 ### File Structure

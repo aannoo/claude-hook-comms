@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 hcom - Claude Hook Comms
-A lightweight multi-agent communication system for claude code
+Lightweight CLI tool for real-time communication between Claude Code subagents using hooks
 """
 
 import os
@@ -170,27 +170,22 @@ def get_config_value(key, default=None):
     return config.get(key, default)
 
 def get_hook_command():
-    """Determine the best hook command approach based on paths"""
+    """Get hook command with silent fallback
+    
+    Uses ${HCOM:-true} for clean paths, conditional for paths with spaces.
+    Both approaches exit silently (code 0) when not launched via 'hcom open'.
+    """
     python_path = sys.executable
     script_path = os.path.abspath(__file__)
     
-    # Characters that cause issues in shell expansion
-    problematic_chars = [' ', '`', '"', "'", '\\', '\n', ';', '&', '|', '(', ')', ':', 
-                        '$', '*', '?', '[', ']', '{', '}', '!', '~', '<', '>']
-    
-    has_problematic_chars = any(char in python_path or char in script_path 
-                               for char in problematic_chars)
-    
-    if has_problematic_chars:
-        # Use direct paths with proper escaping
-        # Escape backslashes first, then quotes
-        escaped_python = python_path.replace('\\', '\\\\').replace('"', '\\"')
-        escaped_script = script_path.replace('\\', '\\\\').replace('"', '\\"')
-        return f'"{escaped_python}" "{escaped_script}"', {}
+    if ' ' in python_path or ' ' in script_path:
+        # Paths with spaces: use conditional check
+        escaped_python = shlex.quote(python_path)
+        escaped_script = shlex.quote(script_path)
+        return f'[ "${{HCOM_ACTIVE}}" = "1" ] && {escaped_python} {escaped_script} || true', {}
     else:
-        # Use single clean env var
-        env_vars = {'HCOM': f'{python_path} {script_path}'}
-        return '$HCOM', env_vars
+        # Clean paths: use environment variable
+        return '${HCOM:-true}', {}
 
 def build_claude_env():
     """Build environment variables for Claude instances"""
@@ -206,9 +201,11 @@ def build_claude_env():
     
     env.update(config.get('env_overrides', {}))
     
-    # Add hook-specific env vars if using that approach
-    _, hook_env_vars = get_hook_command()
-    env.update(hook_env_vars)
+    # Set HCOM only for clean paths (spaces handled differently)
+    python_path = sys.executable
+    script_path = os.path.abspath(__file__)
+    if ' ' not in python_path and ' ' not in script_path:
+        env['HCOM'] = f'{python_path} {script_path}'
     
     return env
 
@@ -265,7 +262,7 @@ def send_message(from_instance, message):
     except Exception:
         return False
 
-def should_deliver_message(msg, instance_name):
+def should_deliver_message(msg, instance_name, all_instance_names=None):
     """Check if message should be delivered based on @-mentions"""
     text = msg['message']
     
@@ -277,11 +274,22 @@ def should_deliver_message(msg, instance_name):
     if not mentions:
         return True
     
-    for mention in mentions:
-        if instance_name.lower().startswith(mention.lower()):
-            return True
+    # Check if this instance matches any mention
+    this_instance_matches = any(instance_name.lower().startswith(mention.lower()) for mention in mentions)
     
-    return False
+    if this_instance_matches:
+        return True
+    
+    # If we have all_instance_names, check if ANY mention matches ANY instance
+    if all_instance_names:
+        any_mention_matches = any(
+            any(name.lower().startswith(mention.lower()) for name in all_instance_names)
+            for mention in mentions
+        )
+        if not any_mention_matches:
+            return True  # No matches anywhere = broadcast to all
+    
+    return False  # This instance doesn't match, but others might
 
 # ==================== Parsing and Helper Functions ====================
 
@@ -423,15 +431,22 @@ def _remove_hcom_hooks_from_settings(settings):
     
     # Patterns to match any hcom hook command
     # - $HCOM post/stop/notify
+    # - ${HCOM:-...} post/stop/notify
+    # - [ "${HCOM_ACTIVE}" = "1" ] && ... hcom.py ... || true
     # - hcom post/stop/notify  
+    # - uvx hcom post/stop/notify
     # - /path/to/hcom.py post/stop/notify
+    # - sh -c "[ ... ] && ... hcom ..."
     # - "/path with spaces/python" "/path with spaces/hcom.py" post/stop/notify
     # - '/path/to/python' '/path/to/hcom.py' post/stop/notify
     hcom_patterns = [
-        r'\$HCOM\s+(post|stop|notify)\b',           # Environment variable
+        r'\$\{?HCOM',                                # Environment variable (with or without braces)
+        r'\bHCOM_ACTIVE.*hcom\.py',                 # Conditional with HCOM_ACTIVE check
         r'\bhcom\s+(post|stop|notify)\b',           # Direct hcom command
+        r'\buvx\s+hcom\s+(post|stop|notify)\b',     # uvx hcom command
         r'hcom\.py["\']?\s+(post|stop|notify)\b',   # hcom.py with optional quote
         r'["\'][^"\']*hcom\.py["\']?\s+(post|stop|notify)\b',  # Quoted path with hcom.py
+        r'sh\s+-c.*hcom',                           # Shell wrapper with hcom
     ]
     compiled_patterns = [re.compile(pattern) for pattern in hcom_patterns]
     
@@ -713,7 +728,7 @@ def setup_hooks():
     if hcom_send_permission not in settings['permissions']['allow']:
         settings['permissions']['allow'].append(hcom_send_permission)
     
-    # Get the hook command approach (env vars or direct paths based on spaces)
+    # Get the hook command template
     hook_cmd_base, _ = get_hook_command()
     
     # Add PostToolUse hook
@@ -881,10 +896,11 @@ def get_new_messages(instance_name):
     # Filter messages:
     # 1. Exclude own messages
     # 2. Apply @-mention filtering
+    all_instance_names = list(positions.keys())
     messages = []
     for msg in all_messages:
         if msg['from'] != instance_name:
-            if should_deliver_message(msg, instance_name):
+            if should_deliver_message(msg, instance_name, all_instance_names):
                 messages.append(msg)
     
     # Update position to end of file
@@ -1280,18 +1296,21 @@ def cmd_help():
 
 Usage:
   hcom open [n]                Launch n Claude instances
-  hcom open --prefix name n    Launch with name prefix
+  hcom open <agent>            Launch named agent from .claude/agents/
+  hcom open --prefix <team> n  Launch n instances with team prefix
   hcom watch                   View conversation dashboard
-  hcom clear                 Clear and archive conversation
-  hcom cleanup               Remove hooks from current directory
-  hcom cleanup --all         Remove hooks from all tracked directories
-  hcom help                  Show this help
+  hcom clear                   Clear and archive conversation
+  hcom cleanup                 Remove hooks from current directory
+  hcom cleanup --all           Remove hooks from all tracked directories
+  hcom help                    Show this help
 
 Automation:
-  hcom send 'msg'            Send message
-  hcom send '@prefix msg'    Send to specific instances
-  hcom watch --logs          Show logs
-  hcom watch --status        Show status""")
+  hcom send 'msg'              Send message
+  hcom send '@prefix msg'      Send to specific instances
+  hcom watch --logs            Show logs
+  hcom watch --status          Show status
+
+Docs: https://raw.githubusercontent.com/aannoo/claude-hook-comms/main/README.md""")
     return 0
 
 def cmd_open(*args):
@@ -1778,6 +1797,19 @@ def cmd_send(message):
     if error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
+    
+    # Check for unmatched mentions (minimal warning)
+    mentions = MENTION_PATTERN.findall(message)
+    if mentions and pos_file.exists():
+        try:
+            positions = load_positions(pos_file)
+            all_instances = list(positions.keys())
+            unmatched = [m for m in mentions 
+                        if not any(name.lower().startswith(m.lower()) for name in all_instances)]
+            if unmatched:
+                print(f"Note: @{', @'.join(unmatched)} don't match any instances - broadcasting to all")
+        except Exception:
+            pass  # Don't fail on warning
     
     # Send message
     sender_name = get_config_value('sender_name', 'bigboss')
