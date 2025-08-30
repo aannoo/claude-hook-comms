@@ -724,7 +724,7 @@ def setup_hooks():
     if 'hooks' not in settings:
         settings['hooks'] = {}
     
-    hcom_send_permission = 'Bash(echo "HCOM_SEND:*")'
+    hcom_send_permission = 'Bash(echo HCOM_SEND:*)'
     if hcom_send_permission not in settings['permissions']['allow']:
         settings['permissions']['allow'].append(hcom_send_permission)
     
@@ -1292,6 +1292,7 @@ def show_main_screen_header():
 
 def cmd_help():
     """Show help text"""
+    # Basic help for interactive users
     print("""hcom - Claude Hook Comms
 
 Usage:
@@ -1305,12 +1306,59 @@ Usage:
   hcom help                    Show this help
 
 Automation:
-  hcom send 'msg'              Send message
+  hcom send 'msg'              Send message to all
   hcom send '@prefix msg'      Send to specific instances
   hcom watch --logs            Show logs
   hcom watch --status          Show status
+  hcom watch --wait [timeout]  Wait and notify for new messages (seconds)
 
 Docs: https://raw.githubusercontent.com/aannoo/claude-hook-comms/main/README.md""")
+    
+    # Additional help for AI assistants when running in non-interactive mode
+    if not sys.stdin.isatty():
+        print("""
+
+=== ADDITIONAL INFO ===
+
+CONCEPT: HCOM creates multi-agent collaboration by launching multiple Claude Code 
+instances in separate terminals that share a single conversation.
+
+KEY UNDERSTANDING:
+• Single conversation - All instances share ~/.hcom/hcom.log
+• Agents are system prompts - "reviewer" loads .claude/agents/reviewer.md
+• CLI usage - Use 'hcom send' for messaging. Internal instances use 'echo HCOM_SEND:'
+• hcom open is directory-specific - always cd to project directory first              
+
+LAUNCH PATTERNS:
+  hcom open 2 reviewer                   # 2 generic + 1 reviewer agent
+  hcom open reviewer reviewer            # 2 separate reviewer instances  
+  hcom open --prefix api 2               # Team naming: api-hova7, api-kolec
+  hcom open test --claude-args "-p 'write tests'"  # Pass 'claude' CLI flags
+
+@MENTION TARGETING:
+  hcom send "message"           # Broadcasts to everyone
+  hcom send "@api fix this"     # Targets all api-* instances (api-hova7, api-kolec)
+  hcom send "@hova7 status?"    # Targets specific instance
+  (Unmatched @mentions broadcast to everyone)
+
+STATUS INDICATORS:
+• ◉ thinking, ▷ responding, ▶ executing - instance is working
+• ◉ waiting - instance is waiting for new messages (hcom send)
+• ■ blocked - instance is blocked by permission request (needs user approval)
+• ○ inactive - instance is inactive (timed out, disconnected, etc)
+              
+CONFIG:
+Environment overrides (temporary): HCOM_INSTANCE_HINTS="useful info" hcom send "hi"
+Config file (persistent): ~/.hcom/config.json
+
+Key settings (all in config.json):
+  terminal_mode: "new_window" | "same_terminal" | "show_commands"
+  initial_prompt: "Say hi in chat", first_use_text: "Essential, concise messages only..."
+  instance_hints: "", cli_hints: ""  # Extra info for instances/CLI
+
+EXPECT: Instance names are auto-generated (5-char format based on uuid: "hova7"). Check actual names 
+with 'hcom watch --status'. Instances respond automatically in shared chat.""")
+    
     return 0
 
 def cmd_open(*args):

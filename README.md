@@ -64,7 +64,7 @@ hcom open test-writer --claude-args "-p 'write tests for any new code'"
 hcom open reviewer --claude-args "-p 'review when @mentioned'"
 
 # Pass multiple Claude flags
-hcom open orchestrator --claude-args "--model claude-3-opus 
+hcom open orchestrator --claude-args "--model claude-sonnet 
 --resume session_id"
 
 # Launch in specific directories
