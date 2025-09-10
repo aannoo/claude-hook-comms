@@ -11,12 +11,14 @@ import tempfile
 import shutil
 import shlex
 import re
+import subprocess
 import time
 import select
 import threading
 import platform
+import random
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ==================== Constants ====================
 
@@ -113,6 +115,50 @@ def atomic_write(filepath, content):
     
     os.replace(tmp.name, filepath)
 
+def get_instance_file(instance_name):
+    """Get path to instance's position file"""
+    return get_hcom_dir() / "instances" / f"{instance_name}.json"
+
+def load_instance_position(instance_name):
+    """Load position data for a single instance"""
+    instance_file = get_instance_file(instance_name)
+    if instance_file.exists():
+        try:
+            with open(instance_file, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError):
+            pass
+    return {}
+
+def save_instance_position(instance_name, data):
+    """Save position data for a single instance - no locking needed"""
+    instance_file = get_instance_file(instance_name)
+    instance_file.parent.mkdir(exist_ok=True)
+    atomic_write(instance_file, json.dumps(data, indent=2))
+
+def load_all_positions():
+    """Load positions from all instance files"""
+    instances_dir = get_hcom_dir() / "instances"
+    if not instances_dir.exists():
+        return {}
+    
+    positions = {}
+    for instance_file in instances_dir.glob("*.json"):
+        try:
+            instance_name = instance_file.stem
+            with open(instance_file, 'r') as f:
+                positions[instance_name] = json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError):
+            continue
+    return positions
+
+def clear_all_positions():
+    """Clear all instance position files"""
+    instances_dir = get_hcom_dir() / "instances"
+    if instances_dir.exists():
+        shutil.rmtree(instances_dir)
+    instances_dir.mkdir(exist_ok=True)
+
 # ==================== Configuration System ====================
 
 def get_cached_config():
@@ -141,8 +187,8 @@ def _load_config_from_file():
                     else:
                         config[key] = value
                     
-        except json.JSONDecodeError:
-            print(format_warning("Invalid JSON in config file, using defaults"), file=sys.stderr)
+        except (json.JSONDecodeError, UnicodeDecodeError, PermissionError):
+            print(format_warning("Cannot read config file, using defaults"), file=sys.stderr)
     else:
         atomic_write(config_path, json.dumps(DEFAULT_CONFIG, indent=2))
     
@@ -191,14 +237,19 @@ def build_claude_env():
     """Build environment variables for Claude instances"""
     env = {HCOM_ACTIVE_ENV: HCOM_ACTIVE_VALUE}
     
+    # Get config file values
     config = get_cached_config()
-    for config_key, env_var in HOOK_SETTINGS.items():
-        if config_key in config:
-            config_value = config[config_key]
-            default_value = DEFAULT_CONFIG.get(config_key)
-            if config_value != default_value:
-                env[env_var] = str(config_value)
     
+    # Pass env vars only when they differ from config file values
+    for config_key, env_var in HOOK_SETTINGS.items():
+        actual_value = get_config_value(config_key)  # Respects env var precedence
+        config_file_value = config.get(config_key)
+        
+        # Only pass if different from config file (not default)
+        if actual_value != config_file_value and actual_value is not None:
+            env[env_var] = str(actual_value)
+    
+    # Still support env_overrides from config file
     env.update(config.get('env_overrides', {}))
     
     # Set HCOM only for clean paths (spaces handled differently)
@@ -230,16 +281,10 @@ def require_args(min_count, usage_msg, extra_msg=""):
             print(extra_msg)
         sys.exit(1)
 
-def load_positions(pos_file):
-    """Load positions from file with error handling"""
-    positions = {}
-    if pos_file.exists():
-        try:
-            with open(pos_file, 'r') as f:
-                positions = json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError):
-            pass
-    return positions
+def load_positions(pos_file=None):
+    """Load all positions - redirects to load_all_positions()"""
+    # pos_file parameter kept for compatibility but ignored
+    return load_all_positions()
 
 def send_message(from_instance, message):
     """Send a message to the log"""
@@ -280,12 +325,17 @@ def should_deliver_message(msg, instance_name, all_instance_names=None):
     if this_instance_matches:
         return True
     
-    # If we have all_instance_names, check if ANY mention matches ANY instance
+    # Check if any mention is for the CLI sender (bigboss)
+    sender_name = get_config_value('sender_name', 'bigboss')
+    sender_mentioned = any(sender_name.lower().startswith(mention.lower()) for mention in mentions)
+    
+    # If we have all_instance_names, check if ANY mention matches ANY instance or sender
     if all_instance_names:
         any_mention_matches = any(
             any(name.lower().startswith(mention.lower()) for name in all_instance_names)
             for mention in mentions
-        )
+        ) or sender_mentioned
+        
         if not any_mention_matches:
             return True  # No matches anywhere = broadcast to all
     
@@ -297,14 +347,16 @@ def parse_open_args(args):
     """Parse arguments for open command
     
     Returns:
-        tuple: (instances, prefix, claude_args)
+        tuple: (instances, prefix, claude_args, background)
             instances: list of agent names or 'generic'
             prefix: team name prefix or None
             claude_args: additional args to pass to claude
+            background: bool, True if --background or -p flag
     """
     instances = []
     prefix = None
     claude_args = []
+    background = False
     
     i = 0
     while i < len(args):
@@ -323,6 +375,9 @@ def parse_open_args(args):
                 raise ValueError(format_error('--claude-args requires an argument'))
             claude_args = shlex.split(args[i + 1])
             i += 2
+        elif arg == '--background' or arg == '-p':
+            background = True
+            i += 1
         else:
             try:
                 count = int(arg)
@@ -341,7 +396,7 @@ def parse_open_args(args):
     if not instances:
         instances = ['generic']
     
-    return instances, prefix, claude_args
+    return instances, prefix, claude_args, background
 
 def extract_agent_config(content):
     """Extract configuration from agent YAML frontmatter"""
@@ -416,7 +471,8 @@ def get_display_name(transcript_path, prefix=None):
         uuid_char = conversation_uuid[0]
         base_name = f"{dir_chars}{syls[hash_val % len(syls)]}{uuid_char}"
     else:
-        base_name = f"{dir_chars}claude"
+        pid_suffix = os.getppid() % 10000  # 4 digits max
+        base_name = f"{dir_chars}{pid_suffix}claude"
     
     if prefix:
         return f"{prefix}-{base_name}"
@@ -424,10 +480,13 @@ def get_display_name(transcript_path, prefix=None):
 
 def _remove_hcom_hooks_from_settings(settings):
     """Remove hcom hooks from settings dict"""
-    if 'hooks' not in settings:
+    if not isinstance(settings, dict) or 'hooks' not in settings:
         return
     
-    import re
+    if not isinstance(settings['hooks'], dict):
+        return
+    
+    import copy
     
     # Patterns to match any hcom hook command
     # - $HCOM post/stop/notify
@@ -445,31 +504,47 @@ def _remove_hcom_hooks_from_settings(settings):
         r'\bhcom\s+(post|stop|notify)\b',           # Direct hcom command
         r'\buvx\s+hcom\s+(post|stop|notify)\b',     # uvx hcom command
         r'hcom\.py["\']?\s+(post|stop|notify)\b',   # hcom.py with optional quote
-        r'["\'][^"\']*hcom\.py["\']?\s+(post|stop|notify)\b',  # Quoted path with hcom.py
+        r'["\'][^"\']*hcom\.py["\']?\s+(post|stop|notify)\b(?=\s|$)',  # Quoted path with hcom.py (more precise)
         r'sh\s+-c.*hcom',                           # Shell wrapper with hcom
     ]
     compiled_patterns = [re.compile(pattern) for pattern in hcom_patterns]
     
-    for event in ['PostToolUse', 'Stop', 'Notification']:
+    for event in ['PreToolUse', 'PostToolUse', 'Stop', 'Notification']:
         if event not in settings['hooks']:
             continue
         
-        settings['hooks'][event] = [
-            matcher for matcher in settings['hooks'][event]
-            if not any(
-                any(
+        # Process each matcher
+        updated_matchers = []
+        for matcher in settings['hooks'][event]:
+            # Fail fast on malformed settings - Claude won't run with broken settings anyway
+            if not isinstance(matcher, dict):
+                raise ValueError(f"Malformed settings: matcher in {event} is not a dict: {type(matcher).__name__}")
+            
+            # Work with a copy to avoid any potential reference issues
+            matcher_copy = copy.deepcopy(matcher)
+            
+            # Filter out HCOM hooks from this matcher
+            non_hcom_hooks = [
+                hook for hook in matcher_copy.get('hooks', [])
+                if not any(
                     pattern.search(hook.get('command', ''))
                     for pattern in compiled_patterns
                 )
-                for hook in matcher.get('hooks', [])
-            )
-        ]
+            ]
+            
+            # Only keep the matcher if it has non-HCOM hooks remaining
+            if non_hcom_hooks:
+                matcher_copy['hooks'] = non_hcom_hooks
+                updated_matchers.append(matcher_copy)
+            elif not matcher.get('hooks'):  # Preserve matchers that never had hooks
+                updated_matchers.append(matcher_copy)
         
-        if not settings['hooks'][event]:
+        # Update or remove the event
+        if updated_matchers:
+            settings['hooks'][event] = updated_matchers
+        else:
             del settings['hooks'][event]
     
-    if not settings['hooks']:
-        del settings['hooks']
 
 def build_env_string(env_vars, format_type="bash"):
     """Build environment variable string for different shells"""
@@ -571,7 +646,11 @@ def escape_for_platform(text, platform_type):
                    .replace('\t', '\\t'))  # Escape tabs
     elif platform_type == 'powershell':
         # PowerShell escaping - use backticks for special chars
-        return text.replace('`', '``').replace('"', '`"').replace('$', '`$')
+        # Quote paths with spaces for PowerShell
+        escaped = text.replace('`', '``').replace('"', '`"').replace('$', '`$')
+        if ' ' in text and not (text.startswith('"') and text.endswith('"')):
+            return f'"{escaped}"'
+        return escaped
     else:  # POSIX/bash
         return shlex.quote(text)
 
@@ -590,7 +669,7 @@ def safe_command_substitution(template, **substitutions):
             result = result.replace(placeholder, quoted_value)
     return result
 
-def launch_terminal(command, env, config=None, cwd=None):
+def launch_terminal(command, env, config=None, cwd=None, background=False):
     """Launch terminal with command
     
     Args:
@@ -598,19 +677,55 @@ def launch_terminal(command, env, config=None, cwd=None):
         env: Environment variables to set
         config: Configuration dict
         cwd: Working directory
+        background: Launch as background process
     """
-    import subprocess
-    
     if config is None:
         config = get_cached_config()
     
     env_vars = os.environ.copy()
     env_vars.update(env)
     
-    terminal_mode = get_config_value('terminal_mode', 'new_window')
-    
     # Command should now always be a string from build_claude_command
     command_str = command
+    
+    # Background mode implementation
+    if background:
+        # Create log file for background instance
+        logs_dir = get_hcom_dir() / 'logs'
+        logs_dir.mkdir(exist_ok=True)
+        log_file = logs_dir / env['HCOM_BACKGROUND']
+        
+        # Launch detached process
+        try:
+            with open(log_file, 'w') as log_handle:
+                process = subprocess.Popen(
+                    command_str,
+                    shell=True,
+                    env=env_vars,
+                    cwd=cwd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True  # detach from terminal session
+                )
+        except OSError as e:
+            print(f"Error: Failed to launch background instance: {e}", file=sys.stderr)
+            return None
+        
+        # Check for immediate failures
+        time.sleep(0.2)
+        if process.poll() is not None:
+            # Process already exited
+            with open(log_file, 'r') as f:
+                error_output = f.read()[:1000]
+            print(f"Error: Background instance failed immediately", file=sys.stderr)
+            if error_output:
+                print(f"  Output: {error_output}", file=sys.stderr)
+            return None
+        
+        return str(log_file)
+    
+    terminal_mode = get_config_value('terminal_mode', 'new_window')
     
     if terminal_mode == 'show_commands':
         env_str = build_env_string(env)
@@ -675,7 +790,7 @@ def launch_terminal(command, env, config=None, cwd=None):
                 subprocess.run(term_cmd + [full_cmd])
                 return True
         
-        raise Exception(format_error("No supported terminal emulator found", "Install gnome-terminal, konsole, xfce4-terminal, or xterm"))
+        raise Exception(format_error("No supported terminal emulator found", "Install gnome-terminal, konsole, or xterm"))
         
     elif system == 'Windows':
         # Windows Terminal with PowerShell
@@ -709,8 +824,8 @@ def setup_hooks():
         try:
             with open(settings_path, 'r') as f:
                 settings = json.load(f)
-        except json.JSONDecodeError:
-            settings = {}
+        except (json.JSONDecodeError, PermissionError) as e:
+            raise Exception(format_error(f"Cannot read settings: {e}"))
     
     if 'hooks' not in settings:
         settings['hooks'] = {}
@@ -723,13 +838,21 @@ def setup_hooks():
     
     if 'hooks' not in settings:
         settings['hooks'] = {}
-    
-    hcom_send_permission = 'Bash(echo HCOM_SEND:*)'
-    if hcom_send_permission not in settings['permissions']['allow']:
-        settings['permissions']['allow'].append(hcom_send_permission)
-    
+        
     # Get the hook command template
     hook_cmd_base, _ = get_hook_command()
+    
+    # Add PreToolUse hook for auto-approving HCOM_SEND commands
+    if 'PreToolUse' not in settings['hooks']:
+        settings['hooks']['PreToolUse'] = []
+    
+    settings['hooks']['PreToolUse'].append({
+        'matcher': 'Bash',
+        'hooks': [{
+            'type': 'command',
+            'command': f'{hook_cmd_base} pre'
+        }]
+    })
     
     # Add PostToolUse hook
     if 'PostToolUse' not in settings['hooks']:
@@ -771,9 +894,33 @@ def setup_hooks():
     })
     
     # Write settings atomically
-    atomic_write(settings_path, json.dumps(settings, indent=2))
+    try:
+        atomic_write(settings_path, json.dumps(settings, indent=2))
+    except Exception as e:
+        raise Exception(format_error(f"Cannot write settings: {e}"))
+    
+    # Quick verification
+    if not verify_hooks_installed(settings_path):
+        raise Exception(format_error("Hook installation failed"))
     
     return True
+
+def verify_hooks_installed(settings_path):
+    """Verify that HCOM hooks were installed correctly"""
+    try:
+        with open(settings_path, 'r') as f:
+            settings = json.load(f)
+        
+        # Check all 4 hook types exist with HCOM commands
+        hooks = settings.get('hooks', {})
+        for hook_type in ['PreToolUse', 'PostToolUse', 'Stop', 'Notification']:
+            if not any('hcom' in str(h).lower() or 'HCOM' in str(h) 
+                      for h in hooks.get(hook_type, [])):
+                return False
+        
+        return True
+    except Exception:
+        return False
 
 def is_interactive():
     """Check if running in interactive mode"""
@@ -781,7 +928,7 @@ def is_interactive():
 
 def get_archive_timestamp():
     """Get timestamp for archive files"""
-    return datetime.now().strftime("%Y%m%d-%H%M%S")
+    return datetime.now().strftime("%Y-%m-%d_%H%M%S")
 
 def get_conversation_uuid(transcript_path):
     """Get conversation UUID from transcript
@@ -878,12 +1025,11 @@ def get_new_messages(instance_name):
     """Get new messages for instance with @-mention filtering"""
     ensure_hcom_dir()
     log_file = get_hcom_dir() / "hcom.log"
-    pos_file = get_hcom_dir() / "hcom.json"
     
     if not log_file.exists():
         return []
     
-    positions = load_positions(pos_file)
+    positions = load_all_positions()
     
     # Get last position for this instance
     last_pos = 0
@@ -908,13 +1054,8 @@ def get_new_messages(instance_name):
         f.seek(0, 2)  # Seek to end
         new_pos = f.tell()
     
-    # Update position file
-    if instance_name not in positions:
-        positions[instance_name] = {}
-    
-    positions[instance_name]['pos'] = new_pos 
-    
-    atomic_write(pos_file, json.dumps(positions, indent=2))
+    # Update position directly
+    update_instance_position(instance_name, {'pos': new_pos})
     
     return messages
 
@@ -964,7 +1105,19 @@ def get_transcript_status(transcript_path):
 def get_instance_status(pos_data):
     """Get current status of instance"""
     now = int(time.time())
-    wait_timeout = get_config_value('wait_timeout', 1800)
+    wait_timeout = pos_data.get('wait_timeout', get_config_value('wait_timeout', 1800))
+    
+    # Check if process is still alive. pid: null means killed
+    # All real instances should have a PID (set by update_instance_with_pid)
+    if 'pid' in pos_data:
+        pid = pos_data['pid']
+        if pid is None:
+            # Explicitly null = was killed
+            return "inactive", ""
+        try:
+            os.kill(int(pid), 0)  # Check process existence
+        except (ProcessLookupError, TypeError, ValueError):
+            return "inactive", ""
     
     last_permission = pos_data.get("last_permission_request", 0)
     last_stop = pos_data.get("last_stop", 0)
@@ -978,6 +1131,14 @@ def get_instance_status(pos_data):
         status, _, _, transcript_timestamp = get_transcript_status(transcript_path)
         transcript_status = status
     
+    # Calculate last actual activity (excluding heartbeat)
+    last_activity = max(last_permission, last_tool, transcript_timestamp)
+    
+    # Check timeout based on actual activity
+    if last_activity > 0 and (now - last_activity) > wait_timeout:
+        return "inactive", ""
+    
+    # Now determine current status including heartbeat
     events = [
         (last_permission, "blocked"),
         (last_stop, "waiting"), 
@@ -988,14 +1149,13 @@ def get_instance_status(pos_data):
     recent_events = [(ts, status) for ts, status in events if ts > 0]
     if not recent_events:
         return "inactive", ""
-        
+    
     most_recent_time, most_recent_status = max(recent_events)
     age = now - most_recent_time
     
-    if age > wait_timeout:
-        return "inactive", ""
-        
-    return most_recent_status, f"({format_age(age)})"
+    # Add background indicator
+    status_suffix = " (bg)" if pos_data.get('background') else ""
+    return most_recent_status, f"({format_age(age)}){status_suffix}"
 
 def get_status_block(status_type):
     """Get colored status block for a status type"""
@@ -1053,12 +1213,7 @@ def show_recent_activity_alt_screen(limit=None):
 
 def show_instances_status():
     """Show status of all instances"""
-    pos_file = get_hcom_dir() / "hcom.json"
-    if not pos_file.exists():
-        print(f"   {DIM}No Claude instances connected{RESET}")
-        return
-    
-    positions = load_positions(pos_file)
+    positions = load_all_positions()
     if not positions:
         print(f"   {DIM}No Claude instances connected{RESET}")
         return
@@ -1072,12 +1227,7 @@ def show_instances_status():
 
 def show_instances_by_directory():
     """Show instances organized by their working directories"""
-    pos_file = get_hcom_dir() / "hcom.json"
-    if not pos_file.exists():
-        print(f"   {DIM}No Claude instances connected{RESET}")
-        return
-    
-    positions = load_positions(pos_file)
+    positions = load_all_positions()
     if positions:
         directories = {}
         for instance_name, pos_data in positions.items():
@@ -1138,11 +1288,7 @@ def alt_screen_detailed_status_and_input():
 
 def get_status_summary():
     """Get a one-line summary of all instance statuses"""
-    pos_file = get_hcom_dir() / "hcom.json"
-    if not pos_file.exists():
-        return f"{BG_BLUE}{BOLD}{FG_WHITE} no instances {RESET}"
-    
-    positions = load_positions(pos_file)
+    positions = load_all_positions()
     if not positions:
         return f"{BG_BLUE}{BOLD}{FG_WHITE} no instances {RESET}"
     
@@ -1181,12 +1327,9 @@ def log_line_with_status(message, status):
 
 def initialize_instance_in_position_file(instance_name, conversation_uuid=None):
     """Initialize an instance in the position file with all required fields"""
-    ensure_hcom_dir()
-    pos_file = get_hcom_dir() / "hcom.json"
-    positions = load_positions(pos_file)
-    
-    if instance_name not in positions:
-        positions[instance_name] = {
+    instance_file = get_instance_file(instance_name)
+    if not instance_file.exists():
+        save_instance_position(instance_name, {
             "pos": 0,
             "directory": str(Path.cwd()),
             "conversation_uuid": conversation_uuid or "unknown",
@@ -1198,58 +1341,36 @@ def initialize_instance_in_position_file(instance_name, conversation_uuid=None):
             "session_id": "",
             "help_shown": False,
             "notification_message": ""
-        }
-        atomic_write(pos_file, json.dumps(positions, indent=2))
+        })
 
 def migrate_instance_name_if_needed(instance_name, conversation_uuid, transcript_path):
     """Migrate instance name from fallback to UUID-based if needed"""
     if instance_name.endswith("claude") and conversation_uuid:
         new_instance = get_display_name(transcript_path)
         if new_instance != instance_name and not new_instance.endswith("claude"):
-            # Always return the new name if we can generate it
             # Migration of data only happens if old name exists
-            pos_file = get_hcom_dir() / "hcom.json"
-            positions = load_positions(pos_file)
-            if instance_name in positions:
-                # Copy over the old instance data to new name
-                positions[new_instance] = positions.pop(instance_name)
-                # Update the conversation UUID in the migrated data
-                positions[new_instance]["conversation_uuid"] = conversation_uuid
-                atomic_write(pos_file, json.dumps(positions, indent=2))
+            old_file = get_instance_file(instance_name)
+            if old_file.exists():
+                data = load_instance_position(instance_name)
+                data["conversation_uuid"] = conversation_uuid
+                save_instance_position(new_instance, data)
+                old_file.unlink()
             return new_instance
     return instance_name
 
 def update_instance_position(instance_name, update_fields):
-    """Update instance position in position file"""
-    ensure_hcom_dir()
-    pos_file = get_hcom_dir() / "hcom.json"
-    
-    # Get file modification time before reading to detect races
-    mtime_before = pos_file.stat().st_mtime_ns if pos_file.exists() else 0
-    positions = load_positions(pos_file)
-    
-    # Get or create instance data
-    if instance_name not in positions:
-        positions[instance_name] = {}
-    
-    # Update only provided fields
-    for key, value in update_fields.items():
-        positions[instance_name][key] = value
-    
-    # Check if file was modified while we were working
-    mtime_after = pos_file.stat().st_mtime_ns if pos_file.exists() else 0
-    if mtime_after != mtime_before:
-        # Someone else modified it, retry once
-        return update_instance_position(instance_name, update_fields)
-    
-    # Write back atomically
-    atomic_write(pos_file, json.dumps(positions, indent=2))
+    """Update instance position - direct file write, no locking needed"""
+    data = load_instance_position(instance_name)
+    data.update(update_fields)
+    save_instance_position(instance_name, data)
 
-def check_and_show_first_use_help(instance_name):
-    """Check and show first-use help if needed"""
+def get_first_use_text(instance_name):
+    """Get first-use help text if not shown yet
     
-    pos_file = get_hcom_dir() / "hcom.json"
-    positions = load_positions(pos_file)
+    Returns:
+        str: Welcome text if not shown before, empty string otherwise
+    """
+    positions = load_all_positions()
     
     instance_data = positions.get(instance_name, {})
     if not instance_data.get('help_shown', False):
@@ -1260,10 +1381,20 @@ def check_and_show_first_use_help(instance_name):
         first_use_text = get_config_value('first_use_text', '')
         instance_hints = get_config_value('instance_hints', '')
         
-        help_text = f"Welcome! hcom chat active. Your alias: {instance_name}. " \
-                   f"Send messages: echo \"HCOM_SEND:your message\". " \
-                   f"{first_use_text} {instance_hints}".strip()
+        help_text = f"[Welcome! hcom chat active. Your alias: {instance_name}. " \
+                   f"Send messages: echo 'HCOM_SEND:your message']"
+        if first_use_text:
+            help_text += f" [{first_use_text}]"
+        if instance_hints:
+            help_text += f" [{instance_hints}]"
         
+        return help_text
+    return ""
+
+def check_and_show_first_use_help(instance_name):
+    """Check and show first-use help if needed (for Stop hook)"""
+    help_text = get_first_use_text(instance_name)
+    if help_text:
         output = {"decision": HOOK_DECISION_BLOCK, "reason": help_text}
         print(json.dumps(output, ensure_ascii=False), file=sys.stderr)
         sys.exit(EXIT_BLOCK)
@@ -1290,6 +1421,15 @@ def show_main_screen_header():
     
     return all_messages
 
+def show_cli_hints(to_stderr=True):
+    """Show CLI hints if configured"""
+    cli_hints = get_config_value('cli_hints', '')
+    if cli_hints:
+        if to_stderr:
+            print(f"\n{cli_hints}", file=sys.stderr)
+        else:
+            print(f"\n{cli_hints}")
+
 def cmd_help():
     """Show help text"""
     # Basic help for interactive users
@@ -1299,18 +1439,21 @@ Usage:
   hcom open [n]                Launch n Claude instances
   hcom open <agent>            Launch named agent from .claude/agents/
   hcom open --prefix <team> n  Launch n instances with team prefix
+  hcom open --background       Launch instances as background processes (-p also works)
   hcom watch                   View conversation dashboard
   hcom clear                   Clear and archive conversation
   hcom cleanup                 Remove hooks from current directory
   hcom cleanup --all           Remove hooks from all tracked directories
+  hcom kill [instance alias]   Kill specific instance
+  hcom kill --all              Kill all running instances
   hcom help                    Show this help
 
 Automation:
   hcom send 'msg'              Send message to all
   hcom send '@prefix msg'      Send to specific instances
-  hcom watch --logs            Show logs
-  hcom watch --status          Show status
-  hcom watch --wait [timeout]  Wait and notify for new messages (seconds)
+  hcom watch --logs            Show conversation log
+  hcom watch --status          Show status of instances
+  hcom watch --wait [seconds]  Wait for new messages (default 60s)
 
 Docs: https://raw.githubusercontent.com/aannoo/claude-hook-comms/main/README.md""")
     
@@ -1321,19 +1464,25 @@ Docs: https://raw.githubusercontent.com/aannoo/claude-hook-comms/main/README.md"
 === ADDITIONAL INFO ===
 
 CONCEPT: HCOM creates multi-agent collaboration by launching multiple Claude Code 
-instances in separate terminals that share a single conversation.
+instances in separate terminals that share a group chat.
 
 KEY UNDERSTANDING:
 • Single conversation - All instances share ~/.hcom/hcom.log
-• Agents are system prompts - "reviewer" loads .claude/agents/reviewer.md
-• CLI usage - Use 'hcom send' for messaging. Internal instances use 'echo HCOM_SEND:'
-• hcom open is directory-specific - always cd to project directory first              
+• CLI usage - Use 'hcom send' for messaging. Internal instances know to use 'echo HCOM_SEND:'
+• hcom open is directory-specific - always cd to project directory first 
+• hcom watch --wait outputs existing logs, then waits for the next message, prints it, and exits. 
+Times out after [seconds]
+• Named agents are custom system prompts created by users/claude code.
+"reviewer" named agent loads .claude/agents/reviewer.md (if it was ever created)
 
 LAUNCH PATTERNS:
   hcom open 2 reviewer                   # 2 generic + 1 reviewer agent
   hcom open reviewer reviewer            # 2 separate reviewer instances  
   hcom open --prefix api 2               # Team naming: api-hova7, api-kolec
-  hcom open test --claude-args "-p 'write tests'"  # Pass 'claude' CLI flags
+  hcom open --claude-args "--model sonnet"  # Pass 'claude' CLI flags
+  hcom open --background (or -p) then hcom kill  # Detached background process
+  hcom watch --status (get sessionid) then hcom open --claude-args "--resume <sessionid>"
+  HCOM_INITIAL_PROMPT="do x task" hcom open  # initial prompt to instance
 
 @MENTION TARGETING:
   hcom send "message"           # Broadcasts to everyone
@@ -1343,21 +1492,26 @@ LAUNCH PATTERNS:
 
 STATUS INDICATORS:
 • ◉ thinking, ▷ responding, ▶ executing - instance is working
-• ◉ waiting - instance is waiting for new messages (hcom send)
+• ◉ waiting - instance is waiting for new messages
 • ■ blocked - instance is blocked by permission request (needs user approval)
-• ○ inactive - instance is inactive (timed out, disconnected, etc)
+• ○ inactive - instance is timed out, disconnected, etc
               
 CONFIG:
-Environment overrides (temporary): HCOM_INSTANCE_HINTS="useful info" hcom send "hi"
-Config file (persistent): ~/.hcom/config.json
+Config file (persistent s): ~/.hcom/config.json
 
-Key settings (all in config.json):
-  terminal_mode: "new_window" | "same_terminal" | "show_commands"
-  initial_prompt: "Say hi in chat", first_use_text: "Essential, concise messages only..."
-  instance_hints: "", cli_hints: ""  # Extra info for instances/CLI
+Key settings (full list in config.json):
+  terminal_mode: "new_window" (default) | "same_terminal" | "show_commands"
+  initial_prompt: "Say hi in chat", first_use_text: "Essential messages only..."
+  instance_hints: "text", cli_hints: "text"  # Extra info for instances/CLI
 
-EXPECT: Instance names are auto-generated (5-char format based on uuid: "hova7"). Check actual names 
+Temporary environment overrides for any setting (all caps & append HCOM_):
+HCOM_INSTANCE_HINTS="useful info" hcom open  # applied to all messages recieved by instance
+export HCOM_CLI_HINTS="useful info" && hcom send 'hi'  # applied to all cli commands
+
+EXPECT: hcom instance aliases are auto-generated (5-char format: "hova7"). Check actual aliases 
 with 'hcom watch --status'. Instances respond automatically in shared chat.""")
+        
+        show_cli_hints(to_stderr=False)
     
     return 0
 
@@ -1365,7 +1519,11 @@ def cmd_open(*args):
     """Launch Claude instances with chat enabled"""
     try:
         # Parse arguments
-        instances, prefix, claude_args = parse_open_args(list(args))
+        instances, prefix, claude_args, background = parse_open_args(list(args))
+        
+        # Add -p flag and stream-json output for background mode if not already present
+        if background and '-p' not in claude_args and '--print' not in claude_args:
+            claude_args = ['-p', '--output-format', 'stream-json', '--verbose'] + (claude_args or [])
         
         terminal_mode = get_config_value('terminal_mode', 'new_window')
         
@@ -1385,19 +1543,19 @@ def cmd_open(*args):
         
         ensure_hcom_dir()
         log_file = get_hcom_dir() / 'hcom.log'
-        pos_file = get_hcom_dir() / 'hcom.json'
+        instances_dir = get_hcom_dir() / 'instances'
         
         if not log_file.exists():
             log_file.touch()
-        if not pos_file.exists():
-            atomic_write(pos_file, json.dumps({}, indent=2))
+        if not instances_dir.exists():
+            instances_dir.mkdir(exist_ok=True)
         
         # Build environment variables for Claude instances
         base_env = build_claude_env()
         
         # Add prefix-specific hints if provided
         if prefix:
-            hint = f"To respond to {prefix} group: echo \"HCOM_SEND:@{prefix} message\""
+            hint = f"To respond to {prefix} group: echo 'HCOM_SEND:@{prefix} message'"
             base_env['HCOM_INSTANCE_HINTS'] = hint
             
             first_use = f"You're in the {prefix} group. Use {prefix} to message: echo HCOM_SEND:@{prefix} message."
@@ -1409,6 +1567,14 @@ def cmd_open(*args):
         temp_files_to_cleanup = []
         
         for instance_type in instances:
+            instance_env = base_env.copy()
+            
+            # Mark background instances via environment with log filename
+            if background:
+                # Generate unique log filename
+                log_filename = f'background_{int(time.time())}_{random.randint(1000, 9999)}.log'
+                instance_env['HCOM_BACKGROUND'] = log_filename
+            
             # Build claude command
             if instance_type == 'generic':
                 # Generic instance - no agent content
@@ -1421,6 +1587,9 @@ def cmd_open(*args):
                 # Agent instance
                 try:
                     agent_content, agent_config = resolve_agent(instance_type)
+                    # Prepend agent instance awareness to system prompt
+                    agent_prefix = f"You are an instance of {instance_type}. Do not start a subagent with {instance_type} unless explicitly asked.\n\n"
+                    agent_content = agent_prefix + agent_content
                     # Use agent's model and tools if specified and not overridden in claude_args
                     agent_model = agent_config.get('model')
                     agent_tools = agent_config.get('tools')
@@ -1438,8 +1607,14 @@ def cmd_open(*args):
                     continue
             
             try:
-                launch_terminal(claude_cmd, base_env, cwd=os.getcwd())
-                launched += 1
+                if background:
+                    log_file = launch_terminal(claude_cmd, instance_env, cwd=os.getcwd(), background=True)
+                    if log_file:
+                        print(f"Background instance launched, log: {log_file}")
+                        launched += 1
+                else:
+                    launch_terminal(claude_cmd, instance_env, cwd=os.getcwd())
+                    launched += 1
             except Exception as e:
                 print(f"Error: Failed to launch terminal: {e}", file=sys.stderr)
         
@@ -1472,6 +1647,12 @@ def cmd_open(*args):
         
         print("\n" + "\n".join(f"  • {tip}" for tip in tips))
         
+        # Show cli_hints if configured (non-interactive mode)
+        if not is_interactive():
+            cli_hints = get_config_value('cli_hints', '')
+            if cli_hints:
+                print(f"\n{cli_hints}") 
+        
         return 0
         
     except ValueError as e:
@@ -1484,9 +1665,9 @@ def cmd_open(*args):
 def cmd_watch(*args):
     """View conversation dashboard"""
     log_file = get_hcom_dir() / 'hcom.log'
-    pos_file = get_hcom_dir() / 'hcom.json'
+    instances_dir = get_hcom_dir() / 'instances'
     
-    if not log_file.exists() and not pos_file.exists():
+    if not log_file.exists() and not instances_dir.exists():
         print(format_error("No conversation found", "Run 'hcom open' first"), file=sys.stderr)
         return 1
     
@@ -1495,71 +1676,115 @@ def cmd_watch(*args):
     show_status = False
     wait_timeout = None
     
-    for arg in args:
+    i = 0
+    while i < len(args):
+        arg = args[i]
         if arg == '--logs':
             show_logs = True
         elif arg == '--status':
             show_status = True
-        elif arg.startswith('--wait='):
-            try:
-                wait_timeout = int(arg.split('=')[1])
-            except ValueError:
-                print(format_error("Invalid timeout value"), file=sys.stderr)
-                return 1
         elif arg == '--wait':
-            # Default wait timeout if no value provided
-            wait_timeout = 60
+            # Check if next arg is a number
+            if i + 1 < len(args) and args[i + 1].isdigit():
+                wait_timeout = int(args[i + 1])
+                i += 1  # Skip the number
+            else:
+                wait_timeout = 60  # Default
+        i += 1
+    
+    # If wait is specified, enable logs to show the messages
+    if wait_timeout is not None:
+        show_logs = True
     
     # Non-interactive mode (no TTY or flags specified)
     if not is_interactive() or show_logs or show_status:
         if show_logs:
+            # Atomic position capture BEFORE parsing (prevents race condition)
             if log_file.exists():
+                last_pos = log_file.stat().st_size  # Capture position first
                 messages = parse_log_messages(log_file)
-                for msg in messages:
-                    print(f"[{msg['timestamp']}] {msg['from']}: {msg['message']}")
             else:
-                print("No messages yet")
-                
+                last_pos = 0
+                messages = []
+            
+            # If --wait, show only recent messages to prevent context bloat
             if wait_timeout is not None:
-                start_time = time.time()
-                last_pos = log_file.stat().st_size if log_file.exists() else 0
+                cutoff = datetime.now() - timedelta(seconds=5)
+                recent_messages = [m for m in messages if datetime.fromisoformat(m['timestamp']) > cutoff]
                 
+                # Status to stderr, data to stdout
+                if recent_messages:
+                    print(f'---Showing last 5 seconds of messages---', file=sys.stderr)
+                    for msg in recent_messages:
+                        print(f"[{msg['timestamp']}] {msg['from']}: {msg['message']}")
+                    print(f'---Waiting for new message... (exits on receipt or after {wait_timeout} seconds)---', file=sys.stderr)
+                else:
+                    print(f'---Waiting for new message... (exits on receipt or after {wait_timeout} seconds)---', file=sys.stderr)
+                
+                # Wait loop
+                start_time = time.time()
                 while time.time() - start_time < wait_timeout:
                     if log_file.exists() and log_file.stat().st_size > last_pos:
+                        # Capture new position BEFORE parsing (atomic)
+                        new_pos = log_file.stat().st_size
                         new_messages = parse_log_messages(log_file, last_pos)
-                        for msg in new_messages:
-                            print(f"[{msg['timestamp']}] {msg['from']}: {msg['message']}")
-                        last_pos = log_file.stat().st_size
-                        break
-                    time.sleep(1)
+                        if new_messages:
+                            for msg in new_messages:
+                                print(f"[{msg['timestamp']}] {msg['from']}: {msg['message']}")
+                            last_pos = new_pos  # Update only after successful processing
+                            return 0  # Success - got new messages
+                        last_pos = new_pos  # Update even if no messages (file grew but no complete messages yet)
+                    time.sleep(0.1)
+                
+                # Timeout message to stderr
+                print(f'[TIMED OUT] No new messages received after {wait_timeout} seconds.', file=sys.stderr)
+                return 1  # Timeout - no new messages
+            
+            # Regular --logs (no --wait): print all messages to stdout
+            else:
+                if messages:
+                    for msg in messages:
+                        print(f"[{msg['timestamp']}] {msg['from']}: {msg['message']}")
+                else:
+                    print("No messages yet", file=sys.stderr)
+            
+            show_cli_hints()
                     
         elif show_status:
+            # Status information to stdout for parsing
             print("HCOM STATUS")
             print("INSTANCES:")
             show_instances_status()
             print("\nRECENT ACTIVITY:")
             show_recent_activity_alt_screen()
             print(f"\nLOG FILE: {log_file}")
+            
+            show_cli_hints()
         else:
-            # No TTY - show automation usage
-            print("Automation usage:")
-            print("  hcom send 'message'    Send message to group")
-            print("  hcom watch --logs      Show message history")
-            print("  hcom watch --status    Show instance status")
+            # No TTY - show automation usage to stderr
+            print("Automation usage:", file=sys.stderr)
+            print("  hcom send 'message'    Send message to group", file=sys.stderr)
+            print("  hcom watch --logs      Show message history", file=sys.stderr)
+            print("  hcom watch --status    Show instance status", file=sys.stderr)
+            print("  hcom watch --wait      Wait for new messages", file=sys.stderr)
+            
+            show_cli_hints()
         
         return 0
     
     # Interactive dashboard mode
-    last_pos = 0
     status_suffix = f"{DIM} [⏎]...{RESET}"
 
+    # Atomic position capture BEFORE showing messages (prevents race condition)
+    if log_file.exists():
+        last_pos = log_file.stat().st_size
+    else:
+        last_pos = 0
+    
     all_messages = show_main_screen_header()
     
     show_recent_messages(all_messages, limit=5)
     print(f"\n{DIM}{'─'*10} [watching for new messages] {'─'*10}{RESET}")
-    
-    if log_file.exists():
-        last_pos = log_file.stat().st_size
     
     # Print newline to ensure status starts on its own line
     print()
@@ -1637,49 +1862,64 @@ def cmd_clear():
     """Clear and archive conversation"""
     ensure_hcom_dir()
     log_file = get_hcom_dir() / 'hcom.log'
-    pos_file = get_hcom_dir() / 'hcom.json'
+    instances_dir = get_hcom_dir() / 'instances'
+    archive_folder = get_hcom_dir() / 'archive'
     
     # Check if hcom files exist
-    if not log_file.exists() and not pos_file.exists():
+    if not log_file.exists() and not instances_dir.exists():
         print("No hcom conversation to clear")
         return 0
     
     # Generate archive timestamp
     timestamp = get_archive_timestamp()
     
+    # Ensure archive folder exists
+    archive_folder.mkdir(exist_ok=True)
+    
     # Archive existing files if they have content
     archived = False
     
     try:
-        # Archive log file if it exists and has content
-        if log_file.exists() and log_file.stat().st_size > 0:
-            archive_log = get_hcom_dir() / f'hcom-{timestamp}.log'
-            log_file.rename(archive_log)
-            archived = True
-        elif log_file.exists():
-            log_file.unlink()
+        # Create session archive folder if we have content to archive
+        has_log = log_file.exists() and log_file.stat().st_size > 0
+        has_instances = instances_dir.exists() and any(instances_dir.glob('*.json'))
         
-        # Archive position file if it exists and has content
-        if pos_file.exists():
-            try:
-                with open(pos_file, 'r') as f:
-                    data = json.load(f)
-                    if data:  # Non-empty position file
-                        archive_pos = get_hcom_dir() / f'hcom-{timestamp}.json'
-                        pos_file.rename(archive_pos)
-                        archived = True
-                    else:
-                        pos_file.unlink()
-            except (json.JSONDecodeError, FileNotFoundError):
-                if pos_file.exists():
-                    pos_file.unlink()
+        if has_log or has_instances:
+            # Create session archive folder with timestamp
+            session_archive = archive_folder / f'session-{timestamp}'
+            session_archive.mkdir(exist_ok=True)
+            
+            # Archive log file
+            if has_log:
+                archive_log = session_archive / 'hcom.log'
+                log_file.rename(archive_log)
+                archived = True
+            elif log_file.exists():
+                log_file.unlink()
+            
+            # Archive instances
+            if has_instances:
+                archive_instances = session_archive / 'instances'
+                archive_instances.mkdir(exist_ok=True)
+                
+                # Move json files only (background logs stay in logs folder)
+                for f in instances_dir.glob('*.json'):
+                    f.rename(archive_instances / f.name)
+                
+                archived = True
+        else:
+            # Clean up empty files/dirs
+            if log_file.exists():
+                log_file.unlink()
+            if instances_dir.exists():
+                shutil.rmtree(instances_dir)
         
         log_file.touch()
-        atomic_write(pos_file, json.dumps({}, indent=2))
+        clear_all_positions()
         
         if archived:
-            print(f"Archived conversations to hcom-{timestamp}")
-        print("Started fresh hcom conversation")
+            print(f"Archived to archive/session-{timestamp}/")
+        print("Started fresh hcom conversation log")
         return 0
         
     except Exception as e:
@@ -1706,31 +1946,16 @@ def cleanup_directory_hooks(directory):
         hooks_found = False
         
         original_hook_count = sum(len(settings.get('hooks', {}).get(event, [])) 
-                                  for event in ['PostToolUse', 'Stop', 'Notification'])
+                                  for event in ['PreToolUse', 'PostToolUse', 'Stop', 'Notification'])
         
         _remove_hcom_hooks_from_settings(settings)
         
         # Check if any were removed
         new_hook_count = sum(len(settings.get('hooks', {}).get(event, [])) 
-                             for event in ['PostToolUse', 'Stop', 'Notification'])
+                             for event in ['PreToolUse', 'PostToolUse', 'Stop', 'Notification'])
         if new_hook_count < original_hook_count:
             hooks_found = True
-        
-        if 'permissions' in settings and 'allow' in settings['permissions']:
-            original_perms = settings['permissions']['allow'][:]
-            settings['permissions']['allow'] = [
-                perm for perm in settings['permissions']['allow']
-                if 'HCOM_SEND' not in perm
-            ]
-            
-            if len(settings['permissions']['allow']) < len(original_perms):
-                hooks_found = True
-            
-            if not settings['permissions']['allow']:
-                del settings['permissions']['allow']
-            if not settings['permissions']:
-                del settings['permissions']
-        
+                
         if not hooks_found:
             return 0, "No hcom hooks found"
         
@@ -1750,39 +1975,77 @@ def cleanup_directory_hooks(directory):
         return 1, format_error(f"Cannot modify settings.local.json: {e}")
 
 
+def cmd_kill(*args):
+    """Kill instances by name or all with --all"""
+    import signal
+    
+    instance_name = args[0] if args and args[0] != '--all' else None
+    positions = load_all_positions() if not instance_name else {instance_name: load_instance_position(instance_name)}
+    
+    # Filter to instances with PIDs (any instance that's running)
+    targets = [(name, data) for name, data in positions.items() if data.get('pid')]
+    
+    if not targets:
+        print(f"No running process found for {instance_name}" if instance_name else "No running instances found")
+        return 1 if instance_name else 0
+    
+    killed_count = 0
+    for target_name, target_data in targets:
+        # Get status and type info before killing
+        status, age = get_instance_status(target_data)
+        instance_type = "background" if target_data.get('background') else "foreground"
+        
+        pid = int(target_data['pid'])
+        try:
+            # Send SIGTERM for graceful shutdown
+            os.kill(pid, signal.SIGTERM)
+            
+            # Wait up to 2 seconds for process to terminate
+            for _ in range(20):
+                time.sleep(0.1)
+                try:
+                    os.kill(pid, 0)  # Check if process still exists
+                except ProcessLookupError:
+                    # Process terminated successfully
+                    break
+            else:
+                # Process didn't die from SIGTERM, force kill
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    time.sleep(0.1)  # Brief wait for SIGKILL to take effect
+                except ProcessLookupError:
+                    pass  # Already dead
+            
+            print(f"Killed {target_name} ({instance_type}, {status}{age}, PID {pid})")
+            killed_count += 1
+        except (ProcessLookupError, TypeError, ValueError) as e:
+            print(f"Process {pid} already dead or invalid: {e}")
+        
+        # Mark instance as killed
+        update_instance_position(target_name, {'pid': None})
+    
+    if not instance_name:
+        print(f"Killed {killed_count} instance(s)")
+    
+    return 0
+
 def cmd_cleanup(*args):
     """Remove hcom hooks from current directory or all directories"""
     if args and args[0] == '--all':
         directories = set()
         
-        # Get all directories from current position file
-        pos_file = get_hcom_dir() / 'hcom.json'
-        if pos_file.exists():
-            try:
-                positions = load_positions(pos_file)
+        # Get all directories from current instances
+        try:
+            positions = load_all_positions()
+            if positions:
                 for instance_data in positions.values():
                     if isinstance(instance_data, dict) and 'directory' in instance_data:
                         directories.add(instance_data['directory'])
-            except Exception as e:
-                print(format_warning(f"Could not read current position file: {e}"))
-        
-        hcom_dir = get_hcom_dir()
-        try:
-            # Look for archived position files (hcom-TIMESTAMP.json)
-            for archive_file in hcom_dir.glob('hcom-*.json'):
-                try:
-                    with open(archive_file, 'r') as f:
-                        archived_positions = json.load(f)
-                        for instance_data in archived_positions.values():
-                            if isinstance(instance_data, dict) and 'directory' in instance_data:
-                                directories.add(instance_data['directory'])
-                except Exception as e:
-                    print(format_warning(f"Could not read archive {archive_file.name}: {e}"))
         except Exception as e:
-            print(format_warning(f"Could not scan for archived files: {e}"))
+            print(format_warning(f"Could not read current instances: {e}"))
         
         if not directories:
-            print("No directories found in hcom tracking (current or archived)")
+            print("No directories found in current hcom tracking")
             return 0
         
         print(f"Found {len(directories)} unique directories to check")
@@ -1834,9 +2097,9 @@ def cmd_send(message):
     """Send message to hcom"""
     # Check if hcom files exist
     log_file = get_hcom_dir() / 'hcom.log'
-    pos_file = get_hcom_dir() / 'hcom.json'
+    instances_dir = get_hcom_dir() / 'instances'
     
-    if not log_file.exists() and not pos_file.exists():
+    if not log_file.exists() and not instances_dir.exists():
         print(format_error("No conversation found", "Run 'hcom open' first"), file=sys.stderr)
         return 1
     
@@ -1848,14 +2111,14 @@ def cmd_send(message):
     
     # Check for unmatched mentions (minimal warning)
     mentions = MENTION_PATTERN.findall(message)
-    if mentions and pos_file.exists():
+    if mentions:
         try:
-            positions = load_positions(pos_file)
+            positions = load_all_positions()
             all_instances = list(positions.keys())
             unmatched = [m for m in mentions 
                         if not any(name.lower().startswith(m.lower()) for name in all_instances)]
             if unmatched:
-                print(f"Note: @{', @'.join(unmatched)} don't match any instances - broadcasting to all")
+                print(f"Note: @{', @'.join(unmatched)} don't match any instances - broadcasting to all", file=sys.stderr)
         except Exception:
             pass  # Don't fail on warning
     
@@ -1863,7 +2126,12 @@ def cmd_send(message):
     sender_name = get_config_value('sender_name', 'bigboss')
     
     if send_message(sender_name, message):
-        print("Message sent")
+        print("Message sent", file=sys.stderr)
+        
+        # Show cli_hints if configured (non-interactive mode)
+        if not is_interactive():
+            show_cli_hints()
+        
         return 0
     else:
         print(format_error("Failed to send message"), file=sys.stderr)
@@ -1871,18 +2139,25 @@ def cmd_send(message):
 
 # ==================== Hook Functions ====================
 
+def update_instance_with_pid(updates, existing_data):
+    """Add PID to updates if not already set in existing data"""
+    if not existing_data.get('pid'):
+        updates['pid'] = os.getppid()  # Parent PID is the Claude process
+    return updates
+
 def format_hook_messages(messages, instance_name):
     """Format messages for hook feedback"""
     if len(messages) == 1:
         msg = messages[0]
-        reason = f"{msg['from']} → {instance_name}: {msg['message']}"
+        reason = f"[new message] {msg['from']} → {instance_name}: {msg['message']}"
     else:
-        parts = [f"{msg['from']}: {msg['message']}" for msg in messages]
-        reason = f"{len(messages)} messages → {instance_name}: " + " | ".join(parts)
+        parts = [f"{msg['from']} → {instance_name}: {msg['message']}" for msg in messages]
+        reason = f"[{len(messages)} new messages] | " + " | ".join(parts)
     
+    # Only append instance_hints to messages (first_use_text is handled separately)
     instance_hints = get_config_value('instance_hints', '')
     if instance_hints:
-        reason = f"{reason} {instance_hints}"
+        reason = f"{reason} | [{instance_hints}]"
     
     return reason
 
@@ -1904,14 +2179,32 @@ def handle_hook_post():
         
         initialize_instance_in_position_file(instance_name, conversation_uuid)
         
-        update_instance_position(instance_name, {
+        # Get existing position data to check if already set
+        existing_data = load_instance_position(instance_name)
+        
+        updates = {
                 'last_tool': int(time.time()),
                 'last_tool_name': hook_data.get('tool_name', 'unknown'),
                 'session_id': hook_data.get('session_id', ''),
                 'transcript_path': transcript_path,
                 'conversation_uuid': conversation_uuid or 'unknown',
-                'directory': str(Path.cwd())
-            })
+                'directory': str(Path.cwd()),
+            }
+        
+        # Update PID if not already set
+        update_instance_with_pid(updates, existing_data)
+        
+        # Check if this is a background instance and save log file
+        bg_env = os.environ.get('HCOM_BACKGROUND')
+        if bg_env:
+            updates['background'] = True
+            updates['background_log_file'] = str(get_hcom_dir() / 'logs' / bg_env)
+        
+        update_instance_position(instance_name, updates)
+        
+        # Check for first-use help (prepend to first activity)
+        welcome_text = get_first_use_text(instance_name)
+        welcome_prefix = f"{welcome_text} | " if welcome_text else ""
         
         # Check for HCOM_SEND in Bash commands  
         sent_reason = None
@@ -1949,25 +2242,42 @@ def handle_hook_post():
                             sys.exit(EXIT_BLOCK)
                         
                         send_message(instance_name, message)
-                        sent_reason = "✓ Sent"
+                        sent_reason = "[✓ Sent]"
         
         messages = get_new_messages(instance_name)
+        
+        # Limit messages to max_messages_per_delivery
+        if messages:
+            max_messages = get_config_value('max_messages_per_delivery', 50)
+            messages = messages[:max_messages]
         
         if messages and sent_reason:
             # Both sent and received
             reason = f"{sent_reason} | {format_hook_messages(messages, instance_name)}"
+            if welcome_prefix:
+                reason = f"{welcome_prefix}{reason}"
             output = {"decision": HOOK_DECISION_BLOCK, "reason": reason}
             print(json.dumps(output, ensure_ascii=False), file=sys.stderr)
             sys.exit(EXIT_BLOCK)
         elif messages:
             # Just received
             reason = format_hook_messages(messages, instance_name)
+            if welcome_prefix:
+                reason = f"{welcome_prefix}{reason}"
             output = {"decision": HOOK_DECISION_BLOCK, "reason": reason}
             print(json.dumps(output, ensure_ascii=False), file=sys.stderr)
             sys.exit(EXIT_BLOCK)
         elif sent_reason:
             # Just sent
-            output = {"reason": sent_reason}
+            reason = sent_reason
+            if welcome_prefix:
+                reason = f"{welcome_prefix}{reason}"
+            output = {"reason": reason}
+            print(json.dumps(output, ensure_ascii=False), file=sys.stderr)
+            sys.exit(EXIT_BLOCK)
+        elif welcome_prefix:
+            # No activity but need to show welcome
+            output = {"decision": HOOK_DECISION_BLOCK, "reason": welcome_prefix.rstrip(' | ')}
             print(json.dumps(output, ensure_ascii=False), file=sys.stderr)
             sys.exit(EXIT_BLOCK)
     
@@ -1989,17 +2299,38 @@ def handle_hook_stop():
         instance_name = get_display_name(transcript_path) if transcript_path else f"{Path.cwd().name[:2].lower()}claude"
         conversation_uuid = get_conversation_uuid(transcript_path)
         
+        # Migrate instance name if needed (from fallback to UUID-based)
+        instance_name = migrate_instance_name_if_needed(instance_name, conversation_uuid, transcript_path)
+        
         # Initialize instance if needed
         initialize_instance_in_position_file(instance_name, conversation_uuid)
         
-        # Update instance as waiting
-        update_instance_position(instance_name, {
-            'last_stop': int(time.time()),
+        # Get the timeout this hook will use
+        timeout = get_config_value('wait_timeout', 1800)
+        
+        # Get existing position data to check if PID is already set
+        existing_data = load_instance_position(instance_name)
+        
+        # Update instance as waiting and store the timeout
+        updates = {
+            'last_stop': time.time(),
+            'wait_timeout': timeout,  # Store this instance's timeout
             'session_id': hook_data.get('session_id', ''),
             'transcript_path': transcript_path,
             'conversation_uuid': conversation_uuid or 'unknown',
-            'directory': str(Path.cwd())
-        })
+            'directory': str(Path.cwd()),
+        }
+        
+        # Update PID if not already set
+        update_instance_with_pid(updates, existing_data)
+        
+        # Check if this is a background instance and save log file
+        bg_env = os.environ.get('HCOM_BACKGROUND')
+        if bg_env:
+            updates['background'] = True
+            updates['background_log_file'] = str(get_hcom_dir() / 'logs' / bg_env)
+        
+        update_instance_position(instance_name, updates)
         
         parent_pid = os.getppid()
         
@@ -2007,7 +2338,6 @@ def handle_hook_stop():
         check_and_show_first_use_help(instance_name)
         
         # Simple polling loop with parent check
-        timeout = get_config_value('wait_timeout', 1800)
         start_time = time.time()
         
         while time.time() - start_time < timeout:
@@ -2030,10 +2360,10 @@ def handle_hook_stop():
             
             # Update heartbeat
             update_instance_position(instance_name, {
-                'last_stop': int(time.time())
+                'last_stop': time.time()
             })
             
-            time.sleep(1)
+            time.sleep(0.1)
             
     except Exception:
         pass
@@ -2056,21 +2386,70 @@ def handle_hook_notification():
         # Initialize instance if needed
         initialize_instance_in_position_file(instance_name, conversation_uuid)
         
+        # Get existing position data to check if PID is already set
+        existing_data = load_instance_position(instance_name)
+        
         # Update permission request timestamp
-        update_instance_position(instance_name, {
+        updates = {
             'last_permission_request': int(time.time()),
             'notification_message': hook_data.get('message', ''),
             'session_id': hook_data.get('session_id', ''),
             'transcript_path': transcript_path,
             'conversation_uuid': conversation_uuid or 'unknown',
-            'directory': str(Path.cwd())
-        })
+            'directory': str(Path.cwd()),
+        }
+        
+        # Update PID if not already set
+        update_instance_with_pid(updates, existing_data)
+        
+        # Check if this is a background instance and save log file
+        bg_env = os.environ.get('HCOM_BACKGROUND')
+        if bg_env:
+            updates['background'] = True
+            updates['background_log_file'] = str(get_hcom_dir() / 'logs' / bg_env)
+        
+        update_instance_position(instance_name, updates)
         
         check_and_show_first_use_help(instance_name)
                     
     except Exception:
         pass
     
+    sys.exit(EXIT_SUCCESS)
+
+def handle_hook_pretooluse():
+    """Handle PreToolUse hook - auto-approve HCOM_SEND commands"""
+    # Check if active
+    if os.environ.get(HCOM_ACTIVE_ENV) != HCOM_ACTIVE_VALUE:
+        sys.exit(EXIT_SUCCESS)
+    
+    try:
+        # Read hook input
+        hook_data = json.load(sys.stdin)
+        tool_name = hook_data.get('tool_name', '')
+        tool_input = hook_data.get('tool_input', {})
+        
+        # Only process Bash commands
+        if tool_name == 'Bash':
+            command = tool_input.get('command', '')
+            
+            # Check if it's an HCOM_SEND command
+            if 'HCOM_SEND:' in command:
+                # Auto-approve HCOM_SEND commands
+                output = {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "permissionDecisionReason": "HCOM_SEND command auto-approved"
+                    }
+                }
+                print(json.dumps(output, ensure_ascii=False))
+                sys.exit(EXIT_SUCCESS)
+    
+    except Exception:
+        pass
+    
+    # Let normal permission flow continue for non-HCOM_SEND commands
     sys.exit(EXIT_SUCCESS)
 
 # ==================== Main Entry Point ====================
@@ -2101,6 +2480,8 @@ def main(argv=None):
             print(format_error("Message required"), file=sys.stderr)
             return 1
         return cmd_send(argv[2])
+    elif cmd == 'kill':
+        return cmd_kill(*argv[2:])
     
     # Hook commands
     elif cmd == 'post':
@@ -2111,6 +2492,9 @@ def main(argv=None):
         return 0
     elif cmd == 'notify':
         handle_hook_notification()
+        return 0
+    elif cmd == 'pre':
+        handle_hook_pretooluse()
         return 0
     
     

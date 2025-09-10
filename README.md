@@ -38,7 +38,7 @@ uv tool install hcom
 # or pip
 pip install hcom
 # then use with:
-hcom open 3
+hcom open
 ```
 
 
@@ -57,15 +57,18 @@ hcom open 2 backend-coder frontend-coder
 # Launch multiple of the same agent
 hcom open reviewer reviewer reviewer  # 3 separate reviewers
 
-# Launch agents in background with specific prompts
-hcom open test-writer --claude-args "-p 'write tests for any new code'"
+# Launch instances as background processes (no terminal window, managed with 'hcom kill')
+hcom open --background
+hcom open -p 2 code-writer    # -p is shorthand for --background
 
-# Launch watchers that respond to notifications
-hcom open reviewer --claude-args "-p 'review when @mentioned'"
+# Launch agent with specific prompt
+HCOM_INITIAL_PROMPT='write tests' hcom open test-writer
+
+# Resume instance (hcom chat will continue)
+hcom open --claude-args "--resume session_id"  # get session_id from hcom watch
 
 # Pass multiple Claude flags
-hcom open orchestrator --claude-args "--model claude-sonnet 
---resume session_id"
+hcom open orchestrator --claude-args "--model sonnet --resume session_id"
 
 # Launch in specific directories
 cd backend && hcom open api-specialist
@@ -86,9 +89,11 @@ hcom send "@hovoa7 can you check this?"     # Message specific instance by name
 | Command | Description |
 |---------|-------------|
 | `hcom open [n]` | Launch n Claude instances (or named agents) |
+| `hcom open -p` | Launch instances as background processes |
 | `hcom watch` | Conversation/status dashboard |
 | `hcom clear` | Clear and archive conversation |
 | `hcom cleanup` | Remove HCOM hooks from current directory |
+| `hcom kill [name]` | Kill specific instance or all with --all |
 
 ### Automation Commands
 | Command | Description |
@@ -139,10 +144,10 @@ HCOM_INSTANCE_HINTS="always update chat with progress" hcom open nice-subagent-b
 
 ```bash
 # Change your name for one command
-HCOM_SENDER_NAME="reviewer" hcom send "LGTM!"
+HCOM_SENDER_NAME="coolguy" hcom send "LGTM!"
 
-# Make instances wait 30 minutes instead of 10
-HCOM_WAIT_TIMEOUT=1800 hcom open 3
+# Make instances timeout after 60 seconds instead of 30 minutes
+HCOM_WAIT_TIMEOUT=60 hcom open 3
 
 # Custom welcome message
 HCOM_FIRST_USE_TEXT="Debug session for issue #123" hcom open 2
@@ -158,6 +163,7 @@ HCOM_MAX_MESSAGE_SIZE=8192 hcom send "$(cat long_report.txt)"
 - ◉ **waiting** (blue) - Waiting for messages
 - ■ **blocked** (yellow) - Permission blocked
 - ○ **inactive** (red) - Timed out/dead
+- **(bg)** suffix - Instance running in background mode
 
 </details>
 
@@ -186,8 +192,10 @@ hcom adds hooks to your project directory's `.claude/settings.local.json`:
 ```
 ~/.hcom/                             
 ├── hcom.log       # Conversation log
-├── hcom.json      # Instance tracking
-└── config.json    # Configuration
+├── instances/     # Instance tracking
+├── logs/          # Background process logs
+├── config.json    # Configuration
+└── archive/       # Archived sessions
 
 your-project/  
 └── .claude/
@@ -278,6 +286,15 @@ Configure `terminal_command` in `~/.hcom/config.json` to use your preferred term
 ### Archive Conversation / Start New
 ```bash
 hcom clear
+```
+
+### Kill Running Instances
+```bash
+# Kill specific instance
+hcom kill hovoa7
+
+# Kill all instances
+hcom kill --all
 ```
 
 ### Remove HCOM hooks from current directory
