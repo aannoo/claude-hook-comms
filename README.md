@@ -1,109 +1,138 @@
 # hcom - Claude Hook Comms
 
-Lightweight CLI tool for real-time communication between Claude Code [subagents](https://docs.anthropic.com/en/docs/claude-code/sub-agents) using [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks).
+[![PyPI - Version](https://img.shields.io/pypi/v/hcom)](https://pypi.org/project/hcom/)
+ [![PyPI - License](https://img.shields.io/pypi/l/hcom)](https://opensource.org/license/MIT) [![Python Version](https://img.shields.io/badge/python-3.7+-blue.svg)](https://python.org)
 
-## 🦆 What It Does
-
-Creates a group chat where you and multiple interactive Claude Code subagents can communicate with each other across different folders on your computer. Works on Mac, Linux, and Windows with zero dependencies.
+CLI tool for launching multiple Claude Code terminals with interactive [subagents](https://docs.anthropic.com/en/docs/claude-code/sub-agents), headless persistence, and real-time communication via [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks). Works on Mac, Linux, and Windows with zero dependencies.
 
 ![Claude Hook Comms Example](https://raw.githubusercontent.com/aannoo/claude-hook-comms/main/screenshot.jpg)
 
-## 🦷 Features
+## 🥦 Usage
+
+**Run without installing** ([uv](https://docs.astral.sh/uv/#installation))
+```bash
+uvx hcom open 2
+```
+
+**Install** (optional)
+```bash
+pip install hcom
+hcom open 2
+```
+
+| Commands |  |
+|---------|-------------|
+| `hcom open [n]` | Launch `n` instances or named agents |
+| `hcom watch` | Live dashboard / messaging |
+| `hcom clear` | New conversation log |
+| `hcom cleanup` | Safely remove hcom hooks, preserving your project settings |
+
+
+## 🦆 What It Does
+
+`hcom open` adds hooks to the `.claude/settings.local.json` file in the current folder and launches terminals with claude code that remain active, waiting to respond to messages in the shared chat.
+
+**Subagents in their own terminal**
+```bash
+# Launch subagents from your .claude/agents
+hcom open planner code-writer reviewer
+```
+
+**Persistent headless instances**
+```bash
+# Launch one headless instance (default 30min timeout)
+hcom open -p
+```
+
+**Groups and direct messages**
+```bash
+hcom open --prefix cool  # Creates cool-hovoa7
+hcom open --prefix cool  # Creates cool-homab8
+hcom send '@cool hi, you are cool'
+hcom send '@homab8 hi, you are cooler'
+```
+
+---
+
+
+<details>
+<summary><strong>🦷 Features</strong></summary>
 
 - **Multi-Terminal Launch** - Launch Claude Code subagents in new terminals
-- **Live Dashboard** - Real-time monitoring of all instances
-- **Multi-Agent Communication** - Claude instances talk to each other across projects
-- **@Mention Targeting** - Send messages to specific subagents or teams
+- **Background Mode** - Run headless instances without terminal windows
+- **Interactive subagents** - Run subagents in their own terminal window
+- **Live Dashboard** - Real-time monitoring and messaging
+- **Multi-Agent Communication** - Instances talk to each other via shared chat
+- **@Mention Targeting** - Send messages to specific instances or teams
+- **Session Persistence** - Resume previous conversations automatically
 - **Zero Dependencies** - Pure Python stdlib, works everywhere
 
-## 🎪 Quick Start
+</details>
 
-### Use Without Installing
+<details>
+<summary><strong>🥨 All Commands</strong></summary>
+
+
+| Command | Description |
+|---------|-------------|
+| `hcom open [n]` | Launch n Claude instances (or named agents) |
+| `hcom open -p` | Launch headless process |
+| `hcom open --prefix <p> [n]` | Launch with `<p>` prefix (e.g., api-hova7) |
+| `hcom open --claude-args "..."` | Pass flags to Claude Code |
+| `hcom watch` | Conversation/status dashboard |
+| `hcom clear` | Clear and archive conversation |
+| `hcom cleanup` | Safely Remove HCOM hooks from current directory while preserving your settings (`--all` for all directories) |
+| `hcom kill [name]` | Kill specific instance (--all for all running instances) |
+
+### Automation Commands
+| Command | Description |
+|---------|-------------|
+| `hcom send 'message'` | Send message to all instances |
+| `hcom send '@alias msg'` | Send to specific instances alias or prefix |
+| `hcom watch --logs` | View message log history (non-interactive) |
+| `hcom watch --status` | Show instance status as JSON (non-interactive) |
+| `hcom watch --wait [timeout]` | Wait and notify for new messages |
+
+</details>
+
+
+
+<details>
+<summary><strong>🗿 Examples</strong></summary>
+
 ```bash
-# Launch 3 default Claude instances connected to group chat
-uvx hcom open 3
+# Instances can be privately @mentioned by alias or prefix
+hcom open --prefix cool  # Creates cool-hovoa7
+hcom open --prefix cool  # Creates cool-hovob8
+hcom open --prefix notcool # creates notcool-hovoc9
 
-# Launch researcher and code-writer from your .claude/agents
-uvx hcom open researcher code-writer
+# Send a targeted message in dashboard
+@notcool i think you smell good
+@cool that other guy is smelly
+@hovoa7 im lying about the smelly thing
 
-# View/send messages in dashboard
-uvx hcom watch
-```
+# Launch 3 headless instances that die after 60 seconds of inactivity
+HCOM_WAIT_TIMEOUT="60" hcom open 3 -p
+# Manually kill all instance
+hcom kill --all
 
-### Install
-
-```bash
-# uv
-uv tool install hcom
-# or pip
-pip install hcom
-# then use with:
-hcom open
-```
-
-
-## 🦐 Requirements
-
-- Python 3.6+
-- [Claude Code](https://claude.ai/code)
-
-
-## 🗿 More Examples
-
-```bash
-# Launch 2 generic instances + 2 specific agents
-hcom open 2 backend-coder frontend-coder
-
-# Launch multiple of the same agent
-hcom open reviewer reviewer reviewer  # 3 separate reviewers
-
-# Launch instances as background processes (no terminal window, managed with 'hcom kill')
-hcom open --background
-hcom open -p 2 code-writer    # -p is shorthand for --background
+# Launch multiple of the same subagent
+hcom open reviewer reviewer reviewer
 
 # Launch agent with specific prompt
 HCOM_INITIAL_PROMPT='write tests' hcom open test-writer
 
 # Resume instance (hcom chat will continue)
-hcom open --claude-args "--resume session_id"  # get session_id from hcom watch
+hcom open --claude-args "--resume session_id"
+
+# Text appended to all messages recieved by instance
+HCOM_INSTANCE_HINTS="remember where you came from" hcom open
 
 # Pass multiple Claude flags
 hcom open orchestrator --claude-args "--model sonnet --resume session_id"
-
-# Launch in specific directories
-cd backend && hcom open api-specialist
-cd ../frontend && hcom open ui-specialist
-
-# Create named teams that can be @mentioned
-cd ~/api && hcom open --prefix api debugger  # Creates api-hovoa7
-cd ~/auth && hcom open --prefix auth debugger  # Creates auth-hovob8
-
-# Message specific teams or instances
-hcom send "@api login works but API fails"  # Messages all api-* instances
-hcom send "@hovoa7 can you check this?"     # Message specific instance by name
 ```
 
-
-## 🥨 Commands
-
-| Command | Description |
-|---------|-------------|
-| `hcom open [n]` | Launch n Claude instances (or named agents) |
-| `hcom open -p` | Launch instances as background processes |
-| `hcom watch` | Conversation/status dashboard |
-| `hcom clear` | Clear and archive conversation |
-| `hcom cleanup` | Remove HCOM hooks from current directory |
-| `hcom kill [name]` | Kill specific instance or all with --all |
-
-### Automation Commands
-| Command | Description |
-|---------|-------------|
-| `hcom send 'message'` | Send message to chat |
-| `hcom watch --logs` | View message history (non-interactive) |
-| `hcom watch --status` | Show instance status (non-interactive) |
-| `hcom watch --wait [timeout]` | Wait and notify for new messages |
-
----
+</details>
 
 <details>
 <summary><strong>🦖 Configuration</strong></summary>
@@ -128,7 +157,7 @@ HCOM_INSTANCE_HINTS="always update chat with progress" hcom open nice-subagent-b
 | Setting | Default | Environment Variable | Description |
 |---------|---------|---------------------|-------------|
 | `wait_timeout` | 1800 | `HCOM_WAIT_TIMEOUT` | How long instances wait for messages (seconds) |
-| `max_message_size` | 4096 | `HCOM_MAX_MESSAGE_SIZE` | Maximum message length |
+| `max_message_size` | 1048576 | `HCOM_MAX_MESSAGE_SIZE` | Maximum message length (1MB) |
 | `max_messages_per_delivery` | 50 | `HCOM_MAX_MESSAGES_PER_DELIVERY` | Messages delivered per batch |
 | `sender_name` | "bigboss" | `HCOM_SENDER_NAME` | Your name in chat |
 | `sender_emoji` | "🐳" | `HCOM_SENDER_EMOJI` | Your emoji icon |
@@ -138,6 +167,7 @@ HCOM_INSTANCE_HINTS="always update chat with progress" hcom open nice-subagent-b
 | `terminal_command` | null | `HCOM_TERMINAL_COMMAND` | Custom terminal command (see Terminal Options) |
 | `cli_hints` | "" | `HCOM_CLI_HINTS` | Extra text added to CLI outputs |
 | `instance_hints` | "" | `HCOM_INSTANCE_HINTS` | Extra text added to instance messages |
+| `auto_watch` | true | `HCOM_AUTO_WATCH` | Auto-launch watch dashboard after open |
 | `env_overrides` | {} | - | Additional environment variables for Claude Code |
 
 ### Examples
@@ -152,8 +182,16 @@ HCOM_WAIT_TIMEOUT=60 hcom open 3
 # Custom welcome message
 HCOM_FIRST_USE_TEXT="Debug session for issue #123" hcom open 2
 
-# Bigger messages
-HCOM_MAX_MESSAGE_SIZE=8192 hcom send "$(cat long_report.txt)"
+# Bigger delivery batches
+HCOM_MAX_MESSAGES_PER_DELIVERY=100 hcom watch --logs
+```
+
+**Windows PowerShell**:
+```powershell
+# Set environment variables in PowerShell
+$env:HCOM_TERMINAL_MODE="same_terminal"; hcom open agent-name
+$env:HCOM_WAIT_TIMEOUT="60"; hcom open 3
+$env:HCOM_INITIAL_PROMPT="go home buddy!"; hcom open
 ```
 
 ### Status Indicators
@@ -163,7 +201,7 @@ HCOM_MAX_MESSAGE_SIZE=8192 hcom send "$(cat long_report.txt)"
 - ◉ **waiting** (blue) - Waiting for messages
 - ■ **blocked** (yellow) - Permission blocked
 - ○ **inactive** (red) - Timed out/dead
-- **(bg)** suffix - Instance running in background mode
+- **(bg)** suffix - Instance running in background headless mode
 
 </details>
 
@@ -174,14 +212,14 @@ HCOM_MAX_MESSAGE_SIZE=8192 hcom send "$(cat long_report.txt)"
 
 hcom adds hooks to your project directory's `.claude/settings.local.json`:
 
-1. **Sending**: Claude agents use `echo "HCOM_SEND:message"` internally (you use `hcom send` from terminal)
+1. **Sending**: Claude agents use `echo "HCOM_SEND:message"` internally (you use `hcom send` from terminal or dashboard)
 2. **Receiving**: Other Claudes get notified via Stop hook
 3. **Waiting**: Stop hook keeps Claude in a waiting state for new messages
 
-- **Identity**: Each instance gets a unique name based on conversation UUID (e.g., "hovoa7")
+- **Identity**: Each instance gets a unique name based on session ID (e.g., "hovoa7")
 - **Persistence**: Names persist across `--resume` maintaining conversation context
 - **Status Detection**: Notification hook tracks permission requests and activity
-- **Agents**: When you run `hcom open researcher`, it loads an interactive Claude session with a system prompt from `.claude/agents/researcher.md` (local) or `~/.claude/agents/researcher.md` (global). Agents can specify `model:` and `tools:` in YAML frontmatter
+- **Agents**: When you run `hcom open researcher`, it loads an interactive Claude session with a system prompt from `.claude/agents/researcher.md` (local) or `~/.claude/agents/researcher.md` (global). Specified `model:` and `tools:` are carried over.
 
 ### Architecture
 - **Single conversation** - All instances share one global conversation
@@ -199,7 +237,7 @@ hcom adds hooks to your project directory's `.claude/settings.local.json`:
 
 your-project/  
 └── .claude/
-    └── settings.local.json  # hcom hooks configuration
+    └── settings.local.json  # hcom hooks
 ```
 
 </details>
@@ -211,7 +249,7 @@ your-project/
 ### Terminal Mode
 
 Configure terminal behavior in `~/.hcom/config.json`:
-- `"terminal_mode": "new_window"` - Opens new terminal windows (default)
+- `"terminal_mode": "new_window"` - Opens new terminal window(s) (default)
 - `"terminal_mode": "same_terminal"` - Opens in current terminal
 - `"terminal_mode": "show_commands"` - Prints commands without executing
 
@@ -219,9 +257,9 @@ Configure terminal behavior in `~/.hcom/config.json`:
 
 - **macOS**: Terminal.app
 - **Linux**: gnome-terminal, konsole, or xterm
-- **Windows**: Windows Terminal / PowerShell
+- **Windows & WSL**: Windows Terminal / Git Bash
 
-### Running in Current Terminal
+### Running in Current Terminal temporarily
 ```bash
 # For single instances
 HCOM_TERMINAL_MODE=same_terminal hcom open
@@ -229,52 +267,84 @@ HCOM_TERMINAL_MODE=same_terminal hcom open
 
 ### Custom Terminal Examples
 
-Configure `terminal_command` in `~/.hcom/config.json` to use your preferred terminal:
+Configure `terminal_command` in `~/.hcom/config.json` (permanent) or environment variables (temporary).
+
+#### How to use this
+
+The `{script}` placeholder is replaced by HCOM with the path to a temporary bash script that launches Claude Code.
+
+Your custom command just needs to:
+1. Accept `{script}` as a placeholder that will be replaced with a script path
+2. Execute that script with bash
+
+Example template: `your_terminal_command --execute "bash {script}"`
 
 ### iTerm2
 ```json
-{
-  "terminal_command": "osascript -e 'tell app \"iTerm2\" to create window with default profile' -e 'tell current session of current window to write text \"{env} {cmd}\"'"
-}
-```
-
-### Alacritty
-```json
-{
-  "terminal_command": "alacritty -e sh -c '{env} {cmd}'"
-}
-```
-
-### Kitty
-```json
-{
-  "terminal_command": "kitty sh -c '{env} {cmd}'"
-}
+"terminal_command": "osascript -e 'tell app \"iTerm\" to tell (create window with default profile) to tell current session to write text \"{script}\"'"
 ```
 
 ### WezTerm
+Windows:
 ```json
-{
-  "terminal_command": "wezterm cli spawn --new-window -- sh -c '{env} {cmd}'"
-}
+  "terminal_command": "wezterm start -- bash {script}"
 ```
+Or open tabs from within WezTerm:
+```json
+  "terminal_command": "wezterm cli spawn -- bash {script}"
+```
+macOS/Linux:
+```json
+  "terminal_command": "wezterm start -- bash {script}"
+```
+
+### Wave Terminal
+Windows. From within Wave Terminal:
+```json
+  "terminal_command": "wsh run -- bash {script}"
+```
+
+### Alacritty
+macOS:
+```json
+  "terminal_command": "open -n -a Alacritty.app --args -e bash {script}"
+```
+Linux:
+```json
+  "terminal_command": "alacritty -e bash {script}"
+```
+
+### Kitty
+macOS:
+```json
+  "terminal_command": "open -n -a kitty.app --args bash {script}"
+```
+Linux:
+```json
+  "terminal_command": "kitty bash {script}"
+```
+
+### Termux (Android)
+```json
+  "terminal_command": "am startservice --user 0 -n com.termux/com.termux.app.RunCommandService -a com.termux.RUN_COMMAND --es com.termux.RUN_COMMAND_PATH {script} --ez com.termux.RUN_COMMAND_BACKGROUND false"
+```
+Note: Requires `allow-external-apps=true` in `~/.termux/termux.properties`
 
 ### tmux
 ```json
-{
-  "terminal_command": "tmux new-window -n hcom sh -c '{env} {cmd}'"
-}
+  "terminal_command": "tmux new-window -n hcom {script}"
+```
+Then from a terminal:
+```bash
+# Run hcom open directly in new session
+tmux new-session 'hcom open 3'
+```
+Or once off:
+```bash
+# Start tmux with split panes and 3 claude instances in hcom chat
+HCOM_TERMINAL_COMMAND="tmux split-window -h {script}" hcom open 3
 ```
 
-### Available Placeholders
-- `{cmd}` - The claude command to execute
-- `{env}` - Environment variables (pre-formatted as `VAR1='value1' VAR2='value2'`)
-- `{cwd}` - Current working directory
-
-### Notes
-- Custom commands must exit with code 0 for success
-- The `{env}` placeholder contains shell-quoted environment variables
-- Most terminals require wrapping the command in `sh -c` to handle environment variables correctly
 
 </details>
 
@@ -313,8 +383,14 @@ hcom cleanup --all
 
 </details>
 
+## 🦐 Requirements
+
+- Python 3.7+
+- [Claude Code](https://claude.ai/code)
+
+
 ## 🌮 License
 
-MIT License
+- MIT License
 
 ---
