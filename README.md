@@ -1,11 +1,11 @@
 # hcom - Claude Hook Comms
 
 [![PyPI - Version](https://img.shields.io/pypi/v/hcom)](https://pypi.org/project/hcom/)
- [![PyPI - License](https://img.shields.io/pypi/l/hcom)](https://opensource.org/license/MIT) [![Python Version](https://img.shields.io/badge/python-3.7+-blue.svg)](https://python.org)
+ [![PyPI - License](https://img.shields.io/pypi/l/hcom)](https://opensource.org/license/MIT) [![Python Version](https://img.shields.io/badge/python-3.7+-blue.svg)](https://python.org) [![DeepWiki](https://img.shields.io/badge/DeepWiki-aannoo%2Fclaude--hook--comms-blue.svg?logo=data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACwAAAAyCAYAAAAnWDnqAAAAAXNSR0IArs4c6QAAA05JREFUaEPtmUtyEzEQhtWTQyQLHNak2AB7ZnyXZMEjXMGeK/AIi+QuHrMnbChYY7MIh8g01fJoopFb0uhhEqqcbWTp06/uv1saEDv4O3n3dV60RfP947Mm9/SQc0ICFQgzfc4CYZoTPAswgSJCCUJUnAAoRHOAUOcATwbmVLWdGoH//PB8mnKqScAhsD0kYP3j/Yt5LPQe2KvcXmGvRHcDnpxfL2zOYJ1mFwrryWTz0advv1Ut4CJgf5uhDuDj5eUcAUoahrdY/56ebRWeraTjMt/00Sh3UDtjgHtQNHwcRGOC98BJEAEymycmYcWwOprTgcB6VZ5JK5TAJ+fXGLBm3FDAmn6oPPjR4rKCAoJCal2eAiQp2x0vxTPB3ALO2CRkwmDy5WohzBDwSEFKRwPbknEggCPB/imwrycgxX2NzoMCHhPkDwqYMr9tRcP5qNrMZHkVnOjRMWwLCcr8ohBVb1OMjxLwGCvjTikrsBOiA6fNyCrm8V1rP93iVPpwaE+gO0SsWmPiXB+jikdf6SizrT5qKasx5j8ABbHpFTx+vFXp9EnYQmLx02h1QTTrl6eDqxLnGjporxl3NL3agEvXdT0WmEost648sQOYAeJS9Q7bfUVoMGnjo4AZdUMQku50McDcMWcBPvr0SzbTAFDfvJqwLzgxwATnCgnp4wDl6Aa+Ax283gghmj+vj7feE2KBBRMW3FzOpLOADl0Isb5587h/U4gGvkt5v60Z1VLG8BhYjbzRwyQZemwAd6cCR5/XFWLYZRIMpX39AR0tjaGGiGzLVyhse5C9RKC6ai42ppWPKiBagOvaYk8lO7DajerabOZP46Lby5wKjw1HCRx7p9sVMOWGzb/vA1hwiWc6jm3MvQDTogQkiqIhJV0nBQBTU+3okKCFDy9WwferkHjtxib7t3xIUQtHxnIwtx4mpg26/HfwVNVDb4oI9RHmx5WGelRVlrtiw43zboCLaxv46AZeB3IlTkwouebTr1y2NjSpHz68WNFjHvupy3q8TFn3Hos2IAk4Ju5dCo8B3wP7VPr/FGaKiG+T+v+TQqIrOqMTL1VdWV1DdmcbO8KXBz6esmYWYKPwDL5b5FA1a0hwapHiom0r/cKaoqr+27/XcrS5UwSMbQAAAABJRU5ErkJggg==)](https://deepwiki.com/aannoo/claude-hook-comms)
 
-CLI tool for launching multiple Claude Code terminals with interactive [subagents](https://docs.anthropic.com/en/docs/claude-code/sub-agents), headless persistence, and real-time communication via [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks). Works on Mac, Linux, and Windows with zero dependencies.
+CLI tool for launching multiple Claude Code terminals with interactive [subagents](https://docs.anthropic.com/en/docs/claude-code/sub-agents), headless persistence, and real-time communication via [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks). Works on Mac, Linux, Windows, and Android with zero dependencies.
 
-![Claude Hook Comms Example](https://raw.githubusercontent.com/aannoo/claude-hook-comms/main/screenshot.jpg)
+![Claude Code Hook Comms Example](https://raw.githubusercontent.com/aannoo/claude-hook-comms/main/screencapture.gif)
 
 ## 🥦 Usage
 
@@ -23,33 +23,40 @@ hcom open 2
 | Commands |  |
 |---------|-------------|
 | `hcom open [n]` | Launch `n` instances or named agents |
-| `hcom watch` | Live dashboard / messaging |
-| `hcom clear` | New conversation log |
+| `hcom watch` | View live dashboard and messaging |
+| `hcom clear` | Clear and start new conversation |
 | `hcom cleanup` | Safely remove hcom hooks, preserving your project settings |
 
 
 ## 🦆 What It Does
 
-`hcom open` adds hooks to the `.claude/settings.local.json` file in the current folder and launches terminals with claude code that remain active, waiting to respond to messages in the shared chat.
+`hcom open` adds hooks to the `.claude/settings.local.json` file in the current folder and launches terminals with claude code that remain active, waiting to respond to messages in the shared chat. Normal Claude Code opened with `claude` remains unaffected by hcom.
 
-**Subagents in their own terminal**
+### Subagents in their own terminal
 ```bash
 # Launch subagents from your .claude/agents
 hcom open planner code-writer reviewer
 ```
 
-**Persistent headless instances**
+### Persistent headless instances
 ```bash
 # Launch one headless instance (default 30min timeout)
 hcom open -p
 ```
 
-**Groups and direct messages**
+### Groups and direct messages
 ```bash
 hcom open --prefix cool  # Creates cool-hovoa7
 hcom open --prefix cool  # Creates cool-homab8
 hcom send '@cool hi, you are cool'
 hcom send '@homab8 hi, you are cooler'
+```
+
+### Persistent thinking mode
+```bash
+# Thinking mode maintains for entire session
+HCOM_INITIAL_PROMPT="ultrathink and do x" hcom open
+# Every new message reply uses ultrathink
 ```
 
 ---
@@ -66,6 +73,7 @@ hcom send '@homab8 hi, you are cooler'
 - **@Mention Targeting** - Send messages to specific instances or teams
 - **Session Persistence** - Resume previous conversations automatically
 - **Zero Dependencies** - Pure Python stdlib, works everywhere
+- **Cross-platform** - Native support for Windows, WSL, macOS, Linux, Android
 
 </details>
 
@@ -113,7 +121,7 @@ hcom open --prefix notcool # creates notcool-hovoc9
 
 # Launch 3 headless instances that die after 60 seconds of inactivity
 HCOM_WAIT_TIMEOUT="60" hcom open 3 -p
-# Manually kill all instance
+# Manually kill all instances
 hcom kill --all
 
 # Launch multiple of the same subagent
@@ -195,6 +203,9 @@ $env:HCOM_INITIAL_PROMPT="go home buddy!"; hcom open
 ```
 
 ### Status Indicators
+
+When running `hcom watch`, each instance shows its current state:
+
 - ◉ **thinking** (cyan) - Processing input
 - ▷ **responding** (green) - Generating text response  
 - ▶ **executing** (green) - Running tools
@@ -213,13 +224,13 @@ $env:HCOM_INITIAL_PROMPT="go home buddy!"; hcom open
 hcom adds hooks to your project directory's `.claude/settings.local.json`:
 
 1. **Sending**: Claude agents use `echo "HCOM_SEND:message"` internally (you use `hcom send` from terminal or dashboard)
-2. **Receiving**: Other Claudes get notified via Stop hook
+2. **Receiving**: Other Claudes get notified via hooks (PostToolUse or Stop)
 3. **Waiting**: Stop hook keeps Claude in a waiting state for new messages
 
 - **Identity**: Each instance gets a unique name based on session ID (e.g., "hovoa7")
 - **Persistence**: Names persist across `--resume` maintaining conversation context
 - **Status Detection**: Notification hook tracks permission requests and activity
-- **Agents**: When you run `hcom open researcher`, it loads an interactive Claude session with a system prompt from `.claude/agents/researcher.md` (local) or `~/.claude/agents/researcher.md` (global). Specified `model:` and `tools:` are carried over.
+- **Agents**: When you run `hcom open researcher`, it loads an interactive Claude session with a system prompt from `.claude/agents/researcher.md` (local) or `~/.claude/agents/researcher.md` (global). Specified `model:` and `tools:` are carried over
 
 ### Architecture
 - **Single conversation** - All instances share one global conversation
@@ -227,7 +238,7 @@ hcom adds hooks to your project directory's `.claude/settings.local.json`:
 - **@-mention filtering** - Target messages to specific instances or teams
 
 ### File Structure
-```
+```plaintext
 ~/.hcom/                             
 ├── hcom.log       # Conversation log
 ├── instances/     # Instance tracking
@@ -251,21 +262,22 @@ your-project/
 Configure terminal behavior in `~/.hcom/config.json`:
 - `"terminal_mode": "new_window"` - Opens new terminal window(s) (default)
 - `"terminal_mode": "same_terminal"` - Opens in current terminal
-- `"terminal_mode": "show_commands"` - Prints commands without executing
+
+#### Running in current terminal temporarily
+```bash
+# For single instances
+HCOM_TERMINAL_MODE=same_terminal hcom open
+```
 
 ### Default Terminals
 
 - **macOS**: Terminal.app
 - **Linux**: gnome-terminal, konsole, or xterm
 - **Windows & WSL**: Windows Terminal / Git Bash
+- **Android**: Termux
 
-### Running in Current Terminal temporarily
-```bash
-# For single instances
-HCOM_TERMINAL_MODE=same_terminal hcom open
-```
 
-### Custom Terminal Examples
+### Custom Terminals
 
 Configure `terminal_command` in `~/.hcom/config.json` (permanent) or environment variables (temporary).
 
@@ -279,78 +291,91 @@ Your custom command just needs to:
 
 Example template: `your_terminal_command --execute "bash {script}"`
 
-### iTerm2
+### Custom Terminal Examples
+
+#### iTerm2
 ```json
-"terminal_command": "osascript -e 'tell app \"iTerm\" to tell (create window with default profile) to tell current session to write text \"{script}\"'"
+"terminal_command": "open -a iTerm {script}"
 ```
 
-### WezTerm
-Windows:
+#### [ttab](https://github.com/mklement0/ttab) (new tab instead of new window in Terminal.app)
 ```json
-  "terminal_command": "wezterm start -- bash {script}"
-```
-Or open tabs from within WezTerm:
-```json
-  "terminal_command": "wezterm cli spawn -- bash {script}"
-```
-macOS/Linux:
-```json
-  "terminal_command": "wezterm start -- bash {script}"
+"terminal_command": "ttab {script}"
 ```
 
-### Wave Terminal
-Windows. From within Wave Terminal:
+#### [wttab](https://github.com/lalilaloe/wttab) (new tab in Windows Terminal)
 ```json
-  "terminal_command": "wsh run -- bash {script}"
+"terminal_command": "wttab {script}"
 ```
 
-### Alacritty
-macOS:
+#### More
 ```json
-  "terminal_command": "open -n -a Alacritty.app --args -e bash {script}"
-```
-Linux:
-```json
-  "terminal_command": "alacritty -e bash {script}"
+# WezTerm Linux/Windows
+"terminal_command": "wezterm start -- bash {script}"
+
+# Tabs from within WezTerm
+"terminal_command": "wezterm cli spawn -- bash {script}"
+
+# WezTerm macOS:
+"terminal_command": "open -n -a WezTerm.app --args start -- bash {script}"
+
+# Tabs from within WezTerm macOS
+"terminal_command": "/Applications/WezTerm.app/Contents/MacOS/wezterm cli spawn -- bash {script}"
+
+# Wave Terminal Mac/Linux/Windows. From within Wave Terminal:
+"terminal_command": "wsh run -- bash {script}"
+
+# Alacritty macOS:
+"terminal_command": "open -n -a Alacritty.app --args -e bash {script}"
+
+# Alacritty Linux:
+"terminal_command": "alacritty -e bash {script}"
+
+# Kitty macOS:
+"terminal_command": "open -n -a kitty.app --args {script}"
+
+# Kitty Linux
+"terminal_command": "kitty {script}"
 ```
 
-### Kitty
-macOS:
+#### tmux
 ```json
-  "terminal_command": "open -n -a kitty.app --args bash {script}"
+"terminal_command": "tmux new-window -n hcom {script}"
 ```
-Linux:
-```json
-  "terminal_command": "kitty bash {script}"
-```
-
-### Termux (Android)
-```json
-  "terminal_command": "am startservice --user 0 -n com.termux/com.termux.app.RunCommandService -a com.termux.RUN_COMMAND --es com.termux.RUN_COMMAND_PATH {script} --ez com.termux.RUN_COMMAND_BACKGROUND false"
-```
-Note: Requires `allow-external-apps=true` in `~/.termux/termux.properties`
-
-### tmux
-```json
-  "terminal_command": "tmux new-window -n hcom {script}"
-```
-Then from a terminal:
 ```bash
-# Run hcom open directly in new session
-tmux new-session 'hcom open 3'
-```
-Or once off:
-```bash
+# tmux commands work inside tmux, start a session with:
+tmux new-session 'hcom open 3' # each instance opens in new tmux window
+
+# Or one time split-panes:
 # Start tmux with split panes and 3 claude instances in hcom chat
 HCOM_TERMINAL_COMMAND="tmux split-window -h {script}" hcom open 3
 ```
 
+### Android (Termux)
+
+1. Install [Termux](https://f-droid.org/packages/com.termux/) from F-Droid (not Google Play)
+2. Setup:
+   ```bash
+   pkg install python nodejs
+   npm install -g @anthropic-ai/claude-cli
+   pip install hcom
+   ```
+3. Enable:
+   ```bash
+   echo "allow-external-apps=true" >> ~/.termux/termux.properties
+   termux-reload-settings
+   ```
+4. Enable: "Display over other apps" permission for visible terminals
+
+5. Run: `hcom open`
+
+---
 
 </details>
 
 
 <details>
-<summary><strong>🦆 Remove</strong></summary>
+<summary><strong>⚗️ Remove</strong></summary>
 
 
 ### Archive Conversation / Start New
@@ -387,6 +412,7 @@ hcom cleanup --all
 
 - Python 3.7+
 - [Claude Code](https://claude.ai/code)
+
 
 
 ## 🌮 License

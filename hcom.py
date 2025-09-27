@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-hcom 0.2.1
+hcom 0.2.2
 CLI tool for launching multiple Claude Code terminals with interactive subagents, headless persistence, and real-time communication via hooks
 """
 
@@ -14,7 +14,6 @@ import re
 import subprocess
 import time
 import select
-import threading
 import platform
 import random
 from pathlib import Path
@@ -33,6 +32,15 @@ def is_wsl():
             return 'microsoft' in f.read().lower()
     except:
         return False
+
+def is_termux():
+    """Detect if running in Termux on Android"""
+    return (
+        'TERMUX_VERSION' in os.environ or              # Primary: Works all versions
+        'TERMUX__ROOTFS' in os.environ or              # Modern: v0.119.0+
+        os.path.exists('/data/data/com.termux') or     # Fallback: Path check
+        'com.termux' in os.environ.get('PREFIX', '')   # Fallback: PREFIX check
+    )
 
 HCOM_ACTIVE_ENV = 'HCOM_ACTIVE'
 HCOM_ACTIVE_VALUE = '1'
@@ -165,6 +173,7 @@ HOOK_SETTINGS = {
 LOG_FILE = "hcom.log"
 INSTANCES_DIR = "instances"
 LOGS_DIR = "logs"
+SCRIPTS_DIR = "scripts"
 CONFIG_FILE = "config.json"
 ARCHIVE_DIR = "archive"
 
@@ -396,8 +405,8 @@ def get_hook_command():
         return f'IF "%HCOM_ACTIVE%"=="1" {python_path} {script_path}', {}
     elif ' ' in python_path or ' ' in script_path:
         # Unix with spaces: use conditional check
-        escaped_python = shell_quote(python_path)
-        escaped_script = shell_quote(script_path)
+        escaped_python = shlex.quote(python_path)
+        escaped_script = shlex.quote(script_path)
         return f'[ "${{HCOM_ACTIVE}}" = "1" ] && {escaped_python} {escaped_script} || true', {}
     else:
         # Unix clean paths: use environment variable
@@ -526,7 +535,7 @@ def parse_open_args(args):
                 raise ValueError(format_error('--prefix requires an argument'))
             prefix = args[i + 1]
             if '|' in prefix:
-                raise ValueError(format_error('Team name cannot contain pipe characters'))
+                raise ValueError(format_error('Prefix cannot contain pipe characters'))
             i += 2
         elif arg == '--claude-args':
             # Next argument contains claude args as a string
@@ -608,10 +617,10 @@ def resolve_agent(name):
             config = extract_agent_config(content)
             stripped = strip_frontmatter(content)
             if not stripped.strip():
-                raise ValueError(format_error(f"Agent '{name}' has empty content", 'Check the agent file contains a system prompt'))
+                raise ValueError(format_error(f"Agent '{name}' has empty content", 'Check the agent file is a valid format and contains text'))
             return stripped, config
     
-    raise FileNotFoundError(format_error(f'Agent not found: {name}', 'Check available agents or create the agent file'))
+    raise FileNotFoundError(format_error(f'Agent "{name}" not found in project or user .claude/agents/ folder', 'Check available agents or create the agent file'))
 
 def strip_frontmatter(content):
     """Strip YAML frontmatter from agent file"""
@@ -766,7 +775,6 @@ def has_claude_arg(claude_args, arg_names, arg_prefixes):
 
 def build_claude_command(agent_content=None, claude_args=None, initial_prompt="Say hi in chat", model=None, tools=None):
     """Build Claude command with proper argument handling
-
     Returns tuple: (command_string, temp_file_path_or_none)
     For agent content, writes to temp file and uses cat to read it.
     """
@@ -789,8 +797,11 @@ def build_claude_command(agent_content=None, claude_args=None, initial_prompt="S
             cmd_parts.append(shlex.quote(arg))
     
     if agent_content:
+        # Create agent files in scripts directory for unified cleanup
+        scripts_dir = hcom_path(SCRIPTS_DIR)
+        scripts_dir.mkdir(parents=True, exist_ok=True)
         temp_file = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.txt', delete=False,
-                                              prefix='hcom_agent_', dir=tempfile.gettempdir())
+                                              prefix='hcom_agent_', dir=str(scripts_dir))
         temp_file.write(agent_content)
         temp_file.close()
         temp_file_path = temp_file.name
@@ -807,34 +818,18 @@ def build_claude_command(agent_content=None, claude_args=None, initial_prompt="S
         cmd_parts.append('--')
     
     # Quote initial prompt normally
-    cmd_parts.append(shell_quote(initial_prompt))
+    cmd_parts.append(shlex.quote(initial_prompt))
     
     return ' '.join(cmd_parts), temp_file_path
 
-def escape_for_platform(text, platform_type):
-    """Centralized escaping for different platforms"""
-    if platform_type == 'applescript':
-        # AppleScript escaping for text within double quotes
-        # We need to escape backslashes first, then other special chars
-        return (text.replace('\\', '\\\\')
-                   .replace('"', '\\"')  # Escape double quotes
-                   .replace('\n', '\\n')  # Escape newlines
-                   .replace('\r', '\\r')  # Escape carriage returns  
-                   .replace('\t', '\\t'))  # Escape tabs
-    else:  # POSIX/bash
-        return shlex.quote(text)
-
-def shell_quote(text):
-    """Cross-platform shell argument quoting
-
-    Note: On Windows with Git Bash, subprocess.Popen(shell=True) uses bash, not cmd.exe
-    """
-    # Always use shlex.quote for proper bash escaping
-    # Git Bash on Windows uses bash as the shell
-    return shlex.quote(text)
-
 def create_bash_script(script_file, env, cwd, command_str, background=False):
-    """Create a bash script for terminal launch"""
+    """Create a bash script for terminal launch
+    Scripts provide uniform execution across all platforms/terminals.
+    Cleanup behavior:
+    - Normal scripts: append 'rm -f' command for self-deletion
+    - Background scripts: persist until `hcom clear` housekeeping (24 hours)
+    - Agent scripts: treated like background (contain 'hcom_agent_')
+    """
     try:
         # Ensure parent directory exists
         script_path = Path(script_file)
@@ -845,15 +840,52 @@ def create_bash_script(script_file, env, cwd, command_str, background=False):
     with open(script_file, 'w', encoding='utf-8') as f:
         f.write('#!/bin/bash\n')
         f.write('echo "Starting Claude Code..."\n')
-        f.write(build_env_string(env, "bash_export") + '\n')
-        if cwd:
-            f.write(f'cd {shlex.quote(cwd)}\n')
 
-        # On Windows, let bash resolve claude from PATH (Windows paths don't work in bash)
         if platform.system() != 'Windows':
+            # 1. Discover paths once
             claude_path = shutil.which('claude')
+            node_path = shutil.which('node')
+
+            # 2. Add to PATH for minimal environments
+            paths_to_add = []
+            for p in [node_path, claude_path]:
+                if p:
+                    dir_path = os.path.dirname(os.path.realpath(p))
+                    if dir_path not in paths_to_add:
+                        paths_to_add.append(dir_path)
+
+            if paths_to_add:
+                path_addition = ':'.join(paths_to_add)
+                f.write(f'export PATH="{path_addition}:$PATH"\n')
+            elif not claude_path:
+                # Warning for debugging
+                print("Warning: Could not locate 'claude' in PATH", file=sys.stderr)
+
+            # 3. Write environment variables
+            f.write(build_env_string(env, "bash_export") + '\n')
+
+            if cwd:
+                f.write(f'cd {shlex.quote(cwd)}\n')
+
+            # 4. Platform-specific command modifications
             if claude_path:
-                command_str = command_str.replace('claude ', f'{claude_path} ', 1)
+                if is_termux():
+                    # Termux: explicit node to bypass shebang issues
+                    final_node = node_path or '/data/data/com.termux/files/usr/bin/node'
+                    # Quote paths for safety
+                    command_str = command_str.replace(
+                        'claude ',
+                        f'{shlex.quote(final_node)} {shlex.quote(claude_path)} ',
+                        1
+                    )
+                else:
+                    # Mac/Linux: use full path (PATH now has node if needed)
+                    command_str = command_str.replace('claude ', f'{shlex.quote(claude_path)} ', 1)
+        else:
+            # Windows: no PATH modification needed
+            f.write(build_env_string(env, "bash_export") + '\n')
+            if cwd:
+                f.write(f'cd {shlex.quote(cwd)}\n')
 
         f.write(f'{command_str}\n')
 
@@ -908,258 +940,266 @@ def find_bash_on_windows():
 
     return None
 
-def schedule_file_cleanup(files, delay=5):
-    """Schedule cleanup of temporary files after delay"""
-    if not files:
-        return
+# New helper functions for platform-specific terminal launching
+def get_macos_terminal_argv():
+    """Return macOS Terminal.app launch command as argv list."""
+    return ['osascript', '-e', 'tell app "Terminal" to do script "bash {script}"', '-e', 'tell app "Terminal" to activate']
 
-    def cleanup():
-        time.sleep(delay)
-        for file_path in files:
-            try:
-                os.unlink(file_path)
-            except (OSError, FileNotFoundError):
-                pass  # File already deleted or inaccessible
+def get_windows_terminal_argv():
+    """Return Windows terminal launcher as argv list."""
+    bash_exe = find_bash_on_windows()
+    if not bash_exe:
+        raise Exception(format_error("Git Bash not found"))
 
-    thread = threading.Thread(target=cleanup, daemon=True)
-    thread.start()
+    if shutil.which('wt'):
+        return ['wt', bash_exe, '{script}']
+    return ['cmd', '/c', 'start', 'Claude Code', bash_exe, '{script}']
+
+def get_linux_terminal_argv():
+    """Return first available Linux terminal as argv list."""
+    terminals = [
+        ('gnome-terminal', ['gnome-terminal', '--', 'bash', '{script}']),
+        ('konsole', ['konsole', '-e', 'bash', '{script}']),
+        ('xterm', ['xterm', '-e', 'bash', '{script}']),
+    ]
+    for term_name, argv_template in terminals:
+        if shutil.which(term_name):
+            return argv_template
+
+    # WSL fallback integrated here
+    if is_wsl() and shutil.which('cmd.exe'):
+        if shutil.which('wt.exe'):
+            return ['cmd.exe', '/c', 'start', 'wt.exe', 'bash', '{script}']
+        return ['cmd.exe', '/c', 'start', 'bash', '{script}']
+
+    return None
+
+def windows_hidden_popen(argv, *, env=None, cwd=None, stdout=None):
+    """Create hidden Windows process without console window."""
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+
+    return subprocess.Popen(
+        argv,
+        env=env,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=stdout,
+        stderr=subprocess.STDOUT,
+        startupinfo=startupinfo,
+        creationflags=CREATE_NO_WINDOW
+    )
+
+# Platform dispatch map
+PLATFORM_TERMINAL_GETTERS = {
+    'Darwin': get_macos_terminal_argv,
+    'Windows': get_windows_terminal_argv,
+    'Linux': get_linux_terminal_argv,
+}
+
+def _parse_terminal_command(template, script_file):
+    """Parse terminal command template safely to prevent shell injection.
+    Parses the template FIRST, then replaces {script} placeholder in the
+    parsed tokens. This avoids shell injection and handles paths with spaces.
+    Args:
+        template: Terminal command template with {script} placeholder
+        script_file: Path to script file to substitute
+    Returns:
+        list: Parsed command as argv array
+    Raises:
+        ValueError: If template is invalid or missing {script} placeholder
+    """
+    if '{script}' not in template:
+        raise ValueError(format_error("Custom terminal command must include {script} placeholder",
+                                    'Example: open -n -a kitty.app --args bash "{script}"'))
+
+    try:
+        parts = shlex.split(template)
+    except ValueError as e:
+        raise ValueError(format_error(f"Invalid terminal command syntax: {e}",
+                                    "Check for unmatched quotes or invalid shell syntax"))
+
+    # Replace {script} in parsed tokens
+    replaced = []
+    placeholder_found = False
+    for part in parts:
+        if '{script}' in part:
+            replaced.append(part.replace('{script}', script_file))
+            placeholder_found = True
+        else:
+            replaced.append(part)
+
+    if not placeholder_found:
+        raise ValueError(format_error("{script} placeholder not found after parsing",
+                                    "Ensure {script} is not inside environment variables"))
+
+    return replaced
 
 def launch_terminal(command, env, config=None, cwd=None, background=False):
-    """Launch terminal with command
+    """Launch terminal with command using unified script-first approach
     Args:
-        command: Either a string command or list of command parts
+        command: Command string from build_claude_command
         env: Environment variables to set
         config: Configuration dict
         cwd: Working directory
         background: Launch as background process
     """
-
     if config is None:
         config = get_cached_config()
 
     env_vars = os.environ.copy()
     env_vars.update(env)
-
-    # Command should now always be a string from build_claude_command
     command_str = command
-    
-    # Background mode implementation
+
+    # 1) Always create a script
+    script_file = str(hcom_path(SCRIPTS_DIR,
+        f'hcom_{os.getpid()}_{random.randint(1000,9999)}.sh',
+        ensure_parent=True))
+    create_bash_script(script_file, env, cwd, command_str, background)
+
+    # 2) Background mode
     if background:
-        # Create log file for background instance
         logs_dir = hcom_path(LOGS_DIR)
         logs_dir.mkdir(parents=True, exist_ok=True)
         log_file = logs_dir / env['HCOM_BACKGROUND']
 
-        # Launch detached process
         try:
             with open(log_file, 'w', encoding='utf-8') as log_handle:
                 if IS_WINDOWS:
-                    # Windows: Use bash script approach for proper $(cat ...) support
+                    # Windows: hidden bash execution with Python-piped logs
                     bash_exe = find_bash_on_windows()
                     if not bash_exe:
                         raise Exception("Git Bash not found")
 
-                    # Create script file for background process
-                    script_file = str(hcom_path('scripts',
-                        f'background_{os.getpid()}_{random.randint(1000,9999)}.sh',
-                        ensure_parent=True))
-
-                    create_bash_script(script_file, env, cwd, command_str, background=True)
-
-                    # Windows requires STARTUPINFO to hide console window
-                    startupinfo = subprocess.STARTUPINFO()
-                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                    startupinfo.wShowWindow = subprocess.SW_HIDE
-
-                    # Use bash.exe directly with script, avoiding shell=True and cmd.exe
-                    process = subprocess.Popen(
+                    process = windows_hidden_popen(
                         [bash_exe, script_file],
                         env=env_vars,
                         cwd=cwd,
-                        stdin=subprocess.DEVNULL,
-                        stdout=log_handle,
-                        stderr=subprocess.STDOUT,
-                        startupinfo=startupinfo,
-                        creationflags=CREATE_NO_WINDOW  # Belt and suspenders approach
+                        stdout=log_handle
                     )
                 else:
-                    # Unix: use start_new_session for proper detachment
+                    # Unix(Mac/Linux/Termux): detached bash execution with Python-piped logs
                     process = subprocess.Popen(
-                        command_str,
-                        shell=True,
-                        env=env_vars,
-                        cwd=cwd,
+                        ['bash', script_file],
+                        env=env_vars, cwd=cwd,
                         stdin=subprocess.DEVNULL,
-                        stdout=log_handle,
-                        stderr=subprocess.STDOUT,
-                        start_new_session=True  # detach from terminal session
+                        stdout=log_handle, stderr=subprocess.STDOUT,
+                        start_new_session=True
                     )
+
         except OSError as e:
             print(format_error(f"Failed to launch background instance: {e}"), file=sys.stderr)
             return None
-        
-        # Check for immediate failures
+
+        # Health check
         time.sleep(0.2)
         if process.poll() is not None:
-            # Process already exited
-            error_output = read_file_with_retry(
-                log_file,
-                lambda f: f.read()[:1000],
-                default=""
-            )
+            error_output = read_file_with_retry(log_file, lambda f: f.read()[:1000], default="")
             print(format_error("Background instance failed immediately"), file=sys.stderr)
             if error_output:
                 print(f"  Output: {error_output}", file=sys.stderr)
             return None
-        
+
         return str(log_file)
 
+    # 3) Terminal modes
     terminal_mode = get_config_value('terminal_mode', 'new_window')
 
     if terminal_mode == 'show_commands':
-        env_str = build_env_string(env)
-        print(f"{env_str} {command_str}")
-        return True
+        # Print script path and contents
+        try:
+            with open(script_file, 'r', encoding='utf-8') as f:
+                script_content = f.read()
+            print(f"# Script: {script_file}")
+            print(script_content)
+            os.unlink(script_file)  # Clean up immediately
+            return True
+        except Exception as e:
+            print(format_error(f"Failed to read script: {e}"), file=sys.stderr)
+            return False
 
-    elif terminal_mode == 'same_terminal':
-        print(f"Launching Claude in current terminal...")
+    if terminal_mode == 'same_terminal':
+        print("Launching Claude in current terminal...")
         if IS_WINDOWS:
-            # Windows: Use bash directly to support $(cat ...) syntax
             bash_exe = find_bash_on_windows()
             if not bash_exe:
                 print(format_error("Git Bash not found"), file=sys.stderr)
                 return False
-            # Run with bash -c to execute in current terminal
-            result = subprocess.run([bash_exe, '-c', command_str], env=env_vars, cwd=cwd)
+            result = subprocess.run([bash_exe, script_file], env=env_vars, cwd=cwd)
         else:
-            # Unix/Linux/Mac: shell=True works fine
-            result = subprocess.run(command_str, shell=True, env=env_vars, cwd=cwd)
-
+            result = subprocess.run(['bash', script_file], env=env_vars, cwd=cwd)
         return result.returncode == 0
-    
-    system = platform.system()
 
+    # 4) New window mode
     custom_cmd = get_config_value('terminal_command')
 
-    # Check for macOS Terminal.app 1024 char TTY limit
-    if not custom_cmd and system == 'Darwin':
-        full_cmd = build_env_string(env, "bash_export") + command_str
-        if cwd:
-            full_cmd = f'cd {shlex.quote(cwd)}; {full_cmd}'
-        if len(full_cmd) > 1000:  # Switch before 1024 limit
-            # Force script path by setting custom_cmd
-            custom_cmd = 'osascript -e \'tell app "Terminal" to do script "{script}"\''
-
-    # Windows also needs script approach - treat it like custom terminal
-    if system == 'Windows' and not custom_cmd:
-        # Windows always uses script approach with bash
-        bash_exe = find_bash_on_windows()
-        if not bash_exe:
-            raise Exception(format_error("Git Bash not found"))
-        # Set up to use script approach below
-        if shutil.which('wt'):
-            # Windows Terminal available
-            custom_cmd = f'wt {bash_exe} {{script}}'
-        else:
-            # Use cmd.exe with start command for visible window
-            custom_cmd = f'cmd /c start "Claude Code" {bash_exe} {{script}}'
-
-    if custom_cmd and custom_cmd != 'None' and custom_cmd != 'null':
-        # Check for {script} placeholder - the reliable way to handle complex commands
-        if '{script}' in custom_cmd:
-            # Create temp script file
-            # Always use .sh extension for bash scripts
-            script_ext = '.sh'
-            # Use ~/.hcom/scripts/ instead of /tmp to avoid noexec issues
-            script_file = str(hcom_path('scripts',
-                f'launch_{os.getpid()}_{random.randint(1000,9999)}{script_ext}',
-                ensure_parent=True))
-
-            # Create the bash script using helper
-            create_bash_script(script_file, env, cwd, command_str, background)
-
-            # Replace {script} with the script path
-            final_cmd = custom_cmd.replace('{script}', shlex.quote(script_file))
-
-            # Windows needs special flags
-            if system == 'Windows':
-                # Use Popen for non-blocking launch on Windows
-                # Use shell=True for Windows to handle complex commands properly
-                subprocess.Popen(final_cmd, shell=True)
-            else:
-                # TODO: Test if macOS/Linux will still work with Popen for parallel launches with custom terminals like windows
-                result = subprocess.run(final_cmd, shell=True, capture_output=True)
-
-            # Schedule cleanup for all scripts (since we don't wait for completion)
-            schedule_file_cleanup([script_file])
-
-            return True
-
-        # No {script} placeholder found
-        else:
-            print(format_error("Custom terminal command must use {script} placeholder",
-                             "Example: open -n -a kitty.app --args bash \"{script}\"'"),
-                  file=sys.stderr)
-            return False
-    
-    if system == 'Darwin':  # macOS
-        env_setup = build_env_string(env, "bash_export")
-        # Include cd command if cwd is specified
-        if cwd:
-            full_cmd = f'cd {shlex.quote(cwd)}; {env_setup} {command_str}'
-        else:
-            full_cmd = f'{env_setup} {command_str}'
-        
-        # Escape the command for AppleScript double-quoted string
-        escaped = escape_for_platform(full_cmd, 'applescript')
-        
-        script = f'tell app "Terminal" to do script "{escaped}"'
-        subprocess.run(['osascript', '-e', script])
-        return True
-    
-    elif system == 'Linux':
-        # Try Linux terminals first (works for both regular Linux and WSLg)
-        terminals = [
-            ('gnome-terminal', ['gnome-terminal', '--', 'bash', '-c']),
-            ('konsole', ['konsole', '-e', 'bash', '-c']),
-            ('xterm', ['xterm', '-e', 'bash', '-c'])
-        ]
-
-        for term_name, term_cmd in terminals:
-            if shutil.which(term_name):
-                env_cmd = build_env_string(env)
-                # Include cd command if cwd is specified
-                if cwd:
-                    full_cmd = f'cd "{cwd}"; {env_cmd} {command_str}; exec bash'
-                else:
-                    full_cmd = f'{env_cmd} {command_str}; exec bash'
-                subprocess.run(term_cmd + [full_cmd])
+    if not custom_cmd:  # No string sentinel checks
+        if is_termux():
+            # Keep Termux as special case
+            am_cmd = [
+                'am', 'startservice', '--user', '0',
+                '-n', 'com.termux/com.termux.app.RunCommandService',
+                '-a', 'com.termux.RUN_COMMAND',
+                '--es', 'com.termux.RUN_COMMAND_PATH', script_file,
+                '--ez', 'com.termux.RUN_COMMAND_BACKGROUND', 'false'
+            ]
+            try:
+                subprocess.run(am_cmd, check=False)
                 return True
+            except Exception as e:
+                print(format_error(f"Failed to launch Termux: {e}"), file=sys.stderr)
+                return False
 
-        # No Linux terminals found - check if WSL and can use Windows Terminal as fallback
-        if is_wsl() and shutil.which('cmd.exe'):
-            # WSL fallback: Use Windows Terminal through cmd.exe
-            script_file = str(hcom_path('scripts',
-                f'wsl_launch_{os.getpid()}_{random.randint(1000,9999)}.sh',
-                ensure_parent=True))
+        # Unified platform handling via helpers
+        system = platform.system()
+        terminal_getter = PLATFORM_TERMINAL_GETTERS.get(system)
+        if not terminal_getter:
+            raise Exception(format_error(f"Unsupported platform: {system}"))
 
-            create_bash_script(script_file, env, cwd, command_str, background=False)
+        custom_cmd = terminal_getter()
+        if not custom_cmd:  # e.g., Linux with no terminals
+            raise Exception(format_error("No supported terminal emulator found",
+                                       "Install gnome-terminal, konsole, or xterm"))
 
-            # Use Windows Terminal if available, otherwise cmd.exe with start
-            if shutil.which('wt.exe'):
-                subprocess.run(['cmd.exe', '/c', 'start', 'wt.exe', 'bash', script_file])
+    # Type-based dispatch for execution
+    if isinstance(custom_cmd, list):
+        # Our argv commands - safe execution without shell
+        final_argv = [arg.replace('{script}', script_file) for arg in custom_cmd]
+        try:
+            if platform.system() == 'Windows':
+                # Windows needs non-blocking for parallel launches
+                subprocess.Popen(final_argv)
+                return True  # Popen is non-blocking, can't check success
             else:
-                subprocess.run(['cmd.exe', '/c', 'start', 'bash', script_file])
-
-            # Schedule cleanup
-            schedule_file_cleanup([script_file], delay=5)
-            return True
-
-        raise Exception(format_error("No supported terminal emulator found", "Install gnome-terminal, konsole, or xterm"))
-        
+                result = subprocess.run(final_argv)
+                if result.returncode != 0:
+                    return False
+                return True
+        except Exception as e:
+            print(format_error(f"Failed to launch terminal: {e}"), file=sys.stderr)
+            return False
     else:
-        # Windows is now handled by the custom_cmd logic above
-        raise Exception(format_error(f"Unsupported platform: {system}", "Supported platforms: macOS, Linux, Windows"))
+        # User-provided string commands - parse safely without shell=True
+        try:
+            final_argv = _parse_terminal_command(custom_cmd, script_file)
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            return False
+
+        try:
+            if platform.system() == 'Windows':
+                # Windows needs non-blocking for parallel launches
+                subprocess.Popen(final_argv)
+                return True  # Popen is non-blocking, can't check success
+            else:
+                result = subprocess.run(final_argv)
+                if result.returncode != 0:
+                    return False
+                return True
+        except Exception as e:
+            print(format_error(f"Failed to execute terminal command: {e}"), file=sys.stderr)
+            return False
 
 def setup_hooks():
     """Set up Claude hooks in current directory"""
@@ -1598,12 +1638,7 @@ def show_instances_by_directory():
                 last_tool_name = pos_data.get("last_tool_name", "unknown")
                 last_tool_str = datetime.fromtimestamp(last_tool).strftime("%H:%M:%S") if last_tool else "unknown"
                 
-                # Get session IDs (already migrated to array format)
-                session_ids = pos_data.get("session_ids", [])
-                sid = session_ids[-1] if session_ids else ""  # Show most recent session
-                session_info = f" | {sid}" if sid else ""
-                
-                print(f"   {FG_GREEN}->{RESET} {BOLD}{instance_name}{RESET} {status_block} {DIM}{status_type} {age}- used {last_tool_name} at {last_tool_str}{session_info}{RESET}")
+                print(f"   {FG_GREEN}->{RESET} {BOLD}{instance_name}{RESET} {status_block} {DIM}{status_type} {age}- used {last_tool_name} at {last_tool_str}{RESET}")
             print()
     else:
         print(f"   {DIM}Error reading instance data{RESET}")
@@ -1614,12 +1649,8 @@ def alt_screen_detailed_status_and_input():
     
     try:
         timestamp = datetime.now().strftime("%H:%M:%S")
-        print(f"{BOLD} HCOM DETAILED STATUS{RESET}")
-        print(f"{BOLD}{'=' * 70}{RESET}")
-        print(f"{FG_CYAN} HCOM: GLOBAL CHAT{RESET}")
-        print(f"{DIM} LOG FILE: {hcom_path(LOG_FILE)}{RESET}")
-        print(f"{DIM} UPDATED: {timestamp}{RESET}")
-        print(f"{BOLD}{'-' * 70}{RESET}")
+        print(f"{BOLD}HCOM{RESET} STATUS {DIM}- UPDATED: {timestamp}{RESET}")
+        print(f"{DIM}{'─' * 40}{RESET}")
         print()
         
         show_instances_by_directory()
@@ -1630,11 +1661,11 @@ def alt_screen_detailed_status_and_input():
         show_recent_activity_alt_screen()
         
         print()
-        print(f"{BOLD}{'-' * 70}{RESET}")
-        print(f"{FG_GREEN} Type message and press Enter to send (empty to cancel):{RESET}")
+        print(f"{DIM}{'─' * 40}{RESET}")
+        print(f"{FG_GREEN} Press Enter to send message (empty to cancel):{RESET}")
         message = input(f"{FG_CYAN} > {RESET}")
-        
-        print(f"{BOLD}{'=' * 70}{RESET}")
+
+        print(f"{DIM}{'─' * 40}{RESET}")
         
     finally:
         sys.stdout.write("\033[?1049l")
@@ -1817,15 +1848,10 @@ def show_main_screen_header():
     all_messages = []
     if log_file.exists():
         all_messages = parse_log_messages(log_file)
-    message_count = len(all_messages)
+    # message_count = len(all_messages)
     
-    print(f"\n{BOLD}{'='*50}{RESET}")
-    print(f"  {FG_CYAN}HCOM: global chat{RESET}")
-    
-    status_line = get_status_summary()
-    print(f"  {BOLD}INSTANCES:{RESET} {status_line}")
-    print(f"  {DIM}LOGS: {log_file} ({message_count} messages){RESET}")
-    print(f"{BOLD}{'='*50}{RESET}\n")
+    print(f"{BOLD}HCOM{RESET} LOGS")
+    print(f"{DIM}{'─'*40}{RESET}\n")
     
     return all_messages
 
@@ -1915,7 +1941,7 @@ Key settings (full list in config.json):
   env_overrides: "custom environment variables for instances"
 
 Temporary environment overrides for any setting (all caps & append HCOM_):
-HCOM_INSTANCE_HINTS="useful info" hcom open  # applied to all messages recieved by instance
+HCOM_INSTANCE_HINTS="useful info" hcom open  # applied to all messages received by instance
 export HCOM_CLI_HINTS="useful info" && hcom send 'hi'  # applied to all cli commands
 
 EXPECT: hcom instance aliases are auto-generated (5-char format: "hova7"). Check actual aliases 
@@ -1993,8 +2019,6 @@ def cmd_open(*args):
         launched = 0
         initial_prompt = get_config_value('initial_prompt', 'Say hi in chat')
         
-        temp_files_to_cleanup = []
-        
         for idx, instance_type in enumerate(instances):
             instance_env = base_env.copy()
 
@@ -2020,6 +2044,8 @@ def cmd_open(*args):
                 # Agent instance
                 try:
                     agent_content, agent_config = resolve_agent(instance_type)
+                    # Mark this as a subagent instance for SessionStart hook
+                    instance_env['HCOM_SUBAGENT_TYPE'] = instance_type
                     # Prepend agent instance awareness to system prompt
                     agent_prefix = f"You are an instance of {instance_type}. Do not start a subagent with {instance_type} unless explicitly asked.\n\n"
                     agent_content = agent_prefix + agent_content
@@ -2033,8 +2059,7 @@ def cmd_open(*args):
                         model=agent_model,
                         tools=agent_tools
                     )
-                    if temp_file:
-                        temp_files_to_cleanup.append(temp_file)
+                    # Agent temp files live under ~/.hcom/scripts/ for unified housekeeping cleanup
                 except (FileNotFoundError, ValueError) as e:
                     print(str(e), file=sys.stderr)
                     continue
@@ -2046,30 +2071,37 @@ def cmd_open(*args):
                         print(f"Background instance launched, log: {log_file}")
                         launched += 1
                 else:
-                    launch_terminal(claude_cmd, instance_env, cwd=os.getcwd())
-                    launched += 1
+                    if launch_terminal(claude_cmd, instance_env, cwd=os.getcwd()):
+                        launched += 1
             except Exception as e:
                 print(format_error(f"Failed to launch terminal: {e}"), file=sys.stderr)
         
-        # Clean up temp files after a delay (let terminals read them first)
-        if temp_files_to_cleanup:
-            schedule_file_cleanup(temp_files_to_cleanup)
-                
+        requested = len(instances)
+        failed = requested - launched
+
         if launched == 0:
-            print(format_error("No instances launched"), file=sys.stderr)
+            print(format_error(f"No instances launched (0/{requested})"), file=sys.stderr)
             return 1
-            
-        # Success message
-        print(f"Launched {launched} Claude instance{'s' if launched != 1 else ''}")
+
+        # Show results
+        if failed > 0:
+            print(f"Launched {launched}/{requested} Claude instance{'s' if requested != 1 else ''} ({failed} failed)")
+        else:
+            print(f"Launched {launched} Claude instance{'s' if launched != 1 else ''}")
 
         # Auto-launch watch dashboard if configured and conditions are met
         terminal_mode = get_config_value('terminal_mode')
         auto_watch = get_config_value('auto_watch', True)
 
-        if terminal_mode == 'new_window' and auto_watch and launched > 0 and is_interactive():
+        # Only auto-watch if ALL instances launched successfully
+        if terminal_mode == 'new_window' and auto_watch and failed == 0 and is_interactive():
             # Show tips first if needed
             if prefix:
                 print(f"\n  • Send to {prefix} team: hcom send '@{prefix} message'")
+
+            # Clear transition message
+            print("\nOpening hcom watch...")
+            time.sleep(2)  # Brief pause so user sees the message
 
             # Launch interactive watch dashboard in current terminal
             return cmd_watch()
@@ -2081,7 +2113,7 @@ def cmd_open(*args):
                 tips.append(f"Send to {prefix} team: hcom send '@{prefix} message'")
 
             if tips:
-                print("\n" + "\n".join(f"  • {tip}" for tip in tips))
+                print("\n" + "\n".join(f"  • {tip}" for tip in tips) + "\n")
 
             # Show cli_hints if configured (non-interactive mode)
             if not is_interactive():
@@ -2102,7 +2134,7 @@ def cmd_watch(*args):
     instances_dir = hcom_path(INSTANCES_DIR)
     
     if not log_file.exists() and not instances_dir.exists():
-        print(format_error("No conversation found", "Run 'hcom open' first"), file=sys.stderr)
+        print(format_error("No conversation log found", "Run 'hcom open' first"), file=sys.stderr)
         return 1
     
     # Parse arguments
@@ -2249,10 +2281,11 @@ def cmd_watch(*args):
     all_messages = show_main_screen_header()
     
     show_recent_messages(all_messages, limit=5)
-    print(f"\n{DIM}{'─'*10} [watching for new messages] {'─'*10}{RESET}")
-    
+    print(f"\n{DIM}· · · · watching for new messages · · · ·{RESET}")
+    print(f"{DIM}{'─' * 40}{RESET}")
+
     # Print newline to ensure status starts on its own line
-    print()
+    # print()
     
     current_status = get_status_summary()
     update_status(f"{current_status}{status_suffix}")
@@ -2302,7 +2335,8 @@ def cmd_watch(*args):
                 
                 all_messages = show_main_screen_header()
                 show_recent_messages(all_messages)
-                print(f"\n{DIM}{'─'*10} [watching for new messages] {'─'*10}{RESET}")
+                print(f"\n{DIM}· · · · watching for new messages · · · ·{RESET}")
+                print(f"{DIM}{'─' * 40}{RESET}")
                 
                 if log_file.exists():
                     last_pos = log_file.stat().st_size
@@ -2337,6 +2371,14 @@ def cmd_clear():
         deleted_count = sum(1 for f in instances_dir.glob('*.tmp') if f.unlink(missing_ok=True) is None)
         if deleted_count > 0:
             print(f"Cleaned up {deleted_count} temp files")
+
+    # Clean up old script files (older than 24 hours)
+    scripts_dir = hcom_path(SCRIPTS_DIR)
+    if scripts_dir.exists():
+        cutoff_time = time.time() - (24 * 60 * 60)  # 24 hours ago
+        script_count = sum(1 for f in scripts_dir.glob('*') if f.is_file() and f.stat().st_mtime < cutoff_time and f.unlink(missing_ok=True) is None)
+        if script_count > 0:
+            print(f"Cleaned up {script_count} old script files")
 
     # Check if hcom files exist
     if not log_file.exists() and not instances_dir.exists():
@@ -2383,7 +2425,7 @@ def cmd_clear():
         
         log_file.touch()
         clear_all_positions()
-        
+
         if archived:
             print(f"Archived to archive/session-{timestamp}/")
         print("Started fresh hcom conversation log")
@@ -3045,6 +3087,11 @@ def handle_sessionstart(hook_data, instance_name, updates):
 
     # Always show base help text
     help_text = "[Welcome! HCOM chat active. Send messages: echo 'HCOM_SEND:your message']"
+
+    # Add subagent type if this is a named agent
+    subagent_type = os.environ.get('HCOM_SUBAGENT_TYPE')
+    if subagent_type:
+        help_text += f" [Subagent: {subagent_type}]"
 
     # Add first use text only on startup
     if source == 'startup':
