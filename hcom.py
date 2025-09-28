@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-hcom 0.2.2
+hcom 0.2.3
 CLI tool for launching multiple Claude Code terminals with interactive subagents, headless persistence, and real-time communication via hooks
 """
 
@@ -93,6 +93,7 @@ def get_windows_kernel32():
     return _windows_kernel32_cache
 
 MENTION_PATTERN = re.compile(r'(?<![a-zA-Z0-9._-])@(\w+)')
+AGENT_NAME_PATTERN = re.compile(r'^[a-z-]+$')
 TIMESTAMP_SPLIT_PATTERN = re.compile(r'\n(?=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+\|)')
 
 RESET = "\033[0m"
@@ -134,7 +135,7 @@ if IS_WINDOWS or is_wsl():
 # Critical I/O: atomic_write, save_instance_position, merge_instance_immediately
 # Pattern: Try/except/return False in hooks, raise in CLI operations.
 
-# ==================== Configuration ====================
+# ==================== Config Defaults ====================
 
 DEFAULT_CONFIG = {
     "terminal_command": None,
@@ -242,8 +243,15 @@ def read_file_with_retry(filepath, read_func, default=None, max_retries=3):
     return default
 
 def get_instance_file(instance_name):
-    """Get path to instance's position file"""
-    return hcom_path(INSTANCES_DIR, f"{instance_name}.json")
+    """Get path to instance's position file with path traversal protection"""
+    # Sanitize instance name to prevent directory traversal
+    if not instance_name:
+        instance_name = "unknown"
+    safe_name = instance_name.replace('..', '').replace('/', '-').replace('\\', '-').replace(os.sep, '-')
+    if not safe_name:
+        safe_name = "sanitized"
+
+    return hcom_path(INSTANCES_DIR, f"{safe_name}.json")
 
 def migrate_instance_data_v020(data, instance_name):
     """One-time migration from v0.2.0 format (remove in v0.3.0)"""
@@ -376,14 +384,17 @@ def get_config_value(key, default=None):
         env_var = HOOK_SETTINGS[key]
         env_value = os.environ.get(env_var)
         if env_value is not None:
+            # Type conversion based on key
             if key in ['wait_timeout', 'max_message_size', 'max_messages_per_delivery']:
                 try:
                     return int(env_value)
                 except ValueError:
+                    # Invalid integer - fall through to config/default
                     pass
-            elif key == 'auto_watch': # Convert string to boolean
+            elif key == 'auto_watch':
                 return env_value.lower() in ('true', '1', 'yes', 'on')
             else:
+                # String values - return as-is
                 return env_value
 
     config = get_cached_config()
@@ -509,7 +520,7 @@ def should_deliver_message(msg, instance_name, all_instance_names=None):
     
     return False  # This instance doesn't match, but others might
 
-# ==================== Parsing and Helper Functions ====================
+# ==================== Parsing & Utilities ====================
 
 def parse_open_args(args):
     """Parse arguments for open command
@@ -596,31 +607,73 @@ def extract_agent_config(content):
     return config
 
 def resolve_agent(name):
-    """Resolve agent file by name
-    
+    """Resolve agent file by name with validation.
+
     Looks for agent files in:
     1. .claude/agents/{name}.md (local)
     2. ~/.claude/agents/{name}.md (global)
-    
-    Returns tuple: (content after stripping YAML frontmatter, config dict)
+
+    Returns tuple: (content without YAML frontmatter, config dict)
     """
-    for base_path in [Path.cwd(), Path.home()]:
-        agent_path = base_path / '.claude/agents' / f'{name}.md'
-        if agent_path.exists():
-            content = read_file_with_retry(
-                agent_path,
-                lambda f: f.read(),
-                default=None
-            )
-            if content is None:
-                continue  # Skip to next base_path if read failed
-            config = extract_agent_config(content)
-            stripped = strip_frontmatter(content)
-            if not stripped.strip():
-                raise ValueError(format_error(f"Agent '{name}' has empty content", 'Check the agent file is a valid format and contains text'))
-            return stripped, config
-    
-    raise FileNotFoundError(format_error(f'Agent "{name}" not found in project or user .claude/agents/ folder', 'Check available agents or create the agent file'))
+    hint = 'Agent names must use lowercase letters and dashes only'
+
+    if not isinstance(name, str):
+        raise FileNotFoundError(format_error(
+            f"Agent '{name}' not found",
+            hint
+        ))
+
+    candidate = name.strip()
+    display_name = candidate or name
+
+    if not candidate or not AGENT_NAME_PATTERN.fullmatch(candidate):
+        raise FileNotFoundError(format_error(
+            f"Agent '{display_name}' not found",
+            hint
+        ))
+
+    for base_path in (Path.cwd(), Path.home()):
+        agents_dir = base_path / '.claude' / 'agents'
+        try:
+            agents_dir_resolved = agents_dir.resolve(strict=True)
+        except FileNotFoundError:
+            continue
+
+        agent_path = agents_dir / f'{candidate}.md'
+        if not agent_path.exists():
+            continue
+
+        try:
+            resolved_agent_path = agent_path.resolve(strict=True)
+        except FileNotFoundError:
+            continue
+
+        try:
+            resolved_agent_path.relative_to(agents_dir_resolved)
+        except ValueError:
+            continue
+
+        content = read_file_with_retry(
+            agent_path,
+            lambda f: f.read(),
+            default=None
+        )
+        if content is None:
+            continue
+
+        config = extract_agent_config(content)
+        stripped = strip_frontmatter(content)
+        if not stripped.strip():
+            raise ValueError(format_error(
+                f"Agent '{candidate}' has empty content",
+                'Check the agent file is a valid format and contains text'
+            ))
+        return stripped, config
+
+    raise FileNotFoundError(format_error(
+        f"Agent '{candidate}' not found in project or user .claude/agents/ folder",
+        'Check available agents or create the agent file'
+    ))
 
 def strip_frontmatter(content):
     """Strip YAML frontmatter from agent file"""
@@ -1036,18 +1089,14 @@ def _parse_terminal_command(template, script_file):
 
     return replaced
 
-def launch_terminal(command, env, config=None, cwd=None, background=False):
+def launch_terminal(command, env, cwd=None, background=False):
     """Launch terminal with command using unified script-first approach
     Args:
         command: Command string from build_claude_command
         env: Environment variables to set
-        config: Configuration dict
         cwd: Working directory
         background: Launch as background process
     """
-    if config is None:
-        config = get_cached_config()
-
     env_vars = os.environ.copy()
     env_vars.update(env)
     command_str = command
@@ -2282,10 +2331,9 @@ def cmd_watch(*args):
     
     show_recent_messages(all_messages, limit=5)
     print(f"\n{DIM}· · · · watching for new messages · · · ·{RESET}")
-    print(f"{DIM}{'─' * 40}{RESET}")
 
     # Print newline to ensure status starts on its own line
-    # print()
+    print()
     
     current_status = get_status_summary()
     update_status(f"{current_status}{status_suffix}")
@@ -2636,7 +2684,7 @@ def cmd_send(message):
         print(format_error("Failed to send message"), file=sys.stderr)
         return 1
 
-# ==================== Hook Functions ====================
+# ==================== Hook Helpers ====================
 
 def format_hook_messages(messages, instance_name):
     """Format messages for hook feedback"""
