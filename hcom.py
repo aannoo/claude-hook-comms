@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-hcom 0.3.0
+hcom 0.3.1
 CLI tool for launching multiple Claude Code terminals with interactive subagents, headless persistence, and real-time communication via hooks
 """
 
@@ -1326,7 +1326,7 @@ def verify_hooks_installed(settings_path):
 
         # Check all hook types exist with HCOM commands (PostToolUse removed)
         hooks = settings.get('hooks', {})
-        for hook_type in ['SessionStart', 'PreToolUse', 'Stop', 'Notification']:
+        for hook_type in ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'Stop', 'Notification']:
             if not any('hcom' in str(h).lower() or 'HCOM' in str(h)
                       for h in hooks.get(hook_type, [])):
                 return False
@@ -1507,33 +1507,40 @@ def format_age(seconds: float) -> str:
     else:
         return f"{int(seconds/3600)}h"
 
-def get_instance_status(pos_data: dict[str, Any]) -> tuple[str, str]:
-    """Get current status of instance. Returns (status_type, age_string)."""
-    # Returns: (display_category, formatted_age) - category for color, age for display
+def get_instance_status(pos_data: dict[str, Any]) -> tuple[str, str, str]:
+    """Get current status of instance. Returns (status_type, age_string, description)."""
+    # Returns: (display_category, formatted_age, status_description)
     now = int(time.time())
 
     # Check if killed
     if pos_data.get('pid') is None: #TODO: replace this later when process management stuff removed
-        return "inactive", ""
+        return "inactive", "", "killed"
 
     # Get last known status
     last_status = pos_data.get('last_status', '')
     last_status_time = pos_data.get('last_status_time', 0)
+    last_context = pos_data.get('last_status_context', '')
 
     if not last_status or not last_status_time:
-        return "unknown", ""
+        return "unknown", "", "unknown"
 
-    # Get display category from STATUS_INFO
-    display_status, _ = STATUS_INFO.get(last_status, ('unknown', ''))
+    # Get display category and description template from STATUS_INFO
+    display_status, desc_template = STATUS_INFO.get(last_status, ('unknown', 'unknown'))
 
     # Check timeout
     age = now - last_status_time
     timeout = pos_data.get('wait_timeout', get_config_value('wait_timeout', 1800))
     if age > timeout:
-        return "inactive", ""
+        return "inactive", "", "timeout"
+
+    # Format description with context if template has {}
+    if '{}' in desc_template and last_context:
+        status_desc = desc_template.format(last_context)
+    else:
+        status_desc = desc_template
 
     status_suffix = " (bg)" if pos_data.get('background') else ""
-    return display_status, f"({format_age(age)}){status_suffix}"
+    return display_status, f"({format_age(age)}){status_suffix}", status_desc
 
 def get_status_block(status_type: str) -> str:
     """Get colored status block for a status type"""
@@ -1607,19 +1614,8 @@ def show_instances_by_directory():
         for directory, instances in directories.items():
             print(f" {directory}")
             for instance_name, pos_data in instances:
-                status_type, age = get_instance_status(pos_data)
+                status_type, age, status_desc = get_instance_status(pos_data)
                 status_block = get_status_block(status_type)
-
-                # Format status description using STATUS_INFO and context
-                last_status = pos_data.get('last_status', '')
-                last_context = pos_data.get('last_status_context', '')
-                _, desc_template = STATUS_INFO.get(last_status, ('unknown', ''))
-
-                # Format description with context if template has {}
-                if '{}' in desc_template and last_context:
-                    status_desc = desc_template.format(last_context)
-                else:
-                    status_desc = desc_template
 
                 print(f"   {FG_GREEN}->{RESET} {BOLD}{instance_name}{RESET} {status_block} {DIM}{status_desc} {age}{RESET}")
             print()
@@ -1664,7 +1660,7 @@ def get_status_summary():
     status_counts = {status: 0 for status in STATUS_MAP.keys()}
 
     for _, pos_data in positions.items():
-        status_type, _ = get_instance_status(pos_data)
+        status_type, _, _ = get_instance_status(pos_data)
         if status_type in status_counts:
             status_counts[status_type] += 1
 
@@ -2209,7 +2205,7 @@ def cmd_watch(*args):
             status_counts = {}
 
             for name, data in positions.items():
-                status, age = get_instance_status(data)
+                status, age, _ = get_instance_status(data)
                 instances[name] = {
                     "status": status,
                     "age": age.strip() if age else "",
@@ -2497,7 +2493,7 @@ def cmd_kill(*args):
 
     killed_count = 0
     for target_name, target_data in targets:
-        status, age = get_instance_status(target_data)
+        status, age, _ = get_instance_status(target_data)
         instance_type = "background" if target_data.get('background') else "foreground"
 
         pid = int(target_data['pid'])
@@ -2609,8 +2605,10 @@ def cmd_send(message):
         try:
             positions = load_all_positions()
             all_instances = list(positions.keys())
+            sender_name = get_config_value('sender_name', 'bigboss')
+            all_names = all_instances + [sender_name]
             unmatched = [m for m in mentions
-                        if not any(name.lower().startswith(m.lower()) for name in all_instances)]
+                        if not any(name.lower().startswith(m.lower()) for name in all_names)]
             if unmatched:
                 print(f"Note: @{', @'.join(unmatched)} don't match any instances - broadcasting to all", file=sys.stderr)
         except Exception:
@@ -2657,7 +2655,7 @@ def cmd_send(message):
 def cmd_resume_merge(alias: str) -> int:
     """Resume/merge current instance into an existing instance by alias.
 
-    INTERNAL COMMAND: Only called via '$HCOM send --resume alias' during implicit resume workflow.
+    INTERNAL COMMAND: Only called via 'eval $HCOM send --resume alias' during implicit resume workflow.
     Not meant for direct CLI usage.
     """
     # Get current instance name via launch_id mapping (same mechanism as cmd_send)
@@ -2719,8 +2717,6 @@ def format_hook_messages(messages, instance_name):
 
 def init_hook_context(hook_data, hook_type=None):
     """Initialize instance context - shared by post/stop/notify hooks"""
-    import time
-
     session_id = hook_data.get('session_id', '')
     transcript_path = hook_data.get('transcript_path', '')
     prefix = os.environ.get('HCOM_PREFIX')
@@ -2775,7 +2771,6 @@ def init_hook_context(hook_data, hook_type=None):
     )
     if should_create_instance:
         initialize_instance_in_position_file(instance_name, session_id)
-    existing_data = load_instance_position(instance_name) if should_create_instance else {}
 
     # Prepare updates
     updates: dict[str, Any] = {
@@ -2801,7 +2796,7 @@ def init_hook_context(hook_data, hook_type=None):
 
     # Return flags indicating resume state
     is_resume_match = merged_state is not None
-    return instance_name, updates, existing_data, is_resume_match, is_new_instance
+    return instance_name, updates, is_resume_match, is_new_instance
 
 def handle_pretooluse(hook_data, instance_name, updates):
     """Handle PreToolUse hook - auto-approve HCOM_SEND commands when safe"""
@@ -2810,17 +2805,15 @@ def handle_pretooluse(hook_data, instance_name, updates):
     # Non-HCOM_SEND tools: record status (they'll run without permission check)
     set_status(instance_name, 'tool_pending', tool_name)
 
-    import time
-
     # Handle HCOM commands in Bash
     if tool_name == 'Bash':
         command = hook_data.get('tool_input', {}).get('command', '')
         script_path = str(Path(__file__).resolve())
 
-        # === Auto-approve ALL '$HCOM send' commands (including --resume) ===
+        # === Auto-approve ALL 'eval $HCOM send' commands (including --resume) ===
         # This includes:
-        #   - $HCOM send "message" (normal messaging between instances)
-        #   - $HCOM send --resume alias (resume/merge operation)
+        #   - eval $HCOM send "message" (normal messaging between instances)
+        #   - eval $HCOM send --resume alias (resume/merge operation)
         if ('$HCOM send' in command or
             'hcom send' in command or
             (script_path in command and ' send ' in command)):
@@ -2845,15 +2838,13 @@ def safe_exit_with_status(instance_name, code=EXIT_SUCCESS):
 
 def handle_stop(hook_data, instance_name, updates):
     """Handle Stop hook - poll for messages and deliver"""
-    import time as time_module
-
     parent_pid = os.getppid()
     log_hook_error(f'stop:entering_stop_hook_now_pid_{os.getpid()}')
     log_hook_error(f'stop:entering_stop_hook_now_ppid_{parent_pid}')
 
 
     try:
-        entry_time = time_module.time()
+        entry_time = time.time()
         updates['last_stop'] = entry_time
         timeout = get_config_value('wait_timeout', 1800)
         updates['wait_timeout'] = timeout
@@ -2864,30 +2855,29 @@ def handle_stop(hook_data, instance_name, updates):
         except Exception as e:
             log_hook_error(f'stop:update_instance_position({instance_name})', e)
 
-        start_time = time_module.time()
+        start_time = time.time()
         log_hook_error(f'stop:start_time_pid_{os.getpid()}')
 
         try:
             loop_count = 0
+            last_heartbeat = start_time
             # STEP 4: Actual polling loop - this IS the holding pattern
-            while time_module.time() - start_time < timeout:
+            while time.time() - start_time < timeout:
                 if loop_count == 0:
-                    time_module.sleep(0.1)  # Initial wait before first poll
+                    time.sleep(0.1)  # Initial wait before first poll
                 loop_count += 1
 
                 # Check if parent is alive
-                if not IS_WINDOWS and os.getppid() == 1:
-                    log_hook_error(f'stop:parent_died_pid_{os.getpid()}')
-                    safe_exit_with_status(instance_name, EXIT_SUCCESS)
-
-                parent_alive = is_parent_alive(parent_pid)
-                if not parent_alive:
+                if not is_parent_alive(parent_pid):
                     log_hook_error(f'stop:parent_not_alive_pid_{os.getpid()}')
                     safe_exit_with_status(instance_name, EXIT_SUCCESS)
 
-                # Check if user input is pending - exit cleanly if so
-                user_input_signal = hcom_path(INSTANCES_DIR, f'.user_input_pending_{instance_name}')
-                if user_input_signal.exists():
+                # Load instance data once per poll (needed for messages and user input check)
+                instance_data = load_instance_position(instance_name)
+
+                # Check if user input is pending - exit cleanly if recent input
+                last_user_input = instance_data.get('last_user_input', 0)
+                if time.time() - last_user_input < 0.2:
                     log_hook_error(f'stop:user_input_pending_exiting_pid_{os.getpid()}')
                     safe_exit_with_status(instance_name, EXIT_SUCCESS)
 
@@ -2902,14 +2892,16 @@ def handle_stop(hook_data, instance_name, updates):
                     print(json.dumps(output, ensure_ascii=False), file=sys.stderr)
                     sys.exit(EXIT_BLOCK)
 
-                # Update heartbeat
-                try:
-                    update_instance_position(instance_name, {'last_stop': time_module.time()})
-                    # log_hook_error(f'hb_pid_{os.getpid()}')
-                except Exception as e:
-                    log_hook_error(f'stop:heartbeat_update({instance_name})', e)
+                # Update heartbeat every 5 seconds instead of every poll
+                now = time.time()
+                if now - last_heartbeat >= 5.0:
+                    try:
+                        update_instance_position(instance_name, {'last_stop': now})
+                        last_heartbeat = now
+                    except Exception as e:
+                        log_hook_error(f'stop:heartbeat_update({instance_name})', e)
 
-                time_module.sleep(STOP_HOOK_POLL_INTERVAL)
+                time.sleep(STOP_HOOK_POLL_INTERVAL)
 
         except Exception as loop_e:
             # Log polling loop errors but continue to cleanup
@@ -2931,22 +2923,12 @@ def handle_notify(hook_data, instance_name, updates):
 
 def handle_userpromptsubmit(hook_data, instance_name, updates, is_resume_match, is_new_instance):
     """Handle UserPromptSubmit hook - track when user sends messages"""
-    import time as time_module
-
     # Update last user input timestamp
-    updates['last_user_input'] = time_module.time()
+    updates['last_user_input'] = time.time()
     update_instance_position(instance_name, updates)
 
-    # Signal any polling Stop hook to exit cleanly before user input processed
-    signal_file = hcom_path(INSTANCES_DIR, f'.user_input_pending_{instance_name}')
-    try:
-        log_hook_error(f'userpromptsubmit:signal_file_touched_pid_{os.getpid()}')
-        signal_file.touch()
-        time_module.sleep(0.15)  # Give Stop hook time to detect and exit
-        log_hook_error(f'userpromptsubmit:signal_file_unlinked_pid_{os.getpid()}')
-        signal_file.unlink()
-    except (OSError, PermissionError) as e:
-        log_hook_error(f'userpromptsubmit:signal_file_error', e)
+    # Wait for Stop hook to detect timestamp and exit (prevents api errors / race condition)
+    time.sleep(0.15)
 
     send_cmd = build_send_command('your message')
     resume_cmd = send_cmd.replace("'your message'", "--resume your_old_alias")
@@ -3041,7 +3023,7 @@ def handle_hook(hook_type: str) -> None:
     session_id_short = hook_data.get('session_id', 'none')[:8] if hook_data.get('session_id') else 'none'
     log_hook_error(f'DEBUG: Hook {hook_type} called with session_id={session_id_short}')
 
-    instance_name, updates, _, is_resume_match, is_new_instance = init_hook_context(hook_data, hook_type)
+    instance_name, updates, is_resume_match, is_new_instance = init_hook_context(hook_data, hook_type)
 
     match hook_type:
         case 'pre':
@@ -3091,7 +3073,7 @@ def main(argv=None):
 
             # HIDDEN COMMAND: --resume is only used internally by instances during resume workflow
             # Not meant for regular CLI usage. Primary usage:
-            #   - From instances: $HCOM send "message" (instances send messages to each other)
+            #   - From instances: eval $HCOM send "message" (instances send messages to each other)
             #   - From CLI: hcom send "message" (user/claude orchestrator sends to instances)
             if argv[2] == '--resume':
                 if len(argv) < 4:

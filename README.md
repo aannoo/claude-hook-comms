@@ -223,7 +223,7 @@ When running `hcom watch`, each instance shows its current state:
 
 hcom adds hooks to your project directory's `.claude/settings.local.json`:
 
-1. **Sending**: Claude agents use `$HCOM send "message"` internally (you use `hcom send` from terminal or dashboard)
+1. **Sending**: Claude agents use `eval $HCOM send "message"` internally (you use `hcom send` from terminal or dashboard)
 2. **Receiving**: Other Claudes get notified via Stop hook or immediate delivery after sending
 3. **Waiting**: Stop hook keeps Claude in a waiting state for new messages
 
