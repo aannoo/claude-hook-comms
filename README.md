@@ -14,7 +14,7 @@ CLI tool for launching multiple Claude Code terminals with interactive [subagent
 uvx hcom open 2
 ```
 
-**Install** (optional)
+**Install**
 ```bash
 pip install hcom
 hcom open 2
@@ -24,39 +24,40 @@ hcom open 2
 |---------|-------------|
 | `hcom open [n]` | Launch `n` instances or named agents |
 | `hcom watch` | View live dashboard and messaging |
-| `hcom clear` | Clear and start new conversation |
-| `hcom cleanup` | Safely remove hcom hooks, preserving your project settings |
+| `hcom stop` | Disable hcom chat for instance |
+| `hcom start` | Enable hcom chat for instance |
 
 
 ## 🦆 What It Does
 
-`hcom open` adds hooks to the `.claude/settings.local.json` file in the current folder and launches terminals with claude code that remain active, waiting to respond to messages in the shared chat. Normal Claude Code opened with `claude` remains unaffected by hcom.
+`hcom open` adds hooks to the `.claude/settings.local.json` file in the current folder and launches terminals with claude code that remain active, waiting to respond to messages in the shared chat. Normal Claude Code opened with `claude` remains unaffected by hcom, but can opt-in via `hcom start` and opt-out with `hcom stop`.
 
-### Subagents in their own terminal
+
+### Interactive subagents in their own terminal
 ```bash
 # Launch subagents from your .claude/agents
-hcom open planner code-writer reviewer
+hcom open -a planner -a code-writer -a reviewer
 ```
 
 ### Persistent headless instances
 ```bash
 # Launch one headless instance (default 30min timeout)
 hcom open -p
+hcom stop # Stop it earlier than timeout
 ```
 
 ### Groups and direct messages
 ```bash
-hcom open --prefix cool  # Creates cool-hovoa7
-hcom open --prefix cool  # Creates cool-homab8
+hcom open 2 -t cool  # Creates cool-hovoa7 & cool-homab8
 hcom send '@cool hi, you are cool'
 hcom send '@homab8 hi, you are cooler'
 ```
 
-### Persistent thinking mode
+### Toggle HCOM in Claude Code
 ```bash
-# Thinking mode maintains for entire session
-HCOM_INITIAL_PROMPT="ultrathink and do x" hcom open
-# Every new message reply uses ultrathink
+claude  # Start normal Claude Code
+'run hcom start'  # Start HCOM for this instance to receive messages
+'run hcom stop'  # Stop HCOM for this instance, continue as normal claude code
 ```
 
 ---
@@ -80,26 +81,48 @@ HCOM_INITIAL_PROMPT="ultrathink and do x" hcom open
 <details>
 <summary><strong>🥨 All Commands</strong></summary>
 
+```bash
+Usage:
+  hcom open [count] [-a agent]... [-t prefix] [-p] [-- claude-args]
+  hcom watch [--logs|--status|--wait [SEC]]
+  hcom stop [target] [--force]
+  hcom start [target]
+  hcom send "msg"
 
-| Command | Description |
-|---------|-------------|
-| `hcom open [n]` | Launch n Claude instances (or named agents) |
-| `hcom open -p` | Launch headless process |
-| `hcom open --prefix <p> [n]` | Launch with `<p>` prefix (e.g., api-hova7) |
-| `hcom open --claude-args "..."` | Pass flags to Claude Code |
-| `hcom watch` | Conversation/status dashboard |
-| `hcom clear` | Clear and archive conversation |
-| `hcom cleanup` | Safely Remove HCOM hooks from current directory while preserving your settings (`--all` for all directories) |
-| `hcom kill [name]` | Kill specific instance (--all for all running instances) |
+Commands:
+  open                 Launch Claude instances (default count: 1)
+  watch                Monitor conversation dashboard
+  stop                 Stop instances, clear conversation, or remove hooks
+  start                Start stopped instances
+  send                 Send message to instances
 
-### Automation Commands
-| Command | Description |
-|---------|-------------|
-| `hcom send 'message'` | Send message to all instances |
-| `hcom send '@alias msg'` | Send to specific instances alias or prefix |
-| `hcom watch --logs` | View message log history (non-interactive) |
-| `hcom watch --status` | Show instance status as JSON (non-interactive) |
-| `hcom watch --wait [timeout]` | Wait and notify for new messages |
+Open options:
+  [count]              Number of instances per agent (default 1)
+  -a, --agent AGENT    Agent to launch (repeatable)
+  -t, --prefix PREFIX  Team prefix for names
+  -p, --background     Launch in background
+
+Stop targets:
+  (no arg)             Stop HCOM for current instance (when inside)
+  <alias>              Stop HCOM for specific instance
+  all                  Stop all instances + clear & archive conversation
+  hooking              Remove hooks from current directory
+  hooking --all        Remove hooks from all tracked directories
+  everything           Stop all + clear conversation + remove all hooks
+
+Start targets:
+  (no arg)             Start HCOM for current instance (when inside)
+  <alias>              Start HCOM for specific instance
+  hooking              Install hooks in current directory
+
+Watch options:
+  --logs               Show message history
+  --status             Show instance status JSON
+  --wait [SEC]         Wait for new messages (default 60s)
+
+Stop flags:
+  --force              Force stop (deny Bash tool use)
+```
 
 </details>
 
@@ -109,36 +132,28 @@ HCOM_INITIAL_PROMPT="ultrathink and do x" hcom open
 <summary><strong>🗿 Examples</strong></summary>
 
 ```bash
-# Instances can be privately @mentioned by alias or prefix
-hcom open --prefix cool  # Creates cool-hovoa7
-hcom open --prefix cool  # Creates cool-hovob8
-hcom open --prefix notcool # creates notcool-hovoc9
-
-# Send a targeted message in dashboard
-@notcool i think you smell good
-@cool that other guy is smelly
-@hovoa7 im lying about the smelly thing
-
-# Launch 3 headless instances that die after 60 seconds of inactivity
+# Launch 3 headless instances that time out after 60 seconds of inactivity
 HCOM_WAIT_TIMEOUT="60" hcom open 3 -p
-# Manually kill all instances
-hcom kill --all
+# Stop all instances
+hcom stop all
 
 # Launch multiple of the same subagent
-hcom open reviewer reviewer reviewer
+hcom open 3 -a reviewer
+
+# Launch mixed agents with team prefix
+hcom open -t api -a backend -a frontend
 
 # Launch agent with specific prompt
-HCOM_INITIAL_PROMPT='write tests' hcom open test-writer
+HCOM_INITIAL_PROMPT='write tests' hcom open -a test-writer
 
 # Resume instance (hcom chat will continue)
-hcom open --claude-args "--resume session_id"
+hcom open -- --resume session_id
 
 # Text appended to all messages recieved by instance
 HCOM_INSTANCE_HINTS="remember where you came from" hcom open
 
 # Pass multiple Claude flags
-hcom open orchestrator --claude-args "--model sonnet --resume session_id"
-```
+hcom open -a orchestrator -- --model sonnet --resume session_id
 
 </details>
 
@@ -210,8 +225,8 @@ When running `hcom watch`, each instance shows its current state:
 - ▷ **delivered** (cyan) - Just received a message
 - ◉ **waiting** (blue) - Waiting for messages
 - ■ **blocked** (yellow) - Permission request pending
-- ○ **inactive** (red) - Timed out/disconnected
-- ○ **unknown** (gray) - No status data
+- ○ **inactive** (red) - Closed/timed out/ended
+- ○ **unknown** (gray) - No status data or stale
 - **(bg)** suffix - Instance running in background headless mode
 
 </details>
@@ -223,7 +238,7 @@ When running `hcom watch`, each instance shows its current state:
 
 hcom adds hooks to your project directory's `.claude/settings.local.json`:
 
-1. **Sending**: Claude agents use `eval $HCOM send "message"` internally (you use `hcom send` from terminal or dashboard)
+1. **Sending**: Claude uses `hcom send "message"` to communicate
 2. **Receiving**: Other Claudes get notified via Stop hook or immediate delivery after sending
 3. **Waiting**: Stop hook keeps Claude in a waiting state for new messages
 
@@ -234,7 +249,7 @@ hcom adds hooks to your project directory's `.claude/settings.local.json`:
 
 ### Architecture
 - **Single conversation** - All instances share one global conversation
-- **Opt-in participation** - Only Claude Code instances launched with `hcom open` join the chat
+- **Opt-in participation** - Only Claude code instances launched with `hcom open` join automatically, normal instances can use `hcom start`/`stop`
 - **@-mention filtering** - Target messages to specific instances or teams
 
 ### File Structure
@@ -380,26 +395,31 @@ HCOM_TERMINAL_COMMAND="tmux split-window -h {script}" hcom open 3
 
 ### Archive Conversation / Start New
 ```bash
-hcom clear
+hcom stop all
 ```
 
-### Kill Running Instances
+### Stop Running Instances
 ```bash
-# Kill specific instance
-hcom kill hovoa7
+# Stop specific instance
+hcom stop hovoa7
 
-# Kill all instances
-hcom kill --all
+# Stop all and archive
+hcom stop all
 ```
 
-### Remove HCOM hooks from current directory
+### Start Stopped Instances
 ```bash
-hcom cleanup
+# Start specific instance
+hcom start hovoa7
 ```
 
-### Remove HCOM hooks from all directories
+### Remove HCOM hooks
 ```bash
-hcom cleanup --all
+# Current directory
+hcom stop hooking
+
+# All directories
+hcom stop hooking --all
 ```
 
 ### Remove hcom Completely
