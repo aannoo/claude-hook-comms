@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-hcom 0.4.0
+hcom
 CLI tool for launching multiple Claude Code terminals with interactive subagents, headless persistence, and real-time communication via hooks
 """
 
@@ -17,54 +17,22 @@ import time
 import select
 import platform
 import random
-import argparse
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Any, NamedTuple, Sequence
-from dataclasses import dataclass, asdict, field
-from enum import Enum, auto
+from typing import Any, Callable, NamedTuple, TextIO
+from dataclasses import dataclass
 
 if sys.version_info < (3, 10):
     sys.exit("Error: hcom requires Python 3.10 or higher")
 
-__version__ = "0.4.0"
-
-# ==================== Session Scenario Types ====================
-
-class SessionScenario(Enum):
-    """Explicit session startup scenarios for clear logic flow"""
-    FRESH_START = auto()        # New session, new instance
-    MATCHED_RESUME = auto()     # Resume with matching session_id (reuse instance)
-    UNMATCHED_RESUME = auto()   # Resume with no match (new instance, needs recovery)
-
-@dataclass
-class HookContext:
-    """Consolidated context for hook handling with all decisions made"""
-    instance_name: str
-    updates: dict
-    scenario: SessionScenario | None  # None = deferred decision (SessionStart wrong session_id)
-
-    @property
-    def bypass_enabled_check(self) -> bool:
-        """Unmatched resume needs critical message even if disabled"""
-        return self.scenario == SessionScenario.UNMATCHED_RESUME
-
-    @property
-    def needs_critical_prompt(self) -> bool:
-        """Should show critical recovery message?"""
-        return self.scenario == SessionScenario.UNMATCHED_RESUME
-
-    @property
-    def is_resume(self) -> bool:
-        """Is this any kind of resume?"""
-        return self.scenario in (SessionScenario.MATCHED_RESUME, SessionScenario.UNMATCHED_RESUME)
+__version__ = "0.5.0"
 
 # ==================== Constants ====================
 
 IS_WINDOWS = sys.platform == 'win32'
 
-def is_wsl():
-    """Detect if running in WSL (Windows Subsystem for Linux)"""
+def is_wsl() -> bool:
+    """Detect if running in WSL"""
     if platform.system() != 'Linux':
         return False
     try:
@@ -73,7 +41,7 @@ def is_wsl():
     except (FileNotFoundError, PermissionError, OSError):
         return False
 
-def is_termux():
+def is_termux() -> bool:
     """Detect if running in Termux on Android"""
     return (
         'TERMUX_VERSION' in os.environ or              # Primary: Works all versions
@@ -82,8 +50,6 @@ def is_termux():
         'com.termux' in os.environ.get('PREFIX', '')   # Fallback: PREFIX check
     )
 
-EXIT_SUCCESS = 0
-EXIT_BLOCK = 2
 
 # Windows API constants
 CREATE_NO_WINDOW = 0x08000000  # Prevent console window creation
@@ -91,7 +57,6 @@ CREATE_NO_WINDOW = 0x08000000  # Prevent console window creation
 # Timing constants
 FILE_RETRY_DELAY = 0.01  # 10ms delay for file lock retries
 STOP_HOOK_POLL_INTERVAL = 0.1     # 100ms between stop hook polls
-MERGE_ACTIVITY_THRESHOLD = 10  # Seconds of inactivity before allowing instance merge
 
 MENTION_PATTERN = re.compile(r'(?<![a-zA-Z0-9._-])@(\w+)')
 AGENT_NAME_PATTERN = re.compile(r'^[a-z-]+$')
@@ -148,95 +113,68 @@ if IS_WINDOWS or is_wsl():
 # ==================== Error Handling Strategy ====================
 # Hooks: Must never raise exceptions (breaks hcom). Functions return True/False.
 # CLI: Can raise exceptions for user feedback. Check return values.
-# Critical I/O: atomic_write, save_instance_position, merge_instance_immediately
+# Critical I/O: atomic_write, save_instance_position
 # Pattern: Try/except/return False in hooks, raise in CLI operations.
 
-# ==================== CLI Command Objects ====================
+# ==================== CLI Errors ====================
 
 class CLIError(Exception):
     """Raised when arguments cannot be mapped to command semantics."""
 
-@dataclass
-class OpenCommand:
-    count: int
-    agents: list[str]
-    prefix: str | None
-    background: bool
-    claude_args: list[str]
-
-@dataclass
-class WatchCommand:
-    mode: str  # 'interactive', 'logs', 'status', 'wait'
-    wait_seconds: int | None
-
-@dataclass
-class StopCommand:
-    target: str | None
-    close_all_hooks: bool
-    force: bool
-    _hcom_session: str | None = None  # Injected by PreToolUse hook
-
-@dataclass
-class StartCommand:
-    target: str | None
-    _hcom_session: str | None = None  # Injected by PreToolUse hook
-
-@dataclass
-class SendCommand:
-    message: str | None
-    resume_alias: str | None
-    _hcom_session: str | None = None  # Injected by PreToolUse hook
-
 # ==================== Help Text ====================
 
-HELP_TEXT = """hcom - Claude Hook Comms
+HELP_TEXT = """hcom 0.5.0
 
-Usage:
-  hcom open [count] [-a agent]... [-t prefix] [-p] [-- claude-args]
-  hcom watch [--logs|--status|--wait [SEC]]
-  hcom stop [target] [--force]
-  hcom start [target]
-  hcom send "msg"
+Usage: [ENV_VARS] hcom <COUNT> [claude <ARGS>...]
+       hcom watch [--logs|--status|--wait [SEC]]
+       hcom send "message"
+       hcom stop [alias|all] [--force]
+       hcom start [alias]
+       hcom reset [logs|hooks|config]
+
+Launch Examples:
+  hcom 3             Open 3 terminals with claude connected to hcom
+  hcom 3 claude -p                            + Background/headless
+  HCOM_TAG=api hcom 3 claude -p               + @-mention group tag
+  claude 'run hcom start'    claude code with prompt will also work
 
 Commands:
-  open                 Launch Claude instances (default count: 1)
-  watch                Monitor conversation dashboard
-  stop                 Stop instances, clear conversation, or remove hooks
-  start                Start stopped instances
-  send                 Send message to instances
+  watch              Interactive messaging/status dashboard
+    --logs           Print all messages
+    --status         Print instance status JSON
+    --wait [SEC]     Wait and notify for new message
 
-Open options:
-  [count]              Number of instances per agent (default 1)
-  -a, --agent AGENT    Agent to launch (repeatable)
-  -t, --prefix PREFIX  Team prefix for names
-  -p, --background     Launch in background
+  send "msg"         Send message to all instances
+  send "@alias msg"  Send to specific instance/group
 
-Stop targets:
-  (no arg)             Stop HCOM for current instance (when inside)
-  <alias>              Stop HCOM for specific instance
-  all                  Stop all instances + clear & archive conversation
-  hooking              Remove hooks from current directory
-  hooking --all        Remove hooks from all tracked directories
-  everything           Stop all + clear conversation + remove all hooks
+  stop               Stop current instance (from inside Claude)
+  stop <alias>       Stop specific instance
+  stop all           Stop all instances
+    --force          Emergency stop (denies Bash tool)
 
-Start targets:
-  (no arg)             Start HCOM for current instance (when inside)
-  <alias>              Start HCOM for specific instance
-  hooking              Install hooks in current directory
+  start              Start current instance (from inside Claude)
+  start <alias>      Start specific instance
 
-Watch options:
-  --logs               Show message history
-  --status             Show instance status JSON
-  --wait [SEC]         Wait for new messages (default 60s)
+  reset              Stop all + archive logs + remove hooks + clear config
+  reset logs         Clear + archive conversation log
+  reset hooks        Safely remove hcom hooks from claude settings.json
+  reset config       Clear + backup config.env
 
-Stop flags:
-  --force              Force stop (deny Bash tool use)
+Environment Variables:
+  HCOM_TAG=name      Group tag (creates name-* instances)
+  HCOM_AGENT=type    Agent type (comma-separated for multiple)
+  HCOM_TERMINAL=mode Terminal: new|here|print|"custom {script}"
+  HCOM_PROMPT=text   "Say hi in hcom chat" (default)
+  HCOM_HINTS=text    Text appended to all messages received by instance
+  HCOM_TIMEOUT=secs  Time until disconnected from hcom chat (default 1800s / 30mins)
 
-Docs: https://github.com/aannoo/claude-hook-comms#readme"""
+Config: ~/.hcom/config.env
+Docs: https://github.com/aannoo/claude-hook-comms"""
+
 
 # ==================== Logging ====================
 
-def log_hook_error(hook_name: str, error: Exception | None = None):
+def log_hook_error(hook_name: str, error: Exception | str | None = None) -> None:
     """Log hook exceptions or just general logging to ~/.hcom/scripts/hooks.log for debugging"""
     import traceback
     try:
@@ -253,48 +191,68 @@ def log_hook_error(hook_name: str, error: Exception | None = None):
         pass  # Silent failure in error logging
 
 # ==================== Config Defaults ====================
+# Config precedence: env var > ~/.hcom/config.env > defaults
+# All config via HcomConfig dataclass (timeout, terminal, prompt, hints, tag, agent)
 
-# Type definition for configuration
-@dataclass
-class HcomConfig:
-    terminal_command: str | None = None
-    terminal_mode: str = "new_window"
-    initial_prompt: str = "Say hi in chat"
-    sender_name: str = "bigboss"
-    sender_emoji: str = "🐳"
-    cli_hints: str = ""
-    wait_timeout: int = 1800  # 30mins
-    max_message_size: int = 1048576  # 1MB
-    max_messages_per_delivery: int = 50
-    first_use_text: str = "Essential, concise messages only, say hi in hcom chat now"
-    instance_hints: str = ""
-    env_overrides: dict = field(default_factory=dict)
-    auto_watch: bool = True  # Auto-launch watch dashboard after open
-
-DEFAULT_CONFIG = HcomConfig()
-
-_config = None
-
-# Generate env var mappings from dataclass fields (except env_overrides)
-HOOK_SETTINGS = {
-    field: f"HCOM_{field.upper()}"
-    for field in DEFAULT_CONFIG.__dataclass_fields__
-    if field != 'env_overrides'
-}
+# Constants (not configurable)
+MAX_MESSAGE_SIZE = 1048576  # 1MB
+MAX_MESSAGES_PER_DELIVERY = 50
+SENDER = 'bigboss'
+SENDER_EMOJI = '🐳'
+SKIP_HISTORY = True  # New instances start at current log position (skip old messages)
 
 # Path constants
 LOG_FILE = "hcom.log"
 INSTANCES_DIR = "instances"
-LOGS_DIR = "logs"
-SCRIPTS_DIR = "scripts"
-CONFIG_FILE = "config.json"
+LOGS_DIR = ".tmp/logs"
+SCRIPTS_DIR = ".tmp/scripts"
+FLAGS_DIR = ".tmp/flags"
+CONFIG_FILE = "config.env"
 ARCHIVE_DIR = "archive"
 
-# Hook type constants
-ACTIVE_HOOK_TYPES = ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'Stop', 'Notification', 'SessionEnd']
-LEGACY_HOOK_TYPES = ACTIVE_HOOK_TYPES + ['PostToolUse']  # For backward compatibility cleanup
-HOOK_COMMANDS = ['sessionstart', 'userpromptsubmit', 'pre', 'poll', 'notify', 'sessionend']
-LEGACY_HOOK_COMMANDS = HOOK_COMMANDS + ['post']
+# Hook configuration - single source of truth for setup_hooks() and verify_hooks_installed()
+# Format: (hook_type, matcher, command_suffix, timeout)
+# Command gets built as: hook_cmd_base + ' ' + command_suffix (e.g., '${HCOM} poll')
+HOOK_CONFIGS = [
+    ('SessionStart', '', 'sessionstart', None),
+    ('UserPromptSubmit', '', 'userpromptsubmit', None),
+    ('PreToolUse', 'Bash', 'pre', None),
+    ('PostToolUse', 'Bash', 'post', None),   # Match Bash only
+    ('Stop', '', 'poll', 86400),          # Poll for messages (24hr max timeout)
+    ('Notification', '', 'notify', None),
+    ('SessionEnd', '', 'sessionend', None),
+]
+
+# Derived from HOOK_CONFIGS - guaranteed to stay in sync
+ACTIVE_HOOK_TYPES = [cfg[0] for cfg in HOOK_CONFIGS]
+HOOK_COMMANDS = [cfg[2] for cfg in HOOK_CONFIGS]
+LEGACY_HOOK_TYPES = ACTIVE_HOOK_TYPES
+LEGACY_HOOK_COMMANDS = HOOK_COMMANDS
+
+# Hook removal patterns - used by _remove_hcom_hooks_from_settings()
+# Dynamically build from LEGACY_HOOK_COMMANDS to match current and legacy hook formats
+_HOOK_ARGS_PATTERN = '|'.join(LEGACY_HOOK_COMMANDS)
+HCOM_HOOK_PATTERNS = [
+    re.compile(r'\$\{?HCOM'),                                # Current: Environment variable ${HCOM:-...}
+    re.compile(r'\bHCOM_ACTIVE.*hcom\.py'),                 # LEGACY: Unix HCOM_ACTIVE conditional
+    re.compile(r'IF\s+"%HCOM_ACTIVE%"'),                    # LEGACY: Windows HCOM_ACTIVE conditional
+    re.compile(rf'\bhcom\s+({_HOOK_ARGS_PATTERN})\b'),       # LEGACY: Direct hcom command
+    re.compile(rf'\buvx\s+hcom\s+({_HOOK_ARGS_PATTERN})\b'), # LEGACY: uvx hcom command
+    re.compile(rf'hcom\.py["\']?\s+({_HOOK_ARGS_PATTERN})\b'), # LEGACY: hcom.py with optional quote
+    re.compile(rf'["\'][^"\']*hcom\.py["\']?\s+({_HOOK_ARGS_PATTERN})\b(?=\s|$)'),  # LEGACY: Quoted path
+    re.compile(r'sh\s+-c.*hcom'),                           # LEGACY: Shell wrapper
+]
+
+# PreToolUse hook pattern - matches hcom commands for session_id injection and auto-approval
+# - hcom send (any args)
+# - hcom stop (no args) | hcom start (no args)
+# - hcom help | hcom --help | hcom -h
+# - hcom watch --status | hcom watch --launch | hcom watch --logs | hcom watch --wait
+# Negative lookahead (?!\s+[-\w]) ensures stop/start not followed by arguments or flags
+HCOM_COMMAND_PATTERN = re.compile(
+    r'((?:uvx\s+)?hcom|(?:python3?\s+)?\S*hcom\.py)\s+'
+    r'(?:send\b|(?:stop|start)(?!\s+[-\w])|(?:help|--help|-h)\b|watch\s+(?:--status|--launch|--logs|--wait)\b)'
+)
 
 # ==================== File System Utilities ====================
 
@@ -312,7 +270,7 @@ def ensure_hcom_directories() -> bool:
     Called at hook entry to support opt-in scenarios where hooks execute before CLI commands.
     Returns True on success, False on failure."""
     try:
-        for dir_name in [INSTANCES_DIR, LOGS_DIR, SCRIPTS_DIR, ARCHIVE_DIR]:
+        for dir_name in [INSTANCES_DIR, LOGS_DIR, SCRIPTS_DIR, FLAGS_DIR, ARCHIVE_DIR]:
             hcom_path(dir_name).mkdir(parents=True, exist_ok=True)
         return True
     except (OSError, PermissionError):
@@ -351,7 +309,7 @@ def atomic_write(filepath: str | Path, content: str) -> bool:
 
     return False  # All attempts exhausted
 
-def read_file_with_retry(filepath: str | Path, read_func, default: Any = None, max_retries: int = 3) -> Any:
+def read_file_with_retry(filepath: str | Path, read_func: Callable[[TextIO], Any], default: Any = None, max_retries: int = 3) -> Any:
     """Read file with retry logic for Windows file locking"""
     if not Path(filepath).exists():
         return default
@@ -373,10 +331,6 @@ def read_file_with_retry(filepath: str | Path, read_func, default: Any = None, m
             break  # Don't retry on other errors
 
     return default
-
-# ==================== Outbox System (REMOVED) ====================
-# Identity via session_id injection in handle_pretooluse (line 3134)
-# PreToolUse hook injects --_hcom_session, commands use get_display_name() for resolution
 
 def get_instance_file(instance_name: str) -> Path:
     """Get path to instance's position file with path traversal protection"""
@@ -409,6 +363,18 @@ def save_instance_position(instance_name: str, data: dict[str, Any]) -> bool:
     except (OSError, PermissionError, ValueError):
         return False
 
+def get_claude_settings_path() -> Path:
+    """Get path to global Claude settings file"""
+    return Path.home() / '.claude' / 'settings.json'
+
+def load_settings_json(settings_path: Path, default: Any = None) -> dict[str, Any] | None:
+    """Load and parse settings JSON file with retry logic"""
+    return read_file_with_retry(
+        settings_path,
+        lambda f: json.load(f),
+        default=default
+    )
+
 def load_all_positions() -> dict[str, dict[str, Any]]:
     """Load positions from all instance files"""
     instances_dir = hcom_path(INSTANCES_DIR)
@@ -436,93 +402,297 @@ def clear_all_positions() -> None:
 
 # ==================== Configuration System ====================
 
-def get_cached_config():
-    """Get cached configuration, loading if needed"""
-    global _config
-    if _config is None:
-        _config = _load_config_from_file()
-    return _config
+@dataclass
+class HcomConfig:
+    """HCOM configuration with validation. Load priority: env → file → defaults"""
+    timeout: int = 1800
+    terminal: str = 'new'
+    prompt: str = 'say hi in hcom chat'
+    hints: str = ''
+    tag: str = ''
+    agent: str = ''
 
-def _load_config_from_file() -> dict:
-    """Load configuration from ~/.hcom/config.json"""
-    config_path = hcom_path(CONFIG_FILE, ensure_parent=True)
+    def __post_init__(self):
+        """Validate configuration on construction"""
+        errors = self.validate()
+        if errors:
+            raise ValueError(f"Invalid config:\n" + "\n".join(f"  - {e}" for e in errors))
 
-    # Start with default config as dict
-    config_dict = asdict(DEFAULT_CONFIG)
+    def validate(self) -> list[str]:
+        """Validate all fields, return list of errors"""
+        errors = []
+
+        # Validate timeout
+        # Validate timeout (bool is subclass of int in Python, must check explicitly)
+        if isinstance(self.timeout, bool):
+            errors.append(f"timeout must be an integer, not boolean (got {self.timeout})")
+        elif not isinstance(self.timeout, int):
+            errors.append(f"timeout must be an integer, got {type(self.timeout).__name__}")
+        elif not 1 <= self.timeout <= 86400:
+            errors.append(f"timeout must be 1-86400 seconds (24 hours), got {self.timeout}")
+
+        # Validate terminal
+        if not isinstance(self.terminal, str):
+            errors.append(f"terminal must be a string, got {type(self.terminal).__name__}")
+        else:
+            valid_modes = ('new', 'here', 'print')
+            if self.terminal not in valid_modes and '{script}' not in self.terminal:
+                errors.append(
+                    f"terminal must be one of {valid_modes} or custom command with {{script}}, "
+                    f"got '{self.terminal}'"
+                )
+
+        # Validate tag (only alphanumeric and hyphens - security: prevent log delimiter injection)
+        if not isinstance(self.tag, str):
+            errors.append(f"tag must be a string, got {type(self.tag).__name__}")
+        elif self.tag and not re.match(r'^[a-zA-Z0-9-]+$', self.tag):
+            errors.append("tag can only contain letters, numbers, and hyphens")
+
+        # Validate agent
+        if not isinstance(self.agent, str):
+            errors.append(f"agent must be a string, got {type(self.agent).__name__}")
+
+        return errors
+
+    @classmethod
+    def load(cls) -> 'HcomConfig':
+        """Load config with precedence: env var → file → defaults"""
+        # Ensure config file exists
+        config_path = hcom_path(CONFIG_FILE, ensure_parent=True)
+        created_config = False
+        if not config_path.exists():
+            _write_default_config(config_path)
+            created_config = True
+
+        # Warn once if legacy config.json still exists when creating config.env
+        legacy_config = hcom_path('config.json')
+        if created_config and legacy_config.exists():
+            print(
+                format_error(
+                    "Found legacy ~/.hcom/config.json; new config file is: ~/.hcom/config.env."
+                ),
+                file=sys.stderr,
+            )
+
+        # Parse config file once
+        file_config = _parse_env_file(config_path) if config_path.exists() else {}
+
+        def get_var(key: str) -> str | None:
+            """Get variable with precedence: env → file"""
+            if key in os.environ:
+                return os.environ[key]
+            if key in file_config:
+                return file_config[key]
+            return None
+
+        data = {}
+
+        # Load timeout (requires int conversion)
+        timeout_str = get_var('HCOM_TIMEOUT')
+        if timeout_str is not None:
+            try:
+                data['timeout'] = int(timeout_str)
+            except (ValueError, TypeError):
+                pass  # Use default
+
+        # Load string values
+        terminal = get_var('HCOM_TERMINAL')
+        if terminal is not None:
+            data['terminal'] = terminal
+        prompt = get_var('HCOM_PROMPT')
+        if prompt is not None:
+            data['prompt'] = prompt
+        hints = get_var('HCOM_HINTS')
+        if hints is not None:
+            data['hints'] = hints
+        tag = get_var('HCOM_TAG')
+        if tag is not None:
+            data['tag'] = tag
+        agent = get_var('HCOM_AGENT')
+        if agent is not None:
+            data['agent'] = agent
+
+        return cls(**data)  # Validation happens in __post_init__
+
+def _parse_env_file(config_path: Path) -> dict[str, str]:
+    """Parse ENV file (KEY=VALUE format) with security validation"""
+    config = {}
+
+    # Dangerous shell metacharacters that enable command injection
+    DANGEROUS_CHARS = ['`', '$', ';', '|', '&', '\n', '\r']
 
     try:
-        if user_config := read_file_with_retry(
-            config_path,
-            lambda f: json.load(f),
-            default=None
-        ):
-            # Merge user config into default config
-            config_dict.update(user_config)
-        elif not config_path.exists():
-            # Write default config if file doesn't exist
-            atomic_write(config_path, json.dumps(config_dict, indent=2))
-    except (json.JSONDecodeError, UnicodeDecodeError, PermissionError):
-        print("Warning: Cannot read config file, using defaults", file=sys.stderr)
-        # config_dict already has defaults
+        content = config_path.read_text(encoding='utf-8')
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if '=' in line:
+                key, _, value = line.partition('=')
+                key = key.strip()
+                value = value.strip()
 
-    return config_dict
+                # Security: Validate HCOM_TERMINAL for command injection
+                if key == 'HCOM_TERMINAL':
+                    if any(c in value for c in DANGEROUS_CHARS):
+                        print(
+                            f"Warning: Unsafe characters in HCOM_TERMINAL "
+                            f"({', '.join(repr(c) for c in DANGEROUS_CHARS if c in value)}), "
+                            f"ignoring custom terminal command",
+                            file=sys.stderr
+                        )
+                        continue
+                    # Additional check: custom commands must contain {script} placeholder
+                    if value not in ('new', 'here', 'print') and '{script}' not in value:
+                        print(
+                            f"Warning: HCOM_TERMINAL custom command must include {{script}} placeholder, "
+                            f"ignoring",
+                            file=sys.stderr
+                        )
+                        continue
 
-def get_config_value(key: str, default: Any = None) -> Any:
-    """Get config value with proper precedence:
-    1. Environment variable (if in HOOK_SETTINGS)
-    2. Config file
-    3. Default value
-    """
-    if key in HOOK_SETTINGS:
-        env_var = HOOK_SETTINGS[key]
-        if (env_value := os.environ.get(env_var)) is not None:
-            # Type conversion based on key
-            if key in ['wait_timeout', 'max_message_size', 'max_messages_per_delivery']:
-                try:
-                    return int(env_value)
-                except ValueError:
-                    # Invalid integer - fall through to config/default
-                    pass
-            elif key == 'auto_watch':
-                return env_value.lower() in ('true', '1', 'yes', 'on')
-            else:
-                # String values - return as-is
-                return env_value
+                # Remove outer quotes only if they match
+                if len(value) >= 2:
+                    if (value[0] == value[-1]) and value[0] in ('"', "'"):
+                        value = value[1:-1]
+                if key:
+                    config[key] = value
+    except (FileNotFoundError, PermissionError, UnicodeDecodeError):
+        pass
+    return config
 
-    config = get_cached_config()
-    return config.get(key, default)
+def _write_default_config(config_path: Path) -> None:
+    """Write default config file with documentation"""
+    header = """# HCOM Configuration
+#
+# All HCOM_* settings (and any env var ie. Claude Code settings)
+# can be set here or via environment variables.
+# Environment variables override config file values.
+#
+# HCOM settings:
+#   HCOM_TIMEOUT - Instance Stop hook wait timeout in seconds (default: 1800)
+#   HCOM_TERMINAL - Terminal mode: "new", "here", "print", or custom command with {script}
+#   HCOM_PROMPT - Initial prompt for new instances (empty = no auto prompt)
+#   HCOM_HINTS - Text appended to all messages received by instances
+#   HCOM_TAG - Group tag for instances (creates tag-* instances)
+#   HCOM_AGENT - Claude code subagent from .claude/agents/, comma-separated for multiple
+#
+# Put each value on separate lines without comments.
+#
+#
+"""
+    defaults = [
+        'HCOM_TIMEOUT=1800',
+        'HCOM_TERMINAL=new',
+        'HCOM_PROMPT=say hi in hcom chat',
+        'HCOM_HINTS=',
+        'HCOM_TAG=',
+        'HCOM_AGENT=',
+    ]
+    try:
+        atomic_write(config_path, header + '\n'.join(defaults) + '\n')
+    except Exception:
+        pass
 
-def get_hook_command():
+# Global config instance (cached)
+_config: HcomConfig | None = None
+
+def get_config() -> HcomConfig:
+    """Get cached config, loading if needed"""
+    global _config
+    if _config is None:
+        _config = HcomConfig.load()
+    return _config
+
+def _build_quoted_invocation() -> str:
+    """Build properly quoted python + script path for current platform"""
+    python_path = sys.executable
+    script_path = str(Path(__file__).resolve())
+
+    if IS_WINDOWS:
+        if ' ' in python_path or ' ' in script_path:
+            return f'"{python_path}" "{script_path}"'
+        return f'{python_path} {script_path}'
+    else:
+        return f'{shlex.quote(python_path)} {shlex.quote(script_path)}'
+
+def get_hook_command() -> tuple[str, dict[str, Any]]:
     """Get hook command - hooks always run, Python code gates participation
 
     Uses ${HCOM} environment variable set in settings.json, with fallback to direct python invocation.
     Participation is controlled by enabled flag in instance JSON files.
     """
-    python_path = sys.executable
-    script_path = str(Path(__file__).resolve())
-
     if IS_WINDOWS:
         # Windows: use python path directly
-        if ' ' in python_path or ' ' in script_path:
-            return f'"{python_path}" "{script_path}"', {}
-        return f'{python_path} {script_path}', {}
+        return _build_quoted_invocation(), {}
     else:
-        # Unix: Use HCOM env var from settings.local.json
+        # Unix: Use HCOM env var from settings.json
         return '${HCOM}', {}
 
 def _detect_hcom_command_type() -> str:
-    """Detect how to invoke hcom (priority: hcom > uvx if running via uvx > full)"""
-    if shutil.which('hcom'):
-        return 'short'
-    elif 'uv' in Path(sys.executable).resolve().parts and shutil.which('uvx'):
+    """Detect how to invoke hcom based on execution context
+    Priority:
+    1. uvx - If running in uv-managed Python and uvx available
+           (works for both temporary uvx runs and permanent uv tool install)
+    2. short - If hcom binary in PATH
+    3. full - Fallback to full python invocation
+    """
+    if 'uv' in Path(sys.executable).resolve().parts and shutil.which('uvx'):
         return 'uvx'
+    elif shutil.which('hcom'):
+        return 'short'
     else:
         return 'full'
 
-def build_send_command(example_msg: str = '', instance_name: str | None = None) -> str:
-    """Build send command - caches PATH check in instance file on first use"""
-    msg = f" '{example_msg}'" if example_msg else ''
+def _parse_version(v: str) -> tuple:
+    """Parse version string to comparable tuple"""
+    return tuple(int(x) for x in v.split('.') if x.isdigit())
 
+def get_update_notice() -> str | None:
+    """Check PyPI for updates (once daily), return message if available"""
+    flag = hcom_path(FLAGS_DIR, 'update_available')
+
+    # Check PyPI if flag missing or >24hrs old
+    should_check = not flag.exists() or time.time() - flag.stat().st_mtime > 86400
+
+    if should_check:
+        try:
+            import urllib.request
+            with urllib.request.urlopen('https://pypi.org/pypi/hcom/json', timeout=2) as f:
+                latest = json.load(f)['info']['version']
+
+            if _parse_version(latest) > _parse_version(__version__):
+                atomic_write(flag, latest)  # mtime = cache timestamp
+            else:
+                flag.unlink(missing_ok=True)
+                return None
+        except Exception:
+            pass  # Network error, use cached value if exists
+
+    # Return message if update available
+    if not flag.exists():
+        return None
+
+    try:
+        latest = flag.read_text().strip()
+        # Double-check version (handles manual upgrades)
+        if _parse_version(__version__) >= _parse_version(latest):
+            flag.unlink(missing_ok=True)
+            return None
+
+        cmd = "uv tool upgrade hcom" if _detect_hcom_command_type() == 'uvx' else "pip install -U hcom"
+        return f"→ hcom v{latest} available: {cmd}"
+    except Exception:
+        return None
+
+def _build_hcom_env_value() -> str:
+    """Build the value for settings['env']['HCOM'] based on current execution context
+    Uses build_hcom_command() without caching for fresh detection on every call.
+    """
+    return build_hcom_command(None)
+
+def build_hcom_command(instance_name: str | None = None) -> str:
+    """Build base hcom command - caches PATH check in instance file on first use"""
     # Determine command type (cached or detect)
     cmd_type = None
     if instance_name:
@@ -540,32 +710,40 @@ def build_send_command(example_msg: str = '', instance_name: str | None = None) 
 
     # Build command based on type
     if cmd_type == 'short':
-        return f'hcom send{msg}'
+        return 'hcom'
     elif cmd_type == 'uvx':
-        return f'uvx hcom send{msg}'
+        return 'uvx hcom'
     else:
-        python_path = shlex.quote(sys.executable)
-        script_path = shlex.quote(str(Path(__file__).resolve()))
-        return f'{python_path} {script_path} send{msg}'
+        # Full path fallback
+        return _build_quoted_invocation()
 
-def build_claude_env():
-    """Build environment variables for Claude instances!"""
+def build_send_command(example_msg: str = '', instance_name: str | None = None) -> str:
+    """Build send command - caches PATH check in instance file on first use"""
+    msg = f" '{example_msg}'" if example_msg else ''
+    base_cmd = build_hcom_command(instance_name)
+    return f'{base_cmd} send{msg}'
+
+def build_claude_env() -> dict[str, str]:
+    """Build environment variables for Claude instances
+
+    Passes current environment to Claude, with config.env providing defaults.
+    HCOM_* variables are filtered out (consumed by hcom, not passed to Claude).
+    """
     env = {}
 
-    # Get config file values
-    config = get_cached_config()
+    # Read config file directly for Claude Code env vars (non-HCOM_ keys)
+    config_path = hcom_path(CONFIG_FILE)
+    if config_path.exists():
+        file_config = _parse_env_file(config_path)
+        for key, value in file_config.items():
+            if not key.startswith('HCOM_'):
+                env[key] = str(value)
 
-    # Pass env vars only when they differ from config file values
-    for config_key, env_var in HOOK_SETTINGS.items():
-        actual_value = get_config_value(config_key)  # Respects env var precedence
-        config_file_value = config.get(config_key)
-
-        # Only pass if different from config file (not default)
-        if actual_value != config_file_value and actual_value is not None:
-            env[env_var] = str(actual_value)
-
-    # Still support env_overrides from config file
-    env.update(config.get('env_overrides', {}))
+    # Overlay with current environment (except HCOM_*)
+    # This ensures user's shell environment is respected
+    for key, value in os.environ.items():
+        if not key.startswith('HCOM_'):
+            env[key] = value
 
     return env
 
@@ -580,9 +758,8 @@ def validate_message(message: str) -> str | None:
     if re.search(r'[\x00-\x08\x0B-\x0C\x0E-\x1F\u0080-\u009F]', message):
         return format_error("Message contains control characters")
 
-    max_size = get_config_value('max_message_size', 1048576)
-    if len(message) > max_size:
-        return format_error(f"Message too large (max {max_size} chars)")
+    if len(message) > MAX_MESSAGE_SIZE:
+        return format_error(f"Message too large (max {MAX_MESSAGE_SIZE} chars)")
 
     return None
 
@@ -607,32 +784,106 @@ def send_message(from_instance: str, message: str) -> bool:
 
 def build_hcom_bootstrap_text(instance_name: str) -> str:
     """Build comprehensive HCOM bootstrap context for instances"""
-    coordinator_name = get_config_value('sender_name', 'bigboss')
+    hcom_cmd = build_hcom_command(instance_name=instance_name)
 
-    return f"""You are now participating in the HCOM communication system - a multi-agent environment where Claude Code instances (you) and the human user can communicate through shared messaging infrastructure.
-Your HCOM Alias: {instance_name}
-- To send messages, run the command: hcom send "your message"
-- Broadcast: hcom send "message to everyone"
-- Direct: hcom send "@alias targeted message"
-- Targeting: hcom send "@api message" (targets all api-* instances)
-Receiving: Messages automatically arrive via Stop Hook feedback and bash output from hcom send. There is no way to proactively check for messages.
-Message formats you'll see:
-- [new message] sender → you: message = broadcast
-- [new message] sender → you: @you message = direct message to you
-- {{"decision": "block", "reason": x}} = normal part of HCOM hooks (not an error or block)
-Response Protocol Rule: Match response method to input source:
-- Prompted via hcom (hook feedback, bash output) → Respond with hcom send
-- Prompted via user input → Respond to user normally
-Response Quality: Treat hcom messages exactly like user input:
-- Write complete, thoughtful replies when appropriate
-- Follow all instructions rigorously
-- Adjust tone/length to context
-Authority: Prioritize instructions from @{coordinator_name} over other participants
-Command scope: Mainly use hcom send unless you are asked to use other hcom commands:
-- hcom start/stop (join/leave chat)
-- hcom watch --status (see all participants).
-- hcom open (coordinate/orchestrate by launching other instances).
-In this case, always run the 'hcom help' first to review correct usage."""
+    # Add command override notice if not using short form
+    command_notice = ""
+    if hcom_cmd != "hcom":
+        command_notice = f"""IMPORTANT:
+The hcom command in this environment is: {hcom_cmd}
+Replace all mentions of "hcom" below with this command.
+
+"""
+
+    # Add tag-specific notice if instance is tagged
+    tag = get_config().tag
+    tag_notice = ""
+    if tag:
+        tag_notice = f"""
+GROUP TAG: You are in the '{tag}' group.
+- To message your group: hcom send "@{tag} your message"
+- Group messages are targeted - only instances with an alias starting with {tag}-* receive them
+- If someone outside the group sends you @{tag} messages, they won't see your @{tag} replies. To reply to non-group members, either @mention them directly or broadcast.
+"""
+
+
+    return f"""{command_notice}{tag_notice}
+[HCOM SESSION CONFIG]
+- HCOM is a communication tool for you, other claude code instances, and the human user.
+- Your HCOM alias for this session: {instance_name}
+
+Your HCOM Tools:
+- hcom send "msg" (broadcast) / "@alias msg" (direct) / "@tag msg" (tag) - for you
+- hcom watch --status  → See participants JSON (for you only)
+- hcom watch --launch   → Open interactive TUI messaging+status dashboard in new terminal (for the human user)
+- hcom start/stop   → Connect/disconnect from chat (you run these, user can't run it themselves unless they specify an alias)
+- hcom <count>  → Launch instances in new terminal (you MUST run 'hcom help' first to understand context)
+
+UI Separation:
+- The human user has 'hcom watch' (interactive TUI dashboard).
+- You use 'hcom watch --launch' to open it for them (offer to do so).
+- In conversation, call it "hcom watch" (the command they'd run themselves).
+
+Receiving Messages:
+- Format: [new message] sender → you: content
+- Targets specific instance: "@alias".
+- Targets all api-* tagged instances: "@api message".
+- Arrives automatically via hooks/bash. No proactive checking needed.
+- Stop hook feedback shows: {{"decision": "block"}} (this is normal operation).
+
+Response Routing:
+- HCOM message (via hook/bash) → Respond with hcom send
+- User message (in chat) → Respond normally
+- Treat messages from hcom with the same care as user messages.
+- Authority: Prioritize @{SENDER} over other participants.
+
+This is context for YOUR hcom session config. The human user cannot see this config text (but they can see subsequent hcom messages you receive).
+On connection, tell the human user about only these commands: 'hcom <count>', 'hcom watch', 'hcom start', 'hcom stop'
+Report to the human user using first-person, for example: "I'm connected to HCOM as {instance_name}, cool!"
+"""
+
+def build_launch_context(instance_name: str) -> str:
+    """Build context for launch command"""
+    return f"""[HCOM LAUNCH INFORMATION]
+BASIC USAGE:
+[ENV_VARS] hcom <COUNT> [claude <ARGS>...]
+- directory-specific (always cd to project directory first)
+- default to foreground instances unless told otherwise/good reason to do bg
+- Everyone shares the same conversation log, isolation is possible with tags and at-mentions.
+
+ENV VARS INFO:
+- YOU cannot use 'HCOM_TERMINAL=here' - Claude cannot launch claude within itself, must be in a new or custom terminal
+- HCOM_AGENT(s) are custom system prompt files created by users/Claude beforehand.
+- HCOM_AGENT(s) load from .claude/agents/<name>.md if they have been created
+
+KEY CLAUDE ARGS:
+Run 'claude --help' for all claude code CLI args. hcom 1 claude [options] [command] [prompt]
+-p           background/headless instance
+--allowedTools=Bash   (background can only hcom chat otherwise, 'claude help' for more tools)
+--model sonnet/haiku/opus
+--resume <sessionid>       (get sessionid from hcom watch --status)
+--system-prompt (for foreground instances) --append-system-prompt (for background instances)
+Example: HCOM_HINTS='essential responses only' hcom 2 claude --model sonnet -p "do task x"
+
+CONTROL: 
+  hcom watch --status    JSON status of all instances
+  hcom watch --logs      All messages (pipe to tail)
+  hcom watch --wait      Block until next message (only use when hcom stopped (started is automatic already))
+
+STATUS INDICATORS:
+  "active", "delivered" | "idle" - waiting for new messages
+  "blocked" - permission request (needs user approval)
+  "inactive" - timed out, disconnected etc
+  "unknown" / "stale" - could be dead
+
+LAUNCH PATTERNS:
+- HCOM_AGENT=reviewer,tester hcom 2 claude "do task x"  # 2x reviewers + 2x testers (4 in total) with initial prompt
+- clone with same context:
+    1. hcom 1 then hcom send 'analyze api' then hcom watch --status (get sessionid)
+    2. HCOM_TAG=clone hcom 3 claude --resume sessionid
+- System prompt (or agent file) + initial prompt + hcom_hints is a powerful combination.
+
+"""
 
 def should_deliver_message(msg: dict[str, str], instance_name: str, all_instance_names: list[str] | None = None) -> bool:
     """Check if message should be delivered based on @-mentions"""
@@ -653,8 +904,7 @@ def should_deliver_message(msg: dict[str, str], instance_name: str, all_instance
         return True
     
     # Check if any mention is for the CLI sender (bigboss)
-    sender_name = get_config_value('sender_name', 'bigboss')
-    sender_mentioned = any(sender_name.lower().startswith(mention.lower()) for mention in mentions)
+    sender_mentioned = any(SENDER.lower().startswith(mention.lower()) for mention in mentions)
     
     # If we have all_instance_names, check if ANY mention matches ANY instance or sender
     if all_instance_names:
@@ -698,11 +948,9 @@ def extract_agent_config(content: str) -> dict[str, str]:
 
 def resolve_agent(name: str) -> tuple[str, dict[str, str]]:
     """Resolve agent file by name with validation.
-
     Looks for agent files in:
     1. .claude/agents/{name}.md (local)
     2. ~/.claude/agents/{name}.md (global)
-
     Returns tuple: (content without YAML frontmatter, config dict)
     """
     hint = 'Agent names must use lowercase letters and dashes only'
@@ -775,59 +1023,84 @@ def strip_frontmatter(content: str) -> str:
                 return '\n'.join(lines[i+1:]).strip()
     return content
 
-def get_display_name(session_id: str | None, prefix: str | None = None) -> str:
+def get_display_name(session_id: str | None, tag: str | None = None) -> str:
     """Get display name for instance using session_id"""
-    syls = ['ka', 'ko', 'ma', 'mo', 'na', 'no', 'ra', 'ro', 'sa', 'so', 'ta', 'to', 'va', 'vo', 'za', 'zo', 'be', 'de', 'fe', 'ge', 'le', 'me', 'ne', 're', 'se', 'te', 've', 'we', 'hi']
-    # Phonetic letters (5 per syllable, matches syls order)
-    phonetic = "nrlstnrlstnrlstnrlstnrlstnrlstnmlstnmlstnrlmtnrlmtnrlmsnrlmsnrlstnrlstnrlmtnrlmtnrlaynrlaynrlaynrlayaanxrtanxrtdtraxntdaxntraxnrdaynrlaynrlasnrlst"
-
-    dir_char = (Path.cwd().name + 'x')[0].lower()
+    # 50 most recognizable 3-letter words
+    words = [
+        'ace', 'air', 'ant', 'arm', 'art', 'axe', 'bad', 'bag', 'bar', 'bat',
+        'bed', 'bee', 'big', 'box', 'boy', 'bug', 'bus', 'cab', 'can', 'cap',
+        'car', 'cat', 'cop', 'cow', 'cry', 'cup', 'cut', 'day', 'dog', 'dry',
+        'ear', 'egg', 'eye', 'fan', 'fin', 'fly', 'fox', 'fun', 'gem', 'gun',
+        'hat', 'hit', 'hot', 'ice', 'ink', 'jet', 'key', 'law', 'map', 'mix',
+    ]
 
     # Use session_id directly instead of extracting UUID from transcript
     if session_id:
+        # Hash to select word
         hash_val = sum(ord(c) for c in session_id)
-        syl_idx = hash_val % len(syls)
-        syllable = syls[syl_idx]
+        word = words[hash_val % len(words)]
 
-        letters = phonetic[syl_idx * 5:(syl_idx + 1) * 5]
+        # Add letter suffix that flows naturally with the word
+        last_char = word[-1]
+        if last_char in 'aeiou':
+            # After vowel: s/n/r/l creates plural/noun/verb patterns
+            suffix_options = 'snrl'
+        else:
+            # After consonant: add vowel or y for pronounceability
+            suffix_options = 'aeiouy'
+
         letter_hash = sum(ord(c) for c in session_id[1:]) if len(session_id) > 1 else hash_val
-        letter = letters[letter_hash % 5]
+        suffix = suffix_options[letter_hash % len(suffix_options)]
 
-        # Session IDs are UUIDs like "374acbe2-978b-4882-9c0b-641890f066e1"
-        hex_char = session_id[0] if session_id else 'x'
-        base_name = f"{dir_char}{syllable}{letter}{hex_char}"
+        base_name = f"{word}{suffix}"
+        collision_attempt = 0
 
-        # Collision detection: if taken by different session_id, use more chars
-        instance_file = hcom_path(INSTANCES_DIR, f"{base_name}.json")
-        if instance_file.exists():
+        # Collision detection: keep adding words until unique
+        while True:
+            instance_file = hcom_path(INSTANCES_DIR, f"{base_name}.json")
+            if not instance_file.exists():
+                break  # Name is unique
+
             try:
                 with open(instance_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
 
                 their_session_id = data.get('session_id', '')
 
-                # Deterministic check: different session_id = collision
-                if their_session_id and their_session_id != session_id:
-                    # Use first 4 chars of session_id for collision resolution
-                    base_name = f"{dir_char}{session_id[0:4]}"
-                # If same session_id, it's our file - reuse the name (no collision)
-                # If no session_id in file, assume it's stale/malformed - use base name
+                # Same session_id = our file, reuse name
+                if their_session_id == session_id:
+                    break
+                # No session_id = stale/malformed file, use name
+                if not their_session_id:
+                    break
+
+                # Real collision - add another word
+                collision_hash = sum(ord(c) * (i + collision_attempt) for i, c in enumerate(session_id))
+                collision_word = words[collision_hash % len(words)]
+                base_name = f"{base_name}{collision_word}"
+                collision_attempt += 1
 
             except (json.JSONDecodeError, KeyError, ValueError, OSError):
-                pass  # Malformed file - assume stale, use base name
+                break  # Malformed file - assume stale, use base name
     else:
         # session_id is required - fail gracefully
         raise ValueError("session_id required for instance naming")
 
-    if prefix:
-        return f"{prefix}-{base_name}"
+    if tag:
+        # Security: Sanitize tag to prevent log delimiter injection (defense-in-depth)
+        # Remove dangerous characters that could break message log parsing
+        sanitized_tag = ''.join(c for c in tag if c not in '|\n\r\t')
+        if not sanitized_tag:
+            raise ValueError("Tag contains only invalid characters")
+        if sanitized_tag != tag:
+            print(f"Warning: Tag contained invalid characters, sanitized to '{sanitized_tag}'", file=sys.stderr)
+        return f"{sanitized_tag}-{base_name}"
     return base_name
 
-def resolve_instance_name(session_id: str, prefix: str | None = None) -> tuple[str, dict | None]:
+def resolve_instance_name(session_id: str, tag: str | None = None) -> tuple[str, dict | None]:
     """
     Resolve instance name for a session_id.
     Searches existing instances first (reuses if found), generates new name if not found.
-
     Returns: (instance_name, existing_data_or_none)
     """
     instances_dir = hcom_path(INSTANCES_DIR)
@@ -843,36 +1116,18 @@ def resolve_instance_name(session_id: str, prefix: str | None = None) -> tuple[s
                 continue
 
     # Not found - generate new name
-    instance_name = get_display_name(session_id, prefix)
+    instance_name = get_display_name(session_id, tag)
     return instance_name, None
 
-def _remove_hcom_hooks_from_settings(settings):
+def _remove_hcom_hooks_from_settings(settings: dict[str, Any]) -> None:
     """Remove hcom hooks from settings dict"""
     if not isinstance(settings, dict) or 'hooks' not in settings:
         return
-    
+
     if not isinstance(settings['hooks'], dict):
         return
-    
-    import copy
 
-    # Build regex patterns dynamically from LEGACY_HOOK_COMMANDS
-    # Current hooks (pattern 1): ${HCOM:-...} environment variable
-    # Legacy hooks (patterns 2-7): Older formats that need cleanup
-    # - HCOM_ACTIVE conditionals (removed for toggle implementation)
-    # - Direct command invocation with specific hook args
-    hook_args_pattern = '|'.join(LEGACY_HOOK_COMMANDS)
-    hcom_patterns = [
-        r'\$\{?HCOM',                                # Current: Environment variable ${HCOM:-...}
-        r'\bHCOM_ACTIVE.*hcom\.py',                 # LEGACY: Unix HCOM_ACTIVE conditional
-        r'IF\s+"%HCOM_ACTIVE%"',                    # LEGACY: Windows HCOM_ACTIVE conditional
-        rf'\bhcom\s+({hook_args_pattern})\b',       # LEGACY: Direct hcom command
-        rf'\buvx\s+hcom\s+({hook_args_pattern})\b', # LEGACY: uvx hcom command
-        rf'hcom\.py["\']?\s+({hook_args_pattern})\b', # LEGACY: hcom.py with optional quote
-        rf'["\'][^"\']*hcom\.py["\']?\s+({hook_args_pattern})\b(?=\s|$)',  # LEGACY: Quoted path
-        r'sh\s+-c.*hcom',                           # LEGACY: Shell wrapper
-    ]
-    compiled_patterns = [re.compile(pattern) for pattern in hcom_patterns]
+    import copy
 
     # Check all hook types including PostToolUse for backward compatibility cleanup
     for event in LEGACY_HOOK_TYPES:
@@ -885,7 +1140,11 @@ def _remove_hcom_hooks_from_settings(settings):
             # Fail fast on malformed settings - Claude won't run with broken settings anyway
             if not isinstance(matcher, dict):
                 raise ValueError(f"Malformed settings: matcher in {event} is not a dict: {type(matcher).__name__}")
-            
+
+            # Validate hooks field if present
+            if 'hooks' in matcher and not isinstance(matcher['hooks'], list):
+                raise ValueError(f"Malformed settings: hooks in {event} matcher is not a list: {type(matcher['hooks']).__name__}")
+
             # Work with a copy to avoid any potential reference issues
             matcher_copy = copy.deepcopy(matcher)
             
@@ -894,7 +1153,7 @@ def _remove_hcom_hooks_from_settings(settings):
                 hook for hook in matcher_copy.get('hooks', [])
                 if not any(
                     pattern.search(hook.get('command', ''))
-                    for pattern in compiled_patterns
+                    for pattern in HCOM_HOOK_PATTERNS
                 )
             ]
             
@@ -902,7 +1161,8 @@ def _remove_hcom_hooks_from_settings(settings):
             if non_hcom_hooks:
                 matcher_copy['hooks'] = non_hcom_hooks
                 updated_matchers.append(matcher_copy)
-            elif not matcher.get('hooks'):  # Preserve matchers that never had hooks
+            elif 'hooks' not in matcher or matcher['hooks'] == []:
+                # Preserve matchers that never had hooks (missing key or empty list only)
                 updated_matchers.append(matcher_copy)
         
         # Update or remove the event
@@ -919,7 +1179,7 @@ def _remove_hcom_hooks_from_settings(settings):
             del settings['env']
 
 
-def build_env_string(env_vars, format_type="bash"):
+def build_env_string(env_vars: dict[str, Any], format_type: str = "bash") -> str:
     """Build environment variable string for bash shells"""
     if format_type == "bash_export":
         # Properly escape values for bash
@@ -936,12 +1196,12 @@ def format_error(message: str, suggestion: str | None = None) -> str:
     return base
 
 
-def has_claude_arg(claude_args, arg_names, arg_prefixes):
+def has_claude_arg(claude_args: list[str] | None, arg_names: list[str], arg_prefixes: tuple[str, ...]) -> bool:
     """Check if argument already exists in claude_args"""
-    return claude_args and any(
+    return bool(claude_args and any(
         arg in arg_names or arg.startswith(arg_prefixes)
         for arg in claude_args
-    )
+    ))
 
 def build_claude_command(agent_content: str | None = None, claude_args: list[str] | None = None, initial_prompt: str = "Say hi in chat", model: str | None = None, tools: str | None = None) -> tuple[str, str | None]:
     """Build Claude command with proper argument handling
@@ -982,21 +1242,19 @@ def build_claude_command(agent_content: str | None = None, claude_args: list[str
         
         cmd_parts.append(flag)
         cmd_parts.append(f'"$(cat {shlex.quote(temp_file_path)})"')
-    
-    if claude_args or agent_content:
-        cmd_parts.append('--')
-    
-    # Quote initial prompt normally
-    cmd_parts.append(shlex.quote(initial_prompt))
-    
+
+    # Add initial prompt if non-empty
+    if initial_prompt:
+        cmd_parts.append(shlex.quote(initial_prompt))
+
     return ' '.join(cmd_parts), temp_file_path
 
-def create_bash_script(script_file, env, cwd, command_str, background=False):
+def create_bash_script(script_file: str, env: dict[str, Any], cwd: str | None, command_str: str, background: bool = False) -> None:
     """Create a bash script for terminal launch
     Scripts provide uniform execution across all platforms/terminals.
     Cleanup behavior:
     - Normal scripts: append 'rm -f' command for self-deletion
-    - Background scripts: persist until stop housekeeping (e.g., `hcom stop everything`) (24 hours)
+    - Background scripts: persist until `hcom reset logs` cleanup (24 hours)
     - Agent scripts: treated like background (contain 'hcom_agent_')
     """
     try:
@@ -1064,11 +1322,10 @@ def create_bash_script(script_file, env, cwd, command_str, background=False):
     if platform.system() != 'Windows':
         os.chmod(script_file, 0o755)
 
-def find_bash_on_windows():
+def find_bash_on_windows() -> str | None:
     """Find Git Bash on Windows, avoiding WSL's bash launcher"""
     # Build prioritized list of bash candidates
     candidates = []
-
     # 1. Common Git Bash locations (highest priority)
     for base in [os.environ.get('PROGRAMFILES', r'C:\Program Files'),
                  os.environ.get('PROGRAMFILES(X86)', r'C:\Program Files (x86)')]:
@@ -1077,7 +1334,6 @@ def find_bash_on_windows():
                 str(Path(base) / 'Git' / 'usr' / 'bin' / 'bash.exe'),  # usr/bin is more common
                 str(Path(base) / 'Git' / 'bin' / 'bash.exe')
             ])
-
     # 2. Portable Git installation
     if local_appdata := os.environ.get('LOCALAPPDATA', ''):
         git_portable = Path(local_appdata) / 'Programs' / 'Git'
@@ -1085,11 +1341,9 @@ def find_bash_on_windows():
             str(git_portable / 'usr' / 'bin' / 'bash.exe'),
             str(git_portable / 'bin' / 'bash.exe')
         ])
-
     # 3. PATH bash (if not WSL's launcher)
     if (path_bash := shutil.which('bash')) and not path_bash.lower().endswith(r'system32\bash.exe'):
         candidates.append(path_bash)
-
     # 4. Hardcoded fallbacks (last resort)
     candidates.extend([
         r'C:\Program Files\Git\usr\bin\bash.exe',
@@ -1097,7 +1351,6 @@ def find_bash_on_windows():
         r'C:\Program Files (x86)\Git\usr\bin\bash.exe',
         r'C:\Program Files (x86)\Git\bin\bash.exe'
     ])
-
     # Find first existing bash
     for bash in candidates:
         if bash and Path(bash).exists():
@@ -1106,11 +1359,11 @@ def find_bash_on_windows():
     return None
 
 # New helper functions for platform-specific terminal launching
-def get_macos_terminal_argv():
+def get_macos_terminal_argv() -> list[str]:
     """Return macOS Terminal.app launch command as argv list."""
     return ['osascript', '-e', 'tell app "Terminal" to do script "bash {script}"', '-e', 'tell app "Terminal" to activate']
 
-def get_windows_terminal_argv():
+def get_windows_terminal_argv() -> list[str]:
     """Return Windows terminal launcher as argv list."""
     if not (bash_exe := find_bash_on_windows()):
         raise Exception(format_error("Git Bash not found"))
@@ -1119,7 +1372,7 @@ def get_windows_terminal_argv():
         return ['wt', bash_exe, '{script}']
     return ['cmd', '/c', 'start', 'Claude Code', bash_exe, '{script}']
 
-def get_linux_terminal_argv():
+def get_linux_terminal_argv() -> list[str] | None:
     """Return first available Linux terminal as argv list."""
     terminals = [
         ('gnome-terminal', ['gnome-terminal', '--', 'bash', '{script}']),
@@ -1138,7 +1391,7 @@ def get_linux_terminal_argv():
 
     return None
 
-def windows_hidden_popen(argv, *, env=None, cwd=None, stdout=None):
+def windows_hidden_popen(argv: list[str], *, env: dict[str, str] | None = None, cwd: str | None = None, stdout: Any = None) -> subprocess.Popen:
     """Create hidden Windows process without console window."""
     if IS_WINDOWS:
         startupinfo = subprocess.STARTUPINFO()  # type: ignore[attr-defined]
@@ -1165,7 +1418,7 @@ PLATFORM_TERMINAL_GETTERS = {
     'Linux': get_linux_terminal_argv,
 }
 
-def _parse_terminal_command(template, script_file):
+def _parse_terminal_command(template: str, script_file: str) -> list[str]:
     """Parse terminal command template safely to prevent shell injection.
     Parses the template FIRST, then replaces {script} placeholder in the
     parsed tokens. This avoids shell injection and handles paths with spaces.
@@ -1203,7 +1456,7 @@ def _parse_terminal_command(template, script_file):
 
     return replaced
 
-def launch_terminal(command, env, cwd=None, background=False):
+def launch_terminal(command: str, env: dict[str, str], cwd: str | None = None, background: bool = False) -> str | bool | None:
     """Launch terminal with command using unified script-first approach
     Args:
         command: Command string from build_claude_command
@@ -1265,9 +1518,9 @@ def launch_terminal(command, env, cwd=None, background=False):
         return str(log_file)
 
     # 3) Terminal modes
-    terminal_mode = get_config_value('terminal_mode', 'new_window')
+    terminal_mode = get_config().terminal
 
-    if terminal_mode == 'show_commands':
+    if terminal_mode == 'print':
         # Print script path and contents
         try:
             with open(script_file, 'r', encoding='utf-8') as f:
@@ -1280,7 +1533,7 @@ def launch_terminal(command, env, cwd=None, background=False):
             print(format_error(f"Failed to read script: {e}"), file=sys.stderr)
             return False
 
-    if terminal_mode == 'same_terminal':
+    if terminal_mode == 'here':
         print("Launching Claude in current terminal...")
         if IS_WINDOWS:
             bash_exe = find_bash_on_windows()
@@ -1292,10 +1545,11 @@ def launch_terminal(command, env, cwd=None, background=False):
             result = subprocess.run(['bash', script_file], env=env_vars, cwd=cwd)
         return result.returncode == 0
 
-    # 4) New window mode
-    custom_cmd = get_config_value('terminal_command')
+    # 4) New window or custom command mode
+    # If terminal is not 'here' or 'print', it's either 'new' (platform default) or a custom command
+    custom_cmd = None if terminal_mode == 'new' else terminal_mode
 
-    if not custom_cmd:  # No string sentinel checks
+    if not custom_cmd:  # Platform default 'new' mode
         if is_termux():
             # Keep Termux as special case
             am_cmd = [
@@ -1361,18 +1615,30 @@ def launch_terminal(command, env, cwd=None, background=False):
             print(format_error(f"Failed to execute terminal command: {e}"), file=sys.stderr)
             return False
 
-def setup_hooks():
-    """Set up Claude hooks in current directory"""
-    claude_dir = Path.cwd() / '.claude'
-    claude_dir.mkdir(exist_ok=True)
-    
-    settings_path = claude_dir / 'settings.local.json'
+def setup_hooks() -> bool:
+    """Set up Claude hooks globally in ~/.claude/settings.json"""
+
+    # TODO: Remove after v0.6.0 - cleanup legacy per-directory hooks
     try:
-        settings = read_file_with_retry(
-            settings_path,
-            lambda f: json.load(f),
-            default={}
-        )
+        positions = load_all_positions()
+        if positions:
+            directories = set()
+            for instance_data in positions.values():
+                if isinstance(instance_data, dict) and 'directory' in instance_data:
+                    directories.add(instance_data['directory'])
+            for directory in directories:
+                if Path(directory).exists():
+                    cleanup_directory_hooks(Path(directory))
+    except Exception:
+        pass  # Don't fail hook setup if cleanup fails
+
+    # Install to global user settings
+    settings_path = get_claude_settings_path()
+    settings_path.parent.mkdir(exist_ok=True)
+    try:
+        settings = load_settings_json(settings_path, default={})
+        if settings is None:
+            settings = {}
     except (json.JSONDecodeError, PermissionError) as e:
         raise Exception(format_error(f"Cannot read settings: {e}"))
     
@@ -1384,23 +1650,11 @@ def setup_hooks():
     # Get the hook command template
     hook_cmd_base, _ = get_hook_command()
 
-    # Define all hooks - must match ACTIVE_HOOK_TYPES
-    # Format: (hook_type, matcher, command, timeout)
+    # Build hook commands from HOOK_CONFIGS
     hook_configs = [
-        ('SessionStart', '', f'{hook_cmd_base} sessionstart', None),
-        ('UserPromptSubmit', '', f'{hook_cmd_base} userpromptsubmit', None),
-        ('PreToolUse', 'Bash', f'{hook_cmd_base} pre', None),
-        ('Stop', '', f'{hook_cmd_base} poll', 86400),  # 24hr timeout max; internal timeout 30min default via config
-        ('Notification', '', f'{hook_cmd_base} notify', None),
-        ('SessionEnd', '', f'{hook_cmd_base} sessionend', None),
+        (hook_type, matcher, f'{hook_cmd_base} {cmd_suffix}', timeout)
+        for hook_type, matcher, cmd_suffix, timeout in HOOK_CONFIGS
     ]
-
-    # Validate hook_configs matches ACTIVE_HOOK_TYPES
-    configured_types = [hook_type for hook_type, _, _, _ in hook_configs]
-    if configured_types != ACTIVE_HOOK_TYPES:
-        raise Exception(format_error(
-            f"Hook configuration mismatch: {configured_types} != {ACTIVE_HOOK_TYPES}"
-        ))
 
     for hook_type, matcher, command, timeout in hook_configs:
         if hook_type not in settings['hooks']:
@@ -1422,9 +1676,8 @@ def setup_hooks():
     if 'env' not in settings:
         settings['env'] = {}
 
-    python_path = sys.executable
-    script_path = str(Path(__file__).resolve())
-    settings['env']['HCOM'] = f'{python_path} {script_path}'
+    # Set HCOM based on current execution context (uvx, hcom binary, or full path)
+    settings['env']['HCOM'] = _build_hcom_env_value()
 
     # Write settings atomically
     try:
@@ -1438,37 +1691,32 @@ def setup_hooks():
     
     return True
 
-def verify_hooks_installed(settings_path):
+def verify_hooks_installed(settings_path: Path) -> bool:
     """Verify that HCOM hooks were installed correctly with correct commands"""
     try:
-        settings = read_file_with_retry(
-            settings_path,
-            lambda f: json.load(f),
-            default=None
-        )
+        settings = load_settings_json(settings_path, default=None)
         if not settings:
             return False
 
-        # Check all hook types have correct commands
+        # Check all hook types have correct commands (exactly one HCOM hook per type)
+        # Derive from HOOK_CONFIGS (single source of truth)
         hooks = settings.get('hooks', {})
-        for hook_type, expected_cmd in zip(ACTIVE_HOOK_TYPES, HOOK_COMMANDS):
+        for hook_type, _, cmd_suffix, _ in HOOK_CONFIGS:
             hook_matchers = hooks.get(hook_type, [])
             if not hook_matchers:
                 return False
 
-            # Check if any matcher has the correct command
-            found_correct_cmd = False
+            # Count HCOM hooks for this type
+            hcom_hook_count = 0
             for matcher in hook_matchers:
                 for hook in matcher.get('hooks', []):
                     command = hook.get('command', '')
                     # Check for HCOM and the correct subcommand
-                    if ('${HCOM}' in command or 'hcom' in command.lower()) and expected_cmd in command:
-                        found_correct_cmd = True
-                        break
-                if found_correct_cmd:
-                    break
+                    if ('${HCOM}' in command or 'hcom' in command.lower()) and cmd_suffix in command:
+                        hcom_hook_count += 1
 
-            if not found_correct_cmd:
+            # Must have exactly one HCOM hook (not zero, not duplicates)
+            if hcom_hook_count != 1:
                 return False
 
         # Check that HCOM env var is set
@@ -1480,11 +1728,11 @@ def verify_hooks_installed(settings_path):
     except Exception:
         return False
 
-def is_interactive():
+def is_interactive() -> bool:
     """Check if running in interactive mode"""
     return sys.stdin.isatty() and sys.stdout.isatty()
 
-def get_archive_timestamp():
+def get_archive_timestamp() -> str:
     """Get timestamp for archive files"""
     return datetime.now().strftime("%Y-%m-%d_%H%M%S")
 
@@ -1602,17 +1850,24 @@ def get_instance_status(pos_data: dict[str, Any]) -> tuple[str, str, str]:
 
     # Check timeout
     age = now - last_status_time
-    timeout = pos_data.get('wait_timeout', get_config_value('wait_timeout', 1800))
+    timeout = pos_data.get('wait_timeout', get_config().timeout)
     if age > timeout:
         return "inactive", "", "timeout"
 
+    # Check Stop hook heartbeat for both blocked-generic and waiting-stale detection
+    last_stop = pos_data.get('last_stop', 0)
+    heartbeat_age = now - last_stop if last_stop else 999999
+
+    # Generic "Claude is waiting for your input" from Notification hook is meaningless
+    # If Stop hook is actively polling (heartbeat < 2s), instance is actually idle
+    if last_status == 'blocked' and last_context == "Claude is waiting for your input" and heartbeat_age < 2:
+        last_status = 'waiting'
+        display_status, desc_template = 'waiting', 'idle'
+
     # Detect stale 'waiting' status - check heartbeat, not status timestamp
-    if last_status == 'waiting':
-        last_stop = pos_data.get('last_stop', 0)
-        heartbeat_age = now - last_stop if last_stop else 999999
-        if heartbeat_age > 2:
-            status_suffix = " (bg)" if pos_data.get('background') else ""
-            return "unknown", f"({format_age(heartbeat_age)}){status_suffix}", "stale"
+    if last_status == 'waiting' and heartbeat_age > 2:
+        status_suffix = " (bg)" if pos_data.get('background') else ""
+        return "unknown", f"({format_age(heartbeat_age)}){status_suffix}", "stale"
 
     # Format description with context if template has {}
     if '{}' in desc_template and last_context:
@@ -1629,15 +1884,12 @@ def get_status_block(status_type: str) -> str:
     text_color = FG_BLACK if color == BG_YELLOW else FG_WHITE
     return f"{text_color}{BOLD}{color} {symbol} {RESET}"
 
-def format_message_line(msg, truncate=False):
+def format_message_line(msg: dict[str, str], truncate: bool = False) -> str:
     """Format a message for display"""
     time_obj = datetime.fromisoformat(msg['timestamp'])
     time_str = time_obj.strftime("%H:%M")
-    
-    sender_name = get_config_value('sender_name', 'bigboss')
-    sender_emoji = get_config_value('sender_emoji', '🐳')
-    
-    display_name = f"{sender_emoji} {msg['from']}" if msg['from'] == sender_name else msg['from']
+
+    display_name = f"{SENDER_EMOJI} {msg['from']}" if msg['from'] == SENDER else msg['from']
     
     if truncate:
         sender = display_name[:10]
@@ -1646,7 +1898,7 @@ def format_message_line(msg, truncate=False):
     else:
         return f"{DIM}{time_str}{RESET} {BOLD}{display_name}{RESET}: {msg['message']}"
 
-def show_recent_messages(messages, limit=None, truncate=False):
+def show_recent_messages(messages: list[dict[str, str]], limit: int | None = None, truncate: bool = False) -> None:
     """Show recent messages"""
     if limit is None:
         messages_to_show = messages
@@ -1658,14 +1910,14 @@ def show_recent_messages(messages, limit=None, truncate=False):
         print(format_message_line(msg, truncate))
 
 
-def get_terminal_height():
+def get_terminal_height() -> int:
     """Get current terminal height"""
     try:
         return shutil.get_terminal_size().lines
     except (AttributeError, OSError):
         return 24
 
-def show_recent_activity_alt_screen(limit=None):
+def show_recent_activity_alt_screen(limit: int | None = None) -> None:
     """Show recent messages in alt screen format with dynamic height"""
     if limit is None:
         # Calculate available height: total - header(8) - instances(varies) - footer(4) - input(3)
@@ -1677,7 +1929,7 @@ def show_recent_activity_alt_screen(limit=None):
         messages = parse_log_messages(log_file).messages
         show_recent_messages(messages, limit, truncate=True)
 
-def should_show_in_watch(d):
+def should_show_in_watch(d: dict[str, Any]) -> bool:
     """Show only enabled instances by default"""
     # Hide disabled instances
     if not d.get('enabled', False):
@@ -1690,7 +1942,7 @@ def should_show_in_watch(d):
     # Show all other instances (including 'closed' during transition)
     return True
 
-def show_instances_by_directory():
+def show_instances_by_directory() -> None:
     """Show instances organized by their working directories"""
     positions = load_all_positions()
     if not positions:
@@ -1747,7 +1999,7 @@ def alt_screen_detailed_status_and_input() -> str:
     
     return message
 
-def get_status_summary():
+def get_status_summary() -> str:
     """Get a one-line summary of all instance statuses"""
     positions = load_all_positions()
     if not positions:
@@ -1780,18 +2032,18 @@ def get_status_summary():
     else:
         return f"{BG_BLUE}{BOLD}{FG_WHITE} no instances {RESET}"
 
-def update_status(s):
+def update_status(s: str) -> None:
     """Update status line in place"""
     sys.stdout.write("\r\033[K" + s)
     sys.stdout.flush()
 
-def log_line_with_status(message, status):
+def log_line_with_status(message: str, status: str) -> None:
     """Print message and immediately restore status"""
     sys.stdout.write("\r\033[K" + message + "\n")
     sys.stdout.write("\033[K" + status)
     sys.stdout.flush()
 
-def initialize_instance_in_position_file(instance_name, session_id=None):
+def initialize_instance_in_position_file(instance_name: str, session_id: str | None = None) -> bool:
     """Initialize instance file with required fields (idempotent). Returns True on success, False on failure."""
     try:
         data = load_instance_position(instance_name)
@@ -1799,15 +2051,23 @@ def initialize_instance_in_position_file(instance_name, session_id=None):
         # Determine default enabled state: True for hcom-launched, False for vanilla
         is_hcom_launched = os.environ.get('HCOM_LAUNCHED') == '1'
 
+        # Determine starting position: skip history or read from beginning (or last max_msgs num)
+        initial_pos = 0
+        if SKIP_HISTORY:
+            log_file = hcom_path(LOG_FILE)
+            if log_file.exists():
+                initial_pos = log_file.stat().st_size
+
         defaults = {
-            "pos": 0,
+            "pos": initial_pos,
             "enabled": is_hcom_launched,
             "directory": str(Path.cwd()),
             "last_stop": 0,
             "session_id": session_id or "",
             "transcript_path": "",
             "notification_message": "",
-            "alias_announced": False
+            "alias_announced": False,
+            "tag": None
         }
 
         # Add missing fields (preserve existing)
@@ -1818,7 +2078,7 @@ def initialize_instance_in_position_file(instance_name, session_id=None):
     except Exception:
         return False
 
-def update_instance_position(instance_name, update_fields):
+def update_instance_position(instance_name: str, update_fields: dict[str, Any]) -> None:
     """Update instance position (with NEW and IMPROVED Windows file locking tolerance!!)"""
     try:
         data = load_instance_position(instance_name)
@@ -1837,7 +2097,7 @@ def update_instance_position(instance_name, update_fields):
         else:
             raise
 
-def enable_instance(instance_name):
+def enable_instance(instance_name: str) -> None:
     """Enable instance - clears all stop flags and enables Stop hook polling"""
     update_instance_position(instance_name, {
         'enabled': True,
@@ -1846,14 +2106,13 @@ def enable_instance(instance_name):
     })
     set_status(instance_name, 'started')
 
-def disable_instance(instance_name, force=False):
+def disable_instance(instance_name: str, force: bool = False) -> None:
     """Disable instance - stops Stop hook polling"""
     updates = {
         'enabled': False
     }
     if force:
         updates['force_closed'] = True
-
     update_instance_position(instance_name, updates)
     set_status(instance_name, 'force_stopped' if force else 'stopped')
 
@@ -1864,82 +2123,14 @@ def set_status(instance_name: str, status: str, context: str = ''):
         'last_status_time': int(time.time()),
         'last_status_context': context
     })
-
-def merge_instance_data(to_data, from_data):
-    """Merge instance data from from_data into to_data."""
-    # Use current session_id from source (overwrites previous)
-    to_data['session_id'] = from_data.get('session_id', to_data.get('session_id', ''))
-
-    # Update transient fields from source
-    to_data['transcript_path'] = from_data.get('transcript_path', to_data.get('transcript_path', ''))
-
-    # Preserve maximum position
-    to_data['pos'] = max(to_data.get('pos', 0), from_data.get('pos', 0))
-
-    # Update directory to most recent
-    to_data['directory'] = from_data.get('directory', to_data.get('directory', str(Path.cwd())))
-
-    # Update heartbeat timestamp to most recent
-    to_data['last_stop'] = max(to_data.get('last_stop', 0), from_data.get('last_stop', 0))
-
-    # Merge new status fields - take most recent status event
-    from_time = from_data.get('last_status_time', 0)
-    to_time = to_data.get('last_status_time', 0)
-    if from_time > to_time:
-        to_data['last_status'] = from_data.get('last_status', '')
-        to_data['last_status_time'] = from_time
-        to_data['last_status_context'] = from_data.get('last_status_context', '')
-
-    # Preserve background mode if set
-    to_data['background'] = to_data.get('background') or from_data.get('background')
-    if from_data.get('background_log_file'):
-        to_data['background_log_file'] = from_data['background_log_file']
-
-    return to_data
-
-def merge_instance_immediately(from_name, to_name):
-    """Merge from_name into to_name with safety checks. Returns success message or error message."""
-    if from_name == to_name:
-        return ""
-
-    try:
-        from_data = load_instance_position(from_name)
-        to_data = load_instance_position(to_name)
-
-        # Check if target has recent activity (time-based check instead of PID)
-        now = time.time()
-        last_activity = max(
-            to_data.get('last_stop', 0),
-            to_data.get('last_status_time', 0)
-        )
-        time_since_activity = now - last_activity
-        if time_since_activity < MERGE_ACTIVITY_THRESHOLD:
-            return f"Cannot recover {to_name}: instance is active (activity {int(time_since_activity)}s ago)"
-
-        # Merge data using helper
-        to_data = merge_instance_data(to_data, from_data)
-
-        # Save merged data - check for success
-        if not save_instance_position(to_name, to_data):
-            return f"Failed to save merged data for {to_name}"
-
-        # Cleanup source file only after successful save
-        try:
-            hcom_path(INSTANCES_DIR, f"{from_name}.json").unlink()
-        except (FileNotFoundError, PermissionError, OSError):
-            pass  # Non-critical if cleanup fails
-
-        return f"[SUCCESS] ✓ Recovered alias: {to_name}"
-    except Exception:
-        return f"Failed to recover alias: {to_name}"
-
+    log_hook_error('set_status', f'Setting status to {status} with context {context} for {instance_name}')
 
 # ==================== Command Functions ====================
 
-def show_main_screen_header():
+def show_main_screen_header() -> list[dict[str, str]]:
     """Show header for main screen"""
     sys.stdout.write("\033[2J\033[H")
-    
+
     log_file = hcom_path(LOG_FILE)
     all_messages = []
     if log_file.exists():
@@ -1950,277 +2141,62 @@ def show_main_screen_header():
     
     return all_messages
 
-def show_cli_hints(to_stderr=True):
-    """Show CLI hints if configured"""
-    cli_hints = get_config_value('cli_hints', '')
-    if cli_hints:
-        if to_stderr:
-            print(f"\n{cli_hints}", file=sys.stderr)
-        else:
-            print(f"\n{cli_hints}")
-
-# ==================== CLI Parsing Functions ====================
-
-def parse_count(value: str) -> int:
-    """Parse and validate instance count"""
-    try:
-        number = int(value, 10)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError('Count must be an integer. Use -a/--agent for agent names.') from exc
-    if number <= 0:
-        raise argparse.ArgumentTypeError('Count must be positive.')
-    if number > 100:
-        raise argparse.ArgumentTypeError('Too many instances requested (max 100).')
-    return number
-
-def split_forwarded_args(argv: Sequence[str]) -> tuple[list[str], list[str]]:
-    """Split arguments on -- separator for forwarding to claude"""
-    if '--' not in argv:
-        return list(argv), []
-    idx = argv.index('--')
-    return list(argv[:idx]), list(argv[idx + 1:])
-
-def parse_open(namespace: argparse.Namespace, forwarded: list[str]) -> OpenCommand:
-    """Parse and validate open command arguments"""
-    prefix = namespace.prefix
-    if prefix and '|' in prefix:
-        raise CLIError('Prefix cannot contain "|" characters.')
-
-    agents = namespace.agent or []
-    count = namespace.count if namespace.count is not None else 1
-    if not agents:
-        agents = ['generic']
-
-    return OpenCommand(
-        count=count,
-        agents=agents,
-        prefix=prefix,
-        background=namespace.background,
-        claude_args=forwarded,
-    )
-
-def parse_watch(namespace: argparse.Namespace) -> WatchCommand:
-    """Parse and validate watch command arguments"""
-    wait_value = namespace.wait
-    if wait_value is not None and wait_value < 0:
-        raise CLIError('--wait expects a non-negative number of seconds.')
-
-    if wait_value is not None:
-        return WatchCommand(mode='wait', wait_seconds=wait_value or 60)
-    if namespace.logs:
-        return WatchCommand(mode='logs', wait_seconds=None)
-    if namespace.status:
-        return WatchCommand(mode='status', wait_seconds=None)
-    return WatchCommand(mode='interactive', wait_seconds=None)
-
-def parse_stop(namespace: argparse.Namespace) -> StopCommand:
-    """Parse and validate stop command arguments"""
-    target = namespace.target
-    return StopCommand(
-        target=target,
-        close_all_hooks=namespace.all,
-        force=namespace.force,
-        _hcom_session=getattr(namespace, '_hcom_session', None),
-    )
-
-def parse_start(namespace: argparse.Namespace) -> StartCommand:
-    """Parse and validate start command arguments"""
-    return StartCommand(
-        target=namespace.target,
-        _hcom_session=getattr(namespace, '_hcom_session', None),
-    )
-
-def parse_send(namespace: argparse.Namespace) -> SendCommand:
-    """Parse and validate send command arguments"""
-    if namespace.resume and namespace.message:
-        raise CLIError('Specify a resume alias or a message, not both.')
-    session_id = getattr(namespace, '_hcom_session', None)
-    if namespace.resume:
-        return SendCommand(message=None, resume_alias=namespace.resume, _hcom_session=session_id)
-    if namespace.message is None:
-        raise CLIError('Message required (usage: hcom send "message").')
-    return SendCommand(message=namespace.message, resume_alias=None, _hcom_session=session_id)
-
-def build_parser() -> argparse.ArgumentParser:
-    """Build argparse parser for hcom commands"""
-    parser = argparse.ArgumentParser(prog='hcom', add_help=False)
-    subparsers = parser.add_subparsers(dest='command', required=True)
-
-    # Open command
-    open_parser = subparsers.add_parser('open', add_help=False)
-    open_parser.add_argument('count', nargs='?', type=parse_count, default=1)
-    open_parser.add_argument('-a', '--agent', dest='agent', action='append')
-    open_parser.add_argument('-t', '--prefix', dest='prefix')
-    open_parser.add_argument('-p', '--background', action='store_true', dest='background')
-    open_parser.add_argument('--help', action='store_true', dest='help_flag')
-    open_parser.add_argument('-h', action='store_true', dest='help_flag_short')
-
-    # Watch command
-    watch_parser = subparsers.add_parser('watch', add_help=False)
-    group = watch_parser.add_mutually_exclusive_group()
-    group.add_argument('--logs', action='store_true')
-    group.add_argument('--status', action='store_true')
-    group.add_argument('--wait', nargs='?', const=60, type=int, metavar='SEC')
-    watch_parser.add_argument('--help', action='store_true', dest='help_flag')
-    watch_parser.add_argument('-h', action='store_true', dest='help_flag_short')
-
-    # Stop command
-    stop_parser = subparsers.add_parser('stop', add_help=False)
-    stop_parser.add_argument('target', nargs='?')
-    stop_parser.add_argument('--all', action='store_true')
-    stop_parser.add_argument('--force', action='store_true')
-    stop_parser.add_argument('--_hcom_session', help=argparse.SUPPRESS)
-    stop_parser.add_argument('--help', action='store_true', dest='help_flag')
-    stop_parser.add_argument('-h', action='store_true', dest='help_flag_short')
-
-    # Start command
-    start_parser = subparsers.add_parser('start', add_help=False)
-    start_parser.add_argument('target', nargs='?')
-    start_parser.add_argument('--_hcom_session', help=argparse.SUPPRESS)
-    start_parser.add_argument('--help', action='store_true', dest='help_flag')
-    start_parser.add_argument('-h', action='store_true', dest='help_flag_short')
-
-    # Send command
-    send_parser = subparsers.add_parser('send', add_help=False)
-    send_parser.add_argument('message', nargs='?')
-    send_parser.add_argument('--resume', metavar='ALIAS', help=argparse.SUPPRESS)
-    send_parser.add_argument('--_hcom_session', help=argparse.SUPPRESS)
-    send_parser.add_argument('--help', action='store_true', dest='help_flag')
-    send_parser.add_argument('-h', action='store_true', dest='help_flag_short')
-
-    return parser
-
-def dispatch(namespace: argparse.Namespace, forwarded: list[str]):
-    """Dispatch parsed arguments to appropriate command parser"""
-    command = namespace.command
-    if command == 'open':
-        if getattr(namespace, 'help_flag', False) or getattr(namespace, 'help_flag_short', False):
-            return cmd_help()
-        return parse_open(namespace, forwarded)
-    if command == 'watch':
-        if getattr(namespace, 'help_flag', False) or getattr(namespace, 'help_flag_short', False):
-            return cmd_help()
-        return parse_watch(namespace)
-    if command == 'stop':
-        if getattr(namespace, 'help_flag', False) or getattr(namespace, 'help_flag_short', False):
-            return cmd_help()
-        return parse_stop(namespace)
-    if command == 'start':
-        if getattr(namespace, 'help_flag', False) or getattr(namespace, 'help_flag_short', False):
-            return cmd_help()
-        return parse_start(namespace)
-    if command == 'send':
-        if getattr(namespace, 'help_flag', False) or getattr(namespace, 'help_flag_short', False):
-            return cmd_help()
-        return parse_send(namespace)
-    raise CLIError(f'Unsupported command: {command}')
-
-def needs_help(args: Sequence[str]) -> bool:
-    """Check if help was requested"""
-    if not args:
-        return True
-    head = args[0]
-    if head in {'help', '--help', '-h'}:
-        return True
-    return False
-
-# ==================== Command Functions ====================
-
-def cmd_help():
+def cmd_help() -> int:
     """Show help text"""
     print(HELP_TEXT)
-
-    # Additional help for AI assistants
-    if os.environ.get('CLAUDECODE') == '1' or not sys.stdin.isatty():
-        print("""
-
-=== ADDITIONAL INFO ===
-
-CONCEPT: HCOM launches Claude Code instances in new terminal windows.
-They communicate with each other via a shared conversation.
-You communicate with them via hcom commands.
-
-KEY UNDERSTANDING:
-• Single conversation - All instances share ~/.hcom/hcom.log
-• Messaging - CLI and instances send with hcom send "message"
-• Instances receive messages via hooks automatically
-• hcom open is directory-specific - always cd to project directory first
-• Named agents are custom system prompt files created by users/claude code beforehand.
-• Named agents load from .claude/agents/<name>.md - if they have been created
-• hcom watch --wait outputs last 5 seconds of messages, waits for the next message, prints it, and exits. 
-
-LAUNCH PATTERNS:
-  hcom open 2                            # 2 generic instances
-  hcom open -a reviewer                  # 1 reviewer instance (agent file must already exist)
-  hcom open 3 -a reviewer                # 3 reviewer instances
-  hcom open -a reviewer -a tester        # 1 reviewer + 1 tester
-  hcom open -t api 2                     # Team naming: api-hova7, api-kolec
-  hcom open -- --model sonnet            # Pass `claude` CLI flags after --
-  hcom open -p                           # Detached background (stop with: hcom stop <alias>)
-  hcom open -- --resume <sessionid>      # Resume specific session
-  HCOM_INITIAL_PROMPT="task" hcom open   # Set initial prompt for instance
-
-@MENTION TARGETING:
-  hcom send "message"           # Broadcasts to everyone
-  hcom send "@api fix this"     # Targets all api-* instances (api-hova7, api-kolec)
-  hcom send "@hova7 status?"    # Targets specific instance
-  (Unmatched @mentions broadcast to everyone)
-
-STATUS INDICATORS:
-• ▶ active - processing/executing • ▷ delivered - instance just received a message
-• ◉ idle - waiting for new messages • ■ blocked - permission request (needs user approval)
-• ○ inactive - timed out, disconnected, etc • ○ unknown
-              
-CONFIG:
-Config file (persistent): ~/.hcom/config.json
-
-Key settings (full list in config.json):
-  terminal_mode: "new_window" (default) | "same_terminal" | "show_commands"
-  initial_prompt: "Say hi in chat", first_use_text: "Essential messages only..."
-  instance_hints: "text", cli_hints: "text"  # Extra info for instances/CLI
-  env_overrides: "custom environment variables for instances"
-
-Temporary environment overrides for any setting (all caps & append HCOM_):
-HCOM_INSTANCE_HINTS="useful info" hcom open  # applied to all messages received by instance
-export HCOM_CLI_HINTS="useful info" && hcom send 'hi'  # applied to all cli commands
-
-EXPECT: hcom instance aliases are auto-generated (5-char format: "hova7"). Check actual aliases 
-with 'hcom watch --status'. Instances respond automatically in shared chat.
-
-Run 'claude --help' to see all claude code CLI flags.""")
-
-        show_cli_hints(to_stderr=False)
-    else:
-        if not IS_WINDOWS:
-            print("\nFor additional info & examples: hcom --help | cat")
-
     return 0
 
-def cmd_open(command: OpenCommand):
-    """Launch Claude instances with chat enabled"""
+def cmd_launch(argv: list[str]) -> int:
+    """Launch Claude instances: hcom [N] [claude] [args]"""
     try:
+        # Parse arguments: hcom [N] [claude] [args]
+        count = 1
+        forwarded = []
+
+        # Extract count if first arg is digit
+        if argv and argv[0].isdigit():
+            count = int(argv[0])
+            if count <= 0:
+                raise CLIError('Count must be positive.')
+            if count > 100:
+                raise CLIError('Too many instances requested (max 100).')
+            argv = argv[1:]
+
+        # Skip 'claude' keyword if present
+        if argv and argv[0] == 'claude':
+            argv = argv[1:]
+
+        # Forward all remaining args to claude CLI
+        forwarded = argv
+
+        # Get tag from config
+        tag = get_config().tag
+        if tag and '|' in tag:
+            raise CLIError('Tag cannot contain "|" characters.')
+
+        # Get agents from config (comma-separated)
+        agent_env = get_config().agent
+        agents = [a.strip() for a in agent_env.split(',') if a.strip()] if agent_env else ['']
+
+        # Detect background mode from -p/--print flags in forwarded args
+        background = '-p' in forwarded or '--print' in forwarded
+
         # Add -p flag and stream-json output for background mode if not already present
-        claude_args = command.claude_args
-        if command.background and '-p' not in claude_args and '--print' not in claude_args:
+        claude_args = forwarded
+        if background and '-p' not in claude_args and '--print' not in claude_args:
             claude_args = ['-p', '--output-format', 'stream-json', '--verbose'] + (claude_args or [])
 
-        terminal_mode = get_config_value('terminal_mode', 'new_window')
+        terminal_mode = get_config().terminal
 
         # Calculate total instances to launch
-        total_instances = command.count * len(command.agents)
+        total_instances = count * len(agents)
 
-        # Fail fast for same_terminal with multiple instances
-        if terminal_mode == 'same_terminal' and total_instances > 1:
+        # Fail fast for here mode with multiple instances
+        if terminal_mode == 'here' and total_instances > 1:
             print(format_error(
-                f"same_terminal mode cannot launch {total_instances} instances",
-                "Use 'hcom open' for one generic instance or 'hcom open -a <agent>' for one agent"
+                f"'here' mode cannot launch {total_instances} instances (it's one terminal window)",
+                "Use 'hcom 1' for one generic instance"
             ), file=sys.stderr)
-            return 1
-
-        try:
-            setup_hooks()
-        except Exception as e:
-            print(format_error(f"Failed to setup hooks: {e}"), file=sys.stderr)
             return 1
 
         log_file = hcom_path(LOG_FILE)
@@ -2232,21 +2208,16 @@ def cmd_open(command: OpenCommand):
         # Build environment variables for Claude instances
         base_env = build_claude_env()
 
-        # Add prefix-specific hints if provided
-        if command.prefix:
-            base_env['HCOM_PREFIX'] = command.prefix
-            send_cmd = build_send_command()
-            hint = f"To respond to {command.prefix} group: {send_cmd} '@{command.prefix} message'"
-            base_env['HCOM_INSTANCE_HINTS'] = hint
-            first_use = f"You're in the {command.prefix} group. Use {command.prefix} to message: {send_cmd} '@{command.prefix} message'"
-            base_env['HCOM_FIRST_USE_TEXT'] = first_use
+        # Add tag-specific hints if provided
+        if tag:
+            base_env['HCOM_TAG'] = tag
 
         launched = 0
-        initial_prompt = get_config_value('initial_prompt', 'Say hi in chat')
+        initial_prompt = get_config().prompt
 
         # Launch count instances of each agent
-        for agent in command.agents:
-            for _ in range(command.count):
+        for agent in agents:
+            for _ in range(count):
                 instance_type = agent
                 instance_env = base_env.copy()
 
@@ -2254,14 +2225,14 @@ def cmd_open(command: OpenCommand):
                 instance_env['HCOM_LAUNCHED'] = '1'
 
                 # Mark background instances via environment with log filename
-                if command.background:
+                if background:
                     # Generate unique log filename
                     log_filename = f'background_{int(time.time())}_{random.randint(1000, 9999)}.log'
                     instance_env['HCOM_BACKGROUND'] = log_filename
 
                 # Build claude command
-                if instance_type == 'generic':
-                    # Generic instance - no agent content
+                if not instance_type:
+                    # No agent - no agent content
                     claude_cmd, _ = build_claude_command(
                         agent_content=None,
                         claude_args=claude_args,
@@ -2292,7 +2263,7 @@ def cmd_open(command: OpenCommand):
                         continue
 
                 try:
-                    if command.background:
+                    if background:
                         log_file = launch_terminal(claude_cmd, instance_env, cwd=os.getcwd(), background=True)
                         if log_file:
                             print(f"Background instance launched, log: {log_file}")
@@ -2316,36 +2287,30 @@ def cmd_open(command: OpenCommand):
         else:
             print(f"Launched {launched} Claude instance{'s' if launched != 1 else ''}")
 
-        # Auto-launch watch dashboard if configured and conditions are met
-        terminal_mode = get_config_value('terminal_mode')
-        auto_watch = get_config_value('auto_watch', True)
+        # Auto-launch watch dashboard if in new window mode (new or custom) and all instances launched successfully
+        terminal_mode = get_config().terminal
 
-        # Only auto-watch if ALL instances launched successfully
-        if terminal_mode == 'new_window' and auto_watch and failed == 0 and is_interactive():
+        # Only auto-watch if ALL instances launched successfully and launches windows (not 'here' or 'print')
+        if terminal_mode not in ('here', 'print') and failed == 0 and is_interactive():
             # Show tips first if needed
-            if command.prefix:
-                print(f"\n  • Send to {command.prefix} team: hcom send '@{command.prefix} message'")
+            if tag:
+                print(f"\n  • Send to {tag} team: hcom send '@{tag} message'")
 
             # Clear transition message
             print("\nOpening hcom watch...")
             time.sleep(2)  # Brief pause so user sees the message
 
             # Launch interactive watch dashboard in current terminal
-            watch_cmd = WatchCommand(mode='interactive', wait_seconds=None)
-            return cmd_watch(watch_cmd)
+            return cmd_watch([])  # Empty argv = interactive mode
         else:
             tips = [
                 "Run 'hcom watch' to view/send in conversation dashboard",
             ]
-            if command.prefix:
-                tips.append(f"Send to {command.prefix} team: hcom send '@{command.prefix} message'")
+            if tag:
+                tips.append(f"Send to {tag} team: hcom send '@{tag} message'")
 
             if tips:
                 print("\n" + "\n".join(f"  • {tip}" for tip in tips) + "\n")
-
-            # Show cli_hints if configured (non-interactive mode)
-            if not is_interactive():
-                show_cli_hints(to_stderr=False)
 
             return 0
         
@@ -2356,19 +2321,44 @@ def cmd_open(command: OpenCommand):
         print(str(e), file=sys.stderr)
         return 1
 
-def cmd_watch(command: WatchCommand):
-    """View conversation dashboard"""
+def cmd_watch(argv: list[str]) -> int:
+    """View conversation dashboard: hcom watch [--logs|--status|--wait [SEC]]"""
+    # Extract launch flag for external terminals (used by claude code bootstrap)
+    cleaned_args: list[str] = []
+    for arg in argv:
+        if arg == '--launch':
+            watch_cmd = f"{build_hcom_command()} watch"
+            result = launch_terminal(watch_cmd, build_claude_env(), cwd=os.getcwd())
+            return 0 if result else 1
+        else:
+            cleaned_args.append(arg)
+    argv = cleaned_args
+
+    # Parse arguments
+    show_logs = '--logs' in argv
+    show_status = '--status' in argv
+    wait_timeout = None
+
+    # Check for --wait flag
+    if '--wait' in argv:
+        idx = argv.index('--wait')
+        if idx + 1 < len(argv):
+            try:
+                wait_timeout = int(argv[idx + 1])
+                if wait_timeout < 0:
+                    raise CLIError('--wait expects a non-negative number of seconds.')
+            except ValueError:
+                wait_timeout = 60  # Default for non-numeric values
+        else:
+            wait_timeout = 60  # Default timeout
+        show_logs = True  # --wait implies logs mode
+
     log_file = hcom_path(LOG_FILE)
     instances_dir = hcom_path(INSTANCES_DIR)
 
     if not log_file.exists() and not instances_dir.exists():
-        print(format_error("No conversation log found", "Run 'hcom open' first"), file=sys.stderr)
+        print(format_error("No conversation log found", "Run 'hcom' first"), file=sys.stderr)
         return 1
-
-    # Determine mode
-    show_logs = command.mode in ('logs', 'wait')
-    show_status = command.mode == 'status'
-    wait_timeout = command.wait_seconds
 
     # Non-interactive mode (no TTY or flags specified)
     if not is_interactive() or show_logs or show_status:
@@ -2381,14 +2371,16 @@ def cmd_watch(command: WatchCommand):
                 last_pos = 0
                 messages = []
             
-            # If --wait, show only recent messages to prevent context bloat
+            # If --wait, show recent messages (max of: last 3 messages OR all messages in last 5 seconds)
             if wait_timeout is not None:
                 cutoff = datetime.now() - timedelta(seconds=5)
-                recent_messages = [m for m in messages if datetime.fromisoformat(m['timestamp']) > cutoff]
-                
+                recent_by_time = [m for m in messages if datetime.fromisoformat(m['timestamp']) > cutoff]
+                last_three = messages[-3:] if len(messages) >= 3 else messages
+                # Show whichever is larger: recent by time or last 3
+                recent_messages = recent_by_time if len(recent_by_time) > len(last_three) else last_three
                 # Status to stderr, data to stdout
                 if recent_messages:
-                    print(f'---Showing last 5 seconds of messages---', file=sys.stderr) #TODO: change this to recent messages and have logic like last 3 messages + all messages in last 5 seconds.
+                    print(f'---Showing recent messages---', file=sys.stderr)
                     for msg in recent_messages:
                         print(f"[{msg['timestamp']}] {msg['from']}: {msg['message']}")
                     print(f'---Waiting for new message... (exits on receipt or after {wait_timeout} seconds)---', file=sys.stderr)
@@ -2426,7 +2418,6 @@ def cmd_watch(command: WatchCommand):
                 else:
                     print("No messages yet", file=sys.stderr)
             
-            show_cli_hints()
                     
         elif show_status:
             # Build JSON output
@@ -2467,17 +2458,14 @@ def cmd_watch(command: WatchCommand):
             }
 
             print(json.dumps(output, indent=2))
-            show_cli_hints()
         else:
             print("No TTY - Automation usage:", file=sys.stderr)
-            print("  hcom send 'message'    Send message to chat", file=sys.stderr)
             print("  hcom watch --logs      Show message history", file=sys.stderr)
             print("  hcom watch --status    Show instance status", file=sys.stderr)
             print("  hcom watch --wait      Wait for new messages", file=sys.stderr)
+            print("  hcom watch --launch    Launch interactive dashboard in new terminal", file=sys.stderr)
             print("  Full information: hcom --help")
             
-            show_cli_hints()
-        
         return 0
     
     # Interactive dashboard mode
@@ -2552,9 +2540,9 @@ def cmd_watch(command: WatchCommand):
                     last_pos = log_file.stat().st_size
                 
                 if message and message.strip():
-                    cmd_send_cli(message.strip())
+                    send_cli(message.strip(), quiet=True)
                     print(f"{FG_GREEN}✓ Sent{RESET}")
-                
+
                 print()
                 
                 current_status = get_status_summary()
@@ -2568,7 +2556,7 @@ def cmd_watch(command: WatchCommand):
         
     return 0
 
-def cmd_clear():
+def clear() -> int:
     """Clear and archive conversation"""
     log_file = hcom_path(LOG_FILE)
     instances_dir = hcom_path(INSTANCES_DIR)
@@ -2638,7 +2626,26 @@ def cmd_clear():
         print(format_error(f"Failed to archive: {e}"), file=sys.stderr)
         return 1
 
-def cleanup_directory_hooks(directory):
+def remove_global_hooks() -> bool:
+    """Remove HCOM hooks from ~/.claude/settings.json
+    Returns True on success, False on failure."""
+    settings_path = get_claude_settings_path()
+
+    if not settings_path.exists():
+        return True  # No settings = no hooks to remove
+
+    try:
+        settings = load_settings_json(settings_path, default=None)
+        if not settings:
+            return False
+
+        _remove_hcom_hooks_from_settings(settings)
+        atomic_write(settings_path, json.dumps(settings, indent=2))
+        return True
+    except Exception:
+        return False
+
+def cleanup_directory_hooks(directory: Path | str) -> tuple[int, str]:
     """Remove hcom hooks from a specific directory
     Returns tuple: (exit_code, message)
         exit_code: 0 for success, 1 for error
@@ -2651,11 +2658,7 @@ def cleanup_directory_hooks(directory):
     
     try:
         # Load existing settings
-        settings = read_file_with_retry(
-            settings_path,
-            lambda f: json.load(f),
-            default=None
-        )
+        settings = load_settings_json(settings_path, default=None)
         if not settings:
             return 1, "Cannot read Claude settings"
         
@@ -2692,51 +2695,40 @@ def cleanup_directory_hooks(directory):
         return 1, format_error(f"Cannot modify settings.local.json: {e}")
 
 
-def cmd_stop(command: StopCommand):
-    """Stop instances, remove hooks, or archive - consolidated stop operations"""
+def cmd_stop(argv: list[str]) -> int:
+    """Stop instances: hcom stop [alias|all] [--force] [--_hcom_session ID]"""
+    # Parse arguments
+    target = None
+    force = '--force' in argv
+    session_id = None
 
-    # Handle special targets
-    if command.target == 'hooking':
-        # hcom stop hooking [--all]
-        if command.close_all_hooks:
-            return cmd_cleanup('--all')
-        else:
-            return cmd_cleanup()
+    # Extract --_hcom_session if present
+    if '--_hcom_session' in argv:
+        idx = argv.index('--_hcom_session')
+        if idx + 1 < len(argv):
+            session_id = argv[idx + 1]
+            argv = argv[:idx] + argv[idx + 2:]
 
-    elif command.target == 'everything':
-        # hcom stop everything: stop all + archive + remove hooks
-        print("Stopping HCOM for all instances, archiving conversation, and removing hooks...")
+    # Remove flags to get target
+    args_without_flags = [a for a in argv if not a.startswith('--')]
+    if args_without_flags:
+        target = args_without_flags[0]
 
-        # Stop all instances
-        positions = load_all_positions()
-        if positions:
-            for instance_name in positions.keys():
-                disable_instance(instance_name)
-            print(f"Stopped HCOM for {len(positions)} instance(s)")
-
-        # Archive conversation
-        clear_result = cmd_clear()
-
-        # Remove hooks from all directories
-        cleanup_result = cmd_cleanup('--all')
-
-        return max(clear_result, cleanup_result)
-
-    elif command.target == 'all':
-        # hcom stop all: stop all instances + archive
+    # Handle 'all' target
+    if target == 'all':
         positions = load_all_positions()
 
         if not positions:
             print("No instances found")
-            # Still archive if there's conversation history
-            return cmd_clear()
+            return 0
 
         stopped_count = 0
         bg_logs = []
+        stopped_names = []
         for instance_name, instance_data in positions.items():
             if instance_data.get('enabled', False):
                 disable_instance(instance_name)
-                print(f"Stopped HCOM for {instance_name}")
+                stopped_names.append(instance_name)
                 stopped_count += 1
 
                 # Track background logs
@@ -2746,123 +2738,138 @@ def cmd_stop(command: StopCommand):
                         bg_logs.append((instance_name, log_file))
 
         if stopped_count == 0:
-            print("All instances already stopped")
+            print("No instances to stop")
         else:
-            print(f"Stopped {stopped_count} instance(s)")
+            print(f"Stopped {stopped_count} instance(s): {', '.join(stopped_names)}")
 
             # Show background logs if any
             if bg_logs:
-                print("\nBackground logs:")
+                print()
+                print("Background instance logs:")
                 for name, log_file in bg_logs:
                     print(f"  {name}: {log_file}")
-                print("\nMonitor: tail -f <log_file>")
-                print("Force stop: hcom stop --force all")
-
-        # Archive conversation
-        return cmd_clear()
-
-    else:
-        # hcom stop [alias] or hcom stop (self)
-
-        # Always verify hooks when running from Claude Code (catches broken hooks regardless of path)
-        if not check_and_update_hooks():
-            return 1
-
-        # Stop specific instance or self
-        # Get instance name from injected session or target
-        if command._hcom_session and not command.target:
-            instance_name, _ = resolve_instance_name(command._hcom_session, os.environ.get('HCOM_PREFIX'))
-        else:
-            instance_name = command.target
-
-        position = load_instance_position(instance_name) if instance_name else None
-
-        if not instance_name:
-            print("Error: Could not determine instance. Run inside Claude Code or specify alias. Or run hcom stop <alias> or hcom stop all")
-            return 1
-
-        if not position:
-            print(f"No instance found for {instance_name}")
-            return 1
-
-        # Skip already stopped instances (unless forcing)
-        if not position.get('enabled', False) and not command.force:
-            print(f"HCOM already stopped for {instance_name}")
-            return 0
-
-        # Disable instance (optionally with force)
-        disable_instance(instance_name, force=command.force)
-
-        if command.force:
-            print(f"⚠️  Force stopped HCOM for {instance_name}.")
-            print(f"    Bash tool use is now DENIED. Instance is locked down.")
-            print(f"    To restart: hcom start {instance_name}")
-        else:
-            print(f"Stopped HCOM for {instance_name}. Will no longer receive chat messages automatically.")
-
-        # Show background log location if applicable
-        if position.get('background'):
-            log_file = position.get('background_log_file', '')
-            if log_file:
-                print(f"\nBackground log: {log_file}")
-                print(f"Monitor: tail -f {log_file}")
-                if not command.force:
-                    print(f"Force stop: hcom stop --force {instance_name}")
 
         return 0
 
-def cmd_start(command: StartCommand):
-    """Enable HCOM participation for instances"""
+    # Stop specific instance or self
+    # Get instance name from injected session or target
+    if session_id and not target:
+        instance_name, _ = resolve_instance_name(session_id, get_config().tag)
+    else:
+        instance_name = target
 
-    # Always verify hooks when running from Claude Code (catches broken hooks regardless of path)
-    if not check_and_update_hooks():
+    position = load_instance_position(instance_name) if instance_name else None
+
+    if not instance_name:
+        if os.environ.get('CLAUDECODE') == '1':
+            print("Error: Cannot determine instance", file=sys.stderr)
+            print("Usage: Prompt Claude to run 'hcom stop' (or directly use: hcom stop <alias> or hcom stop all)", file=sys.stderr)
+        else:
+            print("Error: Alias required", file=sys.stderr)
+            print("Usage: hcom stop <alias>", file=sys.stderr)
+            print("   Or: hcom stop all", file=sys.stderr)
+            print("   Or: prompt claude to run 'hcom stop' on itself", file=sys.stderr)
+            positions = load_all_positions()
+            visible = [alias for alias, data in positions.items() if should_show_in_watch(data)]
+            if visible:
+                print(f"Active aliases: {', '.join(sorted(visible))}", file=sys.stderr)
         return 1
 
+    if not position:
+        print(f"No instance found for {instance_name}")
+        return 1
+
+    # Skip already stopped instances (unless forcing)
+    if not position.get('enabled', False) and not force:
+        print(f"HCOM already stopped for {instance_name}")
+        return 0
+
+    # Disable instance (optionally with force)
+    disable_instance(instance_name, force=force)
+
+    if force:
+        print(f"⚠️  Force stopped HCOM for {instance_name}.")
+        print(f"    Bash tool use is now DENIED.")
+        print(f"    To restart: hcom start {instance_name}")
+    else:
+        print(f"Stopped HCOM for {instance_name}. Will no longer receive chat messages automatically.")
+
+    # Show background log location if applicable
+    if position.get('background'):
+        log_file = position.get('background_log_file', '')
+        if log_file:
+            print(f"\nBackground log: {log_file}")
+            print(f"Monitor: tail -f {log_file}")
+            if not force:
+                print(f"Force stop: hcom stop --force {instance_name}")
+
+    return 0
+
+def cmd_start(argv: list[str]) -> int:
+    """Enable HCOM participation: hcom start [alias] [--_hcom_session ID]"""
+    # Parse arguments
+    target = None
+    session_id = None
+
+    # Extract --_hcom_session if present
+    if '--_hcom_session' in argv:
+        idx = argv.index('--_hcom_session')
+        if idx + 1 < len(argv):
+            session_id = argv[idx + 1]
+            argv = argv[:idx] + argv[idx + 2:]
+
+    # Remove flags to get target
+    args_without_flags = [a for a in argv if not a.startswith('--')]
+    if args_without_flags:
+        target = args_without_flags[0]
+
     # Get instance name from injected session or target
-    if command._hcom_session and not command.target:
-        instance_name, existing_data = resolve_instance_name(command._hcom_session, os.environ.get('HCOM_PREFIX'))
+    if session_id and not target:
+        instance_name, existing_data = resolve_instance_name(session_id, get_config().tag)
 
         # Create instance if it doesn't exist (opt-in for vanilla instances)
         if not existing_data:
-            initialize_instance_in_position_file(instance_name, command._hcom_session)
+            initialize_instance_in_position_file(instance_name, session_id)
             # Enable instance (clears all stop flags)
             enable_instance(instance_name)
-            print(f"Started HCOM for this instance. Your alias is: {instance_name}")
+            print(f"\nStarted HCOM for {instance_name}")
         else:
             # Skip already started instances
             if existing_data.get('enabled', False):
                 print(f"HCOM already started for {instance_name}")
                 return 0
 
+            # Check if background instance has exited permanently
+            if existing_data.get('session_ended') and existing_data.get('background'):
+                session = existing_data.get('session_id', '')
+                print(f"Cannot start {instance_name}: background instance has exited permanently")
+                print(f"Background instances terminate when stopped and cannot be restarted")
+                if session:
+                    print(f"Resume conversation with same alias: hcom 1 claude -p --resume {session}")
+                return 1
+
             # Re-enabling existing instance
             enable_instance(instance_name)
-            print(f"Started HCOM for {instance_name}. Rejoined chat.")
+            print(f"Started HCOM for {instance_name}")
 
         return 0
-
-    # Handle hooking target
-    if command.target == 'hooking':
-        # hcom start hooking: install hooks in current directory
-        if setup_hooks():
-            print("HCOM hooks installed in current directory")
-            print("Hooks active on next Claude Code launch in this directory")
-            return 0
-        else:
-            return 1
 
     # CLI path: start specific instance
     positions = load_all_positions()
 
     # Handle missing target from external CLI
-    if not command.target:
-        print("Error: No instance specified & Not run by Claude Code\n")
-        print("Run by Claude Code: 'hcom start' starts HCOM for the current instance")
-        print("From anywhere: 'hcom start <alias>'\n")
-        print("To launch new instances: 'hcom open'")
+    if not target:
+        if os.environ.get('CLAUDECODE') == '1':
+            print("Error: Cannot determine instance", file=sys.stderr)
+            print("Usage: Prompt Claude to run 'hcom start' (or: hcom start <alias>)", file=sys.stderr)
+        else:
+            print("Error: Alias required", file=sys.stderr)
+            print("Usage: hcom start <alias> (or: prompt claude to run 'hcom start')", file=sys.stderr)
+            print("To launch new instances: hcom <count>", file=sys.stderr)
         return 1
 
     # Start specific instance
-    instance_name = command.target
+    instance_name = target
     position = positions.get(instance_name)
 
     if not position:
@@ -2874,17 +2881,81 @@ def cmd_start(command: StartCommand):
         print(f"HCOM already started for {instance_name}")
         return 0
 
+    # Check if background instance has exited permanently
+    if position.get('session_ended') and position.get('background'):
+        session = position.get('session_id', '')
+        print(f"Cannot start {instance_name}: background instance has exited permanently")
+        print(f"Background instances terminate when stopped and cannot be restarted")
+        if session:
+            print(f"Resume conversation with same alias: hcom 1 claude -p --resume {session}")
+        return 1
+
     # Enable instance (clears all stop flags)
     enable_instance(instance_name)
 
     print(f"Started HCOM for {instance_name}. Rejoined chat.")
     return 0
 
-def cmd_cleanup(*args):
+def cmd_reset(argv: list[str]) -> int:
+    """Reset HCOM components: logs, hooks, config
+    Usage:
+        hcom reset              # Everything (stop all + logs + hooks + config)
+        hcom reset logs         # Archive conversation only
+        hcom reset hooks        # Remove hooks only
+        hcom reset config       # Clear config (backup to config.env.TIMESTAMP)
+        hcom reset logs hooks   # Combine targets
+    """
+    # No args = everything
+    do_everything = not argv
+    targets = argv if argv else ['logs', 'hooks', 'config']
+
+    # Validate targets
+    valid = {'logs', 'hooks', 'config'}
+    invalid = [t for t in targets if t not in valid]
+    if invalid:
+        print(f"Invalid target(s): {', '.join(invalid)}", file=sys.stderr)
+        print("Valid targets: logs, hooks, config", file=sys.stderr)
+        return 1
+
+    exit_codes = []
+
+    # Stop all instances if doing everything
+    if do_everything:
+        exit_codes.append(cmd_stop(['all']))
+
+    # Execute based on targets
+    if 'logs' in targets:
+        exit_codes.append(clear())
+
+    if 'hooks' in targets:
+        exit_codes.append(cleanup('--all'))
+        if remove_global_hooks():
+            print("Removed hooks")
+        else:
+            print("Warning: Could not remove hooks. Check your claude settings.json file it might be invalid", file=sys.stderr)
+            exit_codes.append(1)
+
+    if 'config' in targets:
+        config_path = hcom_path(CONFIG_FILE)
+        if config_path.exists():
+            # Backup with timestamp
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            backup_path = hcom_path(f'config.env.{timestamp}')
+            shutil.copy2(config_path, backup_path)
+            config_path.unlink()
+            print(f"Config backed up to config.env.{timestamp} and cleared")
+            exit_codes.append(0)
+        else:
+            print("No config file to clear")
+            exit_codes.append(0)
+
+    return max(exit_codes) if exit_codes else 0
+
+def cleanup(*args: str) -> int:
     """Remove hcom hooks from current directory or all directories"""
     if args and args[0] == '--all':
         directories = set()
-        
+
         # Get all directories from current instances
         try:
             positions = load_all_positions()
@@ -2894,6 +2965,24 @@ def cmd_cleanup(*args):
                         directories.add(instance_data['directory'])
         except Exception as e:
             print(f"Warning: Could not read current instances: {e}")
+
+        # Also check archived instances for directories (until 0.5.0)
+        try:
+            archive_dir = hcom_path(ARCHIVE_DIR)
+            if archive_dir.exists():
+                for session_dir in archive_dir.iterdir():
+                    if session_dir.is_dir() and session_dir.name.startswith('session-'):
+                        instances_dir = session_dir / 'instances'
+                        if instances_dir.exists():
+                            for instance_file in instances_dir.glob('*.json'):
+                                try:
+                                    data = json.loads(instance_file.read_text())
+                                    if 'directory' in data:
+                                        directories.add(data['directory'])
+                                except Exception:
+                                    pass
+        except Exception as e:
+            print(f"Warning: Could not read archived instances: {e}")
         
         if not directories:
             print("No directories found in current HCOM tracking")
@@ -2937,42 +3026,61 @@ def cmd_cleanup(*args):
         print(message)
         return exit_code
 
-def check_and_update_hooks() -> bool:
-    """Verify hooks are correct when running inside Claude Code, reinstall if needed.
-    Returns True if hooks are good (continue), False if hooks were updated (restart needed)."""
-    if os.environ.get('CLAUDECODE') != '1':
-        return True  # Not in Claude Code, continue normally
+def ensure_hooks_current() -> bool:
+    """Ensure hooks match current execution context - called on EVERY command.
+    Auto-updates hooks if execution context changes (e.g., pip → uvx).
+    Always returns True (warns but never blocks - Claude Code is fault-tolerant)."""
 
-    # Check both cwd and home for hooks
-    cwd_settings = Path.cwd() / '.claude' / 'settings.local.json'
-    home_settings = Path.home() / '.claude' / 'settings.local.json'
+    # Verify hooks exist and match current execution context
+    global_settings = get_claude_settings_path()
 
-    # If hooks are correctly installed, continue
-    if verify_hooks_installed(cwd_settings) or verify_hooks_installed(home_settings):
-        return True
+    # Check if hooks are valid (exist + env var matches current context)
+    hooks_exist = verify_hooks_installed(global_settings)
+    env_var_matches = False
 
-    # Hooks missing or incorrect - reinstall them
-    try:
-        setup_hooks()
-        print("Hooks updated. Restart Claude Code to use HCOM.", file=sys.stderr)
-    except Exception as e:
-        print(f"Failed to update hooks: {e}", file=sys.stderr)
-        print("Try running: hcom open from normal terminal", file=sys.stderr)
-    return False
+    if hooks_exist:
+        try:
+            settings = load_settings_json(global_settings, default={})
+            if settings is None:
+                settings = {}
+            current_hcom = _build_hcom_env_value()
+            installed_hcom = settings.get('env', {}).get('HCOM')
+            env_var_matches = (installed_hcom == current_hcom)
+        except Exception:
+            # Failed to read settings - try to fix by updating
+            env_var_matches = False
 
-def cmd_send(command: SendCommand, force_cli=False):
-    """Send message to hcom, force cli for config sender instead of instance generated name"""
+    # Install/update hooks if missing or env var wrong
+    if not hooks_exist or not env_var_matches:
+        try:
+            setup_hooks()
+            if os.environ.get('CLAUDECODE') == '1':
+                print("HCOM hooks updated. Please restart Claude Code to apply changes.", file=sys.stderr)
+                print("=" * 60, file=sys.stderr)
+        except Exception as e:
+            # Failed to verify/update hooks, but they might still work
+            # Claude Code is fault-tolerant with malformed JSON
+            print(f"⚠️  Could not verify/update hooks: {e}", file=sys.stderr)
+            print("If HCOM doesn't work, check ~/.claude/settings.json", file=sys.stderr)
 
-    # Always verify hooks when running from Claude Code (catches broken hooks regardless of path)
-    if not check_and_update_hooks():
-        return 1
+    return True
 
-    # Handle resume command - pass caller session_id
-    if command.resume_alias:
-        caller_session = command._hcom_session  # May be None for CLI
-        return cmd_resume_merge(command.resume_alias, caller_session)
+def cmd_send(argv: list[str], force_cli: bool = False, quiet: bool = False) -> int:
+    """Send message to hcom: hcom send "message" [--_hcom_session ID]"""
+    # Parse message and session_id
+    message = None
+    session_id = None
 
-    message = command.message
+    # Extract --_hcom_session if present (injected by PreToolUse hook)
+    if '--_hcom_session' in argv:
+        idx = argv.index('--_hcom_session')
+        if idx + 1 < len(argv):
+            session_id = argv[idx + 1]
+            argv = argv[:idx] + argv[idx + 2:]  # Remove flag and value
+
+    # First non-flag argument is the message
+    if argv:
+        message = argv[0]
 
     # Check message is provided
     if not message:
@@ -2984,7 +3092,7 @@ def cmd_send(command: SendCommand, force_cli=False):
     instances_dir = hcom_path(INSTANCES_DIR)
 
     if not log_file.exists() and not instances_dir.exists():
-        print(format_error("No conversation found", "Run 'hcom open' first"), file=sys.stderr)
+        print(format_error("No conversation found", "Run 'hcom <count>' first"), file=sys.stderr)
         return 1
 
     # Validate message
@@ -2999,7 +3107,7 @@ def cmd_send(command: SendCommand, force_cli=False):
         try:
             positions = load_all_positions()
             all_instances = list(positions.keys())
-            sender_name = get_config_value('sender_name', 'bigboss')
+            sender_name = SENDER
             all_names = all_instances + [sender_name]
             unmatched = [m for m in mentions
                         if not any(name.lower().startswith(m.lower()) for name in all_names)]
@@ -3009,19 +3117,17 @@ def cmd_send(command: SendCommand, force_cli=False):
             pass  # Don't fail on warning
 
     # Determine sender from injected session_id or CLI
-    if command._hcom_session and not force_cli:
-        # Instance context - get name from session_id
+    if session_id and not force_cli:
+        # Instance context - resolve name from session_id (searches existing instances first)
         try:
-            sender_name = get_display_name(command._hcom_session)
+            sender_name, instance_data = resolve_instance_name(session_id, get_config().tag)
         except (ValueError, Exception) as e:
             print(format_error(f"Invalid session_id: {e}"), file=sys.stderr)
             return 1
 
-        instance_data = load_instance_position(sender_name)
-
         # Initialize instance if doesn't exist (first use)
         if not instance_data:
-            initialize_instance_in_position_file(sender_name, command._hcom_session)
+            initialize_instance_in_position_file(sender_name, session_id)
             instance_data = load_instance_position(sender_name)
 
         # Check force_closed
@@ -3042,88 +3148,40 @@ def cmd_send(command: SendCommand, force_cli=False):
         # Show unread messages
         messages = get_unread_messages(sender_name, update_position=True)
         if messages:
-            max_msgs = get_config_value('max_messages_per_delivery', 50)
+            max_msgs = MAX_MESSAGES_PER_DELIVERY
             formatted = format_hook_messages(messages[:max_msgs], sender_name)
             print(f"Message sent\n\n{formatted}", file=sys.stderr)
         else:
             print("Message sent", file=sys.stderr)
 
-        # Show cli_hints if configured (non-interactive mode)
-        if not is_interactive():
-            show_cli_hints()
-
         return 0
     else:
         # CLI context - no session_id or force_cli=True
-        sender_name = get_config_value('sender_name', 'bigboss')
+
+        # Warn if inside Claude Code but no session_id (hooks not working)
+        if os.environ.get('CLAUDECODE') == '1' and not session_id and not force_cli:
+            print(f"⚠️  Cannot determine alias - message sent as '{SENDER}'", file=sys.stderr)
+            print("   Prompt Claude to send a hcom message instead of using bash mode (! prefix).", file=sys.stderr)
+
+
+        sender_name = SENDER
 
         if not send_message(sender_name, message):
             print(format_error("Failed to send message"), file=sys.stderr)
             return 1
 
-        print(f"✓ Sent from {sender_name}", file=sys.stderr)
-
-        # Show cli_hints if configured (non-interactive mode)
-        if not is_interactive():
-            show_cli_hints()
+        if not quiet:
+            print(f"✓ Sent from {sender_name}", file=sys.stderr)
 
         return 0
 
-def cmd_send_cli(message):
+def send_cli(message: str, quiet: bool = False) -> int:
     """Force CLI sender (skip outbox, use config sender name)"""
-    command = SendCommand(message=message, resume_alias=None)
-    return cmd_send(command, force_cli=True)
-
-def cmd_resume_merge(alias: str, caller_session: str | None = None) -> int:
-    """Resume/merge current instance into an existing instance by alias.
-    INTERNAL COMMAND: Only called via 'hcom send --resume alias' during implicit resume workflow.
-    Not meant for direct CLI usage.
-    Args:
-        alias: Target instance alias to merge into
-        caller_session: Session ID of caller (injected by PreToolUse hook) or None for CLI
-    """
-    # If caller_session provided (from hcom send --resume), use it
-    if caller_session:
-        instance_name = get_display_name(caller_session)
-    else:
-        # CLI path - no session context
-        print(format_error("Not in HCOM instance context"), file=sys.stderr)
-        return 1
-
-    if not instance_name:
-        print(format_error("Could not determine instance name"), file=sys.stderr)
-        return 1
-
-    # Sanitize alias: must be valid instance name format
-    # Base: 5 lowercase alphanumeric (e.g., hova3)
-    # Prefixed: {prefix}-{5 chars} (e.g., api-hova3, cool-team-kolec)
-    # This prevents path traversal attacks (e.g., ../../etc, /etc, etc.)
-    if not re.match(r'^([a-zA-Z0-9_-]+-)?[a-z0-9]{5}$', alias):
-        print(format_error("Invalid alias format. Must be 5-char instance name or prefix-name format"), file=sys.stderr)
-        return 1
-
-    # Attempt to merge current instance into target alias
-    status = merge_instance_immediately(instance_name, alias)
-
-    # Handle results
-    if not status:
-        # Empty status means names matched (from_name == to_name)
-        status = f"[SUCCESS] ✓ Already using HCOM alias {alias}. Rejoined chat."
-    elif status.startswith('[SUCCESS]'):
-        # Merge successful - update message
-        status = f"[SUCCESS] ✓ Resumed HCOM as {alias}. Rejoined chat."
-
-    # If merge successful, enable instance (clears session_ended and stop flags)
-    if status.startswith('[SUCCESS]'):
-        enable_instance(alias)
-
-    # Print status and return
-    print(status, file=sys.stderr)
-    return 0 if status.startswith('[SUCCESS]') else 1
+    return cmd_send([message], force_cli=True, quiet=quiet)
 
 # ==================== Hook Helpers ====================
 
-def format_hook_messages(messages, instance_name):
+def format_hook_messages(messages: list[dict[str, str]], instance_name: str) -> str:
     """Format messages for hook feedback"""
     if len(messages) == 1:
         msg = messages[0]
@@ -3132,100 +3190,42 @@ def format_hook_messages(messages, instance_name):
         parts = [f"{msg['from']} → {instance_name}: {msg['message']}" for msg in messages]
         reason = f"[{len(messages)} new messages] | {' | '.join(parts)}"
 
-    # Only append instance_hints to messages (first_use_text is handled separately)
-    instance_hints = get_config_value('instance_hints', '')
-    if instance_hints:
-        reason = f"{reason} | [{instance_hints}]"
+    # Only append hints to messages
+    hints = get_config().hints
+    if hints:
+        reason = f"{reason} | [{hints}]"
 
     return reason
 
 # ==================== Hook Handlers ====================
 
-def detect_session_scenario(
-    hook_type: str | None,
-    session_id: str,
-    source: str,
-    existing_data: dict | None
-) -> SessionScenario | None:
+def init_hook_context(hook_data: dict[str, Any], hook_type: str | None = None) -> tuple[str, dict[str, Any], bool]:
     """
-    Detect session startup scenario explicitly.
-
-    Returns:
-        SessionScenario for definitive scenarios
-        None for deferred decision (SessionStart with wrong session_id)
-    """
-    if existing_data is not None:
-        # Found existing instance with matching session_id
-        return SessionScenario.MATCHED_RESUME
-
-    if hook_type == 'sessionstart' and source == 'resume':
-        # SessionStart on resume without match = wrong session_id
-        # Don't know if truly unmatched yet - UserPromptSubmit will decide
-        return None  # Deferred decision
-
-    if hook_type == 'userpromptsubmit' and source == 'resume':
-        # UserPromptSubmit on resume without match = definitively unmatched
-        return SessionScenario.UNMATCHED_RESUME
-
-    # Normal startup
-    return SessionScenario.FRESH_START
-
-
-def should_create_instance_file(scenario: SessionScenario | None, hook_type: str | None) -> bool:
-    """
-    Decide whether to create instance file NOW.
-
-    Simplified: Only UserPromptSubmit creates instances.
-    SessionStart just shows minimal message and tracks status.
-    """
-    # Only UserPromptSubmit creates instances
-    if hook_type != 'userpromptsubmit':
-        return False
-
-    # Create for new scenarios only (not matched resume which already exists)
-    return scenario in (SessionScenario.FRESH_START, SessionScenario.UNMATCHED_RESUME)
-
-
-def init_hook_context(hook_data, hook_type=None):
-    """
-    Initialize instance context with explicit scenario detection.
-
-    Flow:
+    Initialize instance context. Flow:
     1. Resolve instance name (search by session_id, generate if not found)
-    2. Detect scenario (fresh/matched/unmatched/deferred)
-    3. Decide whether to create file NOW
-    4. Return context with all decisions made
+    2. Create instance file if fresh start in UserPromptSubmit
+    3. Build updates dict
+    4. Return (instance_name, updates, is_matched_resume)
     """
     session_id = hook_data.get('session_id', '')
     transcript_path = hook_data.get('transcript_path', '')
-    source = hook_data.get('source', 'startup')
-    prefix = os.environ.get('HCOM_PREFIX')
+    tag = get_config().tag
 
-    # Step 1: Resolve instance name
-    instance_name, existing_data = resolve_instance_name(session_id, prefix)
+    # Resolve instance name - existing_data is None for fresh starts
+    instance_name, existing_data = resolve_instance_name(session_id, tag)
 
     # Save migrated data if we have it
     if existing_data:
         save_instance_position(instance_name, existing_data)
 
-    # Step 2: Detect scenario
-    scenario = detect_session_scenario(hook_type, session_id, source, existing_data)
-
-    # Check if instance is brand new (before creation - for bypass logic)
-    instance_file = hcom_path(INSTANCES_DIR, f'{instance_name}.json')
-    is_new_instance = not instance_file.exists()
-
-
-    # Step 3: Decide creation
-    should_create = should_create_instance_file(scenario, hook_type)
-
-
-    if should_create:
+    # Create instance file if fresh start in UserPromptSubmit
+    if existing_data is None and hook_type == 'userpromptsubmit':
         initialize_instance_in_position_file(instance_name, session_id)
 
-    # Step 4: Build updates dict
+    # Build updates dict
     updates: dict[str, Any] = {
         'directory': str(Path.cwd()),
+        'tag': tag,
     }
 
     if session_id:
@@ -3239,11 +3239,10 @@ def init_hook_context(hook_data, hook_type=None):
         updates['background'] = True
         updates['background_log_file'] = str(hcom_path(LOGS_DIR, bg_env))
 
-    # Return compatible with existing callers
-    is_resume_match = (scenario == SessionScenario.MATCHED_RESUME)
+    # Simple boolean: matched resume if existing_data found
+    is_matched_resume = (existing_data is not None)
 
-
-    return instance_name, updates, is_resume_match, is_new_instance
+    return instance_name, updates, is_matched_resume
 
 def pretooluse_decision(decision: str, reason: str) -> None:
     """Exit PreToolUse hook with permission decision"""
@@ -3255,9 +3254,9 @@ def pretooluse_decision(decision: str, reason: str) -> None:
         }
     }
     print(json.dumps(output, ensure_ascii=False))
-    sys.exit(EXIT_SUCCESS)
+    sys.exit(0)
 
-def handle_pretooluse(hook_data, instance_name, updates):
+def handle_pretooluse(hook_data: dict[str, Any], instance_name: str) -> None:
     """Handle PreToolUse hook - check force_closed, inject session_id"""
     instance_data = load_instance_position(instance_name)
     tool_name = hook_data.get('tool_name', '')
@@ -3271,18 +3270,16 @@ def handle_pretooluse(hook_data, instance_name, updates):
     if instance_data.get('enabled', False):
         set_status(instance_name, 'tool_pending', tool_name)
 
-    # Inject session_id into hcom send/stop/start commands via updatedInput
+    # Inject session_id into hcom commands via updatedInput
     if tool_name == 'Bash' and session_id:
         command = hook_data.get('tool_input', {}).get('command', '')
 
-        # Match: (hcom|uvx hcom|python X hcom.py|X hcom.py) (send|stop|start)
-        # Handles: hcom, uvx hcom, python hcom.py, python /path/to/hcom.py, hcom.py, /path/to/hcom.py
-        hcom_pattern = r'((?:uvx\s+)?hcom|(?:python3?\s+)?\S*hcom\.py)\s+(send|stop|start)\b'
-
-        # Check if command contains any hcom invocations
-        if re.search(hcom_pattern, command):
-            # Inject session_id after EACH hcom command (handles chained commands)
-            modified_command = re.sub(hcom_pattern, rf'\g<0> --_hcom_session {session_id}', command)
+        # Match hcom commands for session_id injection and auto-approval
+        matches = list(re.finditer(HCOM_COMMAND_PATTERN, command))
+        if matches:
+            # Inject all if chained (&&, ||, ;, |), otherwise first only (avoids quoted text in messages)
+            inject_all = len(matches) > 1 and any(op in command[matches[0].end():matches[1].start()] for op in ['&&', '||', ';', '|'])
+            modified_command = HCOM_COMMAND_PATTERN.sub(rf'\g<0> --_hcom_session {session_id}', command, count=0 if inject_all else 1)
 
             output = {
                 "hookSpecificOutput": {
@@ -3294,17 +3291,16 @@ def handle_pretooluse(hook_data, instance_name, updates):
                 }
             }
             print(json.dumps(output, ensure_ascii=False))
-            sys.exit(EXIT_SUCCESS)
+            sys.exit(0)
 
 
 
-def handle_stop(hook_data, instance_name, updates):
+def handle_stop(hook_data: dict[str, Any], instance_name: str, updates: dict[str, Any], instance_data: dict[str, Any] | None) -> None:
     """Handle Stop hook - poll for messages and deliver"""
 
     try:
-        entry_time = time.time()
-        updates['last_stop'] = entry_time
-        timeout = get_config_value('wait_timeout', 1800)
+        updates['last_stop'] = time.time()
+        timeout = get_config().timeout
         updates['wait_timeout'] = timeout
         set_status(instance_name, 'waiting')
 
@@ -3316,39 +3312,48 @@ def handle_stop(hook_data, instance_name, updates):
         start_time = time.time()
 
         try:
-            loop_count = 0
+            first_poll = True
             last_heartbeat = start_time
             # Actual polling loop - this IS the holding pattern
             while time.time() - start_time < timeout:
-                if loop_count == 0:
-                    time.sleep(0.1)  # Initial wait before first poll
-                loop_count += 1
+                if first_poll:
+                    first_poll = False
 
-                # Load instance data once per poll
+                # Reload instance data each poll iteration
                 instance_data = load_instance_position(instance_name)
+
+                # Check flag file FIRST (highest priority coordination signal)
+                flag_file = get_user_input_flag_file(instance_name)
+                if flag_file.exists():
+                    try:
+                        flag_file.unlink()
+                    except (FileNotFoundError, PermissionError):
+                        # Already deleted or locked, continue anyway
+                        pass
+                    sys.exit(0)
 
                 # Check if session ended (SessionEnd hook fired) - exit without changing status
                 if instance_data.get('session_ended'):
-                    sys.exit(EXIT_SUCCESS)  # Don't overwrite session_ended status
+                    sys.exit(0)  # Don't overwrite session_ended status
 
-                # Check if user input is pending - exit cleanly if recent input
+                # Check if user input is pending (timestamp fallback) - exit cleanly if recent input
                 last_user_input = instance_data.get('last_user_input', 0)
                 if time.time() - last_user_input < 0.2:
-                    sys.exit(EXIT_SUCCESS)  # Don't overwrite status - let current status remain
+                    sys.exit(0)  # Don't overwrite status - let current status remain
 
-                # Check if closed - exit cleanly
+                # Check if stopped/disabled - exit cleanly
                 if not instance_data.get('enabled', False):
-                    sys.exit(EXIT_SUCCESS)  # Preserve 'stopped' status set by cmd_stop
+                    sys.exit(0)  # Preserve 'stopped' status set by cmd_stop
 
                 # Check for new messages and deliver
                 if messages := get_unread_messages(instance_name, update_position=True):
-                    messages_to_show = messages[:get_config_value('max_messages_per_delivery', 50)]
+                    messages_to_show = messages[:MAX_MESSAGES_PER_DELIVERY]
                     reason = format_hook_messages(messages_to_show, instance_name)
                     set_status(instance_name, 'message_delivered', messages_to_show[0]['from'])
 
                     output = {"decision": "block", "reason": reason}
                     print(json.dumps(output, ensure_ascii=False), file=sys.stderr)
-                    sys.exit(EXIT_BLOCK)
+                    sys.exit(2)
 
                 # Update heartbeat every 0.5 seconds for staleness detection
                 now = time.time()
@@ -3367,51 +3372,70 @@ def handle_stop(hook_data, instance_name, updates):
 
         # Timeout reached
         set_status(instance_name, 'timeout')
+        sys.exit(0)
 
     except Exception as e:
         # Log error and exit gracefully
         log_hook_error('handle_stop', e)
-        sys.exit(EXIT_SUCCESS)  # Preserve previous status on exception
+        sys.exit(0)  # Preserve previous status on exception
 
-def handle_notify(hook_data, instance_name, updates):
+def handle_notify(hook_data: dict[str, Any], instance_name: str, updates: dict[str, Any], instance_data: dict[str, Any] | None) -> None:
     """Handle Notification hook - track permission requests"""
     updates['notification_message'] = hook_data.get('message', '')
     update_instance_position(instance_name, updates)
     set_status(instance_name, 'blocked', hook_data.get('message', ''))
 
-def wait_for_stop_exit(instance_name, max_wait=0.2):
-    """Wait for Stop hook to exit. Returns wait time in ms."""
+def get_user_input_flag_file(instance_name: str) -> Path:
+    """Get path to user input coordination flag file"""
+    return hcom_path(FLAGS_DIR, f'{instance_name}.user_input')
+
+def wait_for_stop_exit(instance_name: str, max_wait: float = 0.2) -> int:
+    """
+    Wait for Stop hook to exit using flag file coordination.
+    Returns wait time in ms.
+    Strategy:
+    1. Create flag file
+    2. Wait for Stop hook to delete it (proof it exited)
+    3. Fallback to timeout if Stop hook doesn't delete flag
+    """
     start = time.time()
+    flag_file = get_user_input_flag_file(instance_name)
 
-    while time.time() - start < max_wait:
+    # Wait for flag file to be deleted by Stop hook
+    while flag_file.exists() and time.time() - start < max_wait:
         time.sleep(0.01)
-
-        data = load_instance_position(instance_name)
-        last_stop_age = time.time() - data.get('last_stop', 0)
-
-        if last_stop_age > 0.2:
-            return int((time.time() - start) * 1000)
 
     return int((time.time() - start) * 1000)
 
-def handle_userpromptsubmit(hook_data, instance_name, updates, is_resume_match, is_new_instance):
+def handle_userpromptsubmit(hook_data: dict[str, Any], instance_name: str, updates: dict[str, Any], is_matched_resume: bool, instance_data: dict[str, Any] | None) -> None:
     """Handle UserPromptSubmit hook - track when user sends messages"""
-    # Load instance data for coordination check and alias_announced
-    instance_data = load_instance_position(instance_name)
-    is_enabled = instance_data.get('enabled', False)
-    last_stop = instance_data.get('last_stop', 0)
-    alias_announced = instance_data.get('alias_announced', False)
+    is_enabled = instance_data.get('enabled', False) if instance_data else False
+    last_stop = instance_data.get('last_stop', 0) if instance_data else 0
+    alias_announced = instance_data.get('alias_announced', False) if instance_data else False
+
+    # Session_ended prevents user receiving messages(?) so reset it.
+    if is_matched_resume and instance_data and instance_data.get('session_ended'):
+        update_instance_position(instance_name, {'session_ended': False})
+        instance_data['session_ended'] = False  # Resume path reactivates Stop hook polling
 
     # Coordinate with Stop hook only if enabled AND Stop hook is active
     stop_is_active = (time.time() - last_stop) < 1.0
 
     if is_enabled and stop_is_active:
+        # Create flag file for coordination
+        flag_file = get_user_input_flag_file(instance_name)
+        try:
+            flag_file.touch()
+        except (OSError, PermissionError):
+            # Failed to create flag, fall back to timestamp-only coordination
+            pass
+
+        # Set timestamp (backup mechanism)
         updates['last_user_input'] = time.time()
         update_instance_position(instance_name, updates)
-        wait_ms = wait_for_stop_exit(instance_name)
 
-    send_cmd = build_send_command('your message', instance_name)
-    resume_cmd = send_cmd.replace("'your message'", "--resume your_old_alias")
+        # Wait for Stop hook to delete flag file
+        wait_for_stop_exit(instance_name)
 
     # Build message based on what happened
     msg = None
@@ -3419,18 +3443,8 @@ def handle_userpromptsubmit(hook_data, instance_name, updates, is_resume_match, 
     # Determine if this is an HCOM-launched instance
     is_hcom_launched = os.environ.get('HCOM_LAUNCHED') == '1'
 
-    # PRIORITY 1: Handle unmatched resume FIRST (is_new_instance=True means SessionStart was skipped)
-    # This must show critical recovery message regardless of HCOM_LAUNCHED status
-    if is_new_instance:
-        msg = build_hcom_bootstrap_text(instance_name)
-        msg += (
-            f"\n\n[CRITICAL: HCOM RESUME DETECTED - You MUST recover your identity to maintain conversation context. "
-            f"Run this command: {resume_cmd} - This is REQUIRED for message history and position tracking]"
-        )
-        update_instance_position(instance_name, {'alias_announced': True})
-
-    # PRIORITY 2: Normal startup - show bootstrap if not already announced
-    elif not alias_announced:
+    # Show bootstrap if not already announced
+    if not alias_announced:
         if is_hcom_launched:
             # HCOM-launched instance - show bootstrap immediately
             msg = build_hcom_bootstrap_text(instance_name)
@@ -3445,54 +3459,76 @@ def handle_userpromptsubmit(hook_data, instance_name, updates, is_resume_match, 
                 msg += build_hcom_bootstrap_text(instance_name)
                 update_instance_position(instance_name, {'alias_announced': True})
 
-    # PRIORITY 3: Add resume status note if we showed bootstrap for a matched resume
-    if msg and is_resume_match and not is_new_instance:
+    # Add resume status note if we showed bootstrap for a matched resume
+    if msg and is_matched_resume:
         if is_enabled:
-            msg += "\n[Session resumed. HCOM started for this instance - will receive chat messages. Your alias and conversation history preserved.]"
-        else:
-            msg += "\n[Session resumed. HCOM stopped for this instance - will not receive chat messages. Run 'hcom start' to rejoin chat. Your alias and conversation history preserved.]"
-
+            msg += "\n[HCOM Session resumed. Your alias and conversation history preserved.]"
     if msg:
         output = {
-            # "systemMessage": "HCOM enabled",
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
                 "additionalContext": msg
             }
         }
         print(json.dumps(output), file=sys.stdout)
-        # sys.exit(1)
 
-def handle_sessionstart(hook_data, instance_name, updates, is_resume_match):
-    """Handle SessionStart hook - minimal message, full details on first prompt"""
-    source = hook_data.get('source', 'startup')
-
-    # Update instance if it exists (matched resume only, since we don't create in SessionStart anymore)
-    instance_file = hcom_path(INSTANCES_DIR, f'{instance_name}.json')
-    if instance_file.exists():
-        updates['alias_announced'] = False
-        update_instance_position(instance_name, updates)
-        set_status(instance_name, 'session_start')
-
-    # Minimal message - no alias yet (UserPromptSubmit will show full details)
-    help_text = "[HCOM active. Submit a prompt to initialize.]"
-
-    # Add first_use_text only for hcom-launched instances on startup
-    if os.environ.get('HCOM_LAUNCHED') == '1' and source == 'startup':
-        first_use_text = get_config_value('first_use_text', '')
-        if first_use_text:
-            help_text += f" [{first_use_text}]"
+def handle_sessionstart(hook_data: dict[str, Any]) -> None:
+    """Handle SessionStart hook - initial msg & reads environment variables"""
+    # Only show message for HCOM-launched instances
+    if os.environ.get('HCOM_LAUNCHED') == '1':
+        parts = f"[HCOM is started, you can send messages with the command: {build_hcom_command()} send]"
+    else:
+        parts = f"[You can start HCOM with the command: {build_hcom_command()} start]"
 
     output = {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": help_text
+            "additionalContext": parts
         }
     }
 
     print(json.dumps(output))
 
-def handle_sessionend(hook_data, instance_name, updates):
+def handle_posttooluse(hook_data: dict[str, Any], instance_name: str) -> None:
+    """Handle PostToolUse hook - show launch context or bootstrap"""
+    command = hook_data.get('tool_input', {}).get('command', '')
+    instance_data = load_instance_position(instance_name)
+
+    # Check for help or launch commands (combined pattern)
+    if re.search(r'\bhcom\s+(?:(?:help|--help|-h)\b|\d+)', command):
+        if not instance_data.get('launch_context_announced', False):
+            msg = build_launch_context(instance_name)
+            update_instance_position(instance_name, {'launch_context_announced': True})
+
+            output = {
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": msg
+                }
+            }
+            print(json.dumps(output, ensure_ascii=False))
+        return
+
+    # Check HCOM_COMMAND_PATTERN for bootstrap (other hcom commands)
+    matches = list(re.finditer(HCOM_COMMAND_PATTERN, command))
+
+    if not matches:
+        return
+
+    # Show bootstrap if not announced yet
+    if not instance_data.get('alias_announced', False):
+        msg = build_hcom_bootstrap_text(instance_name)
+        update_instance_position(instance_name, {'alias_announced': True})
+
+        output = {
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": msg
+            }
+        }
+        print(json.dumps(output, ensure_ascii=False))
+
+def handle_sessionend(hook_data: dict[str, Any], instance_name: str, updates: dict[str, Any], instance_data: dict[str, Any] | None) -> None:
     """Handle SessionEnd hook - mark session as ended and set final status"""
     reason = hook_data.get('reason', 'unknown')
 
@@ -3507,138 +3543,139 @@ def handle_sessionend(hook_data, instance_name, updates):
     except Exception as e:
         log_hook_error(f'sessionend:update_instance_position({instance_name})', e)
 
+def should_skip_vanilla_instance(hook_type: str, hook_data: dict) -> bool:
+    """
+    Returns True if hook should exit early.
+    Vanilla instances (not HCOM-launched) exit early unless:
+    - Enabled
+    - PreToolUse (handles opt-in)
+    - UserPromptSubmit with hcom command in prompt (shows preemptive bootstrap)
+    """
+    # PreToolUse always runs (handles toggle commands)
+    # HCOM-launched instances always run
+    if hook_type == 'pre' or os.environ.get('HCOM_LAUNCHED') == '1':
+        return False
+
+    session_id = hook_data.get('session_id', '')
+    if not session_id:  # No session_id = can't identify instance, skip hook
+        return True
+
+    instance_name = get_display_name(session_id, get_config().tag)
+    instance_file = hcom_path(INSTANCES_DIR, f'{instance_name}.json')
+
+    if not instance_file.exists():
+        # Allow UserPromptSubmit if prompt contains hcom command
+        if hook_type == 'userpromptsubmit':
+            user_prompt = hook_data.get('prompt', '')
+            return not re.search(r'\bhcom\s+\w+', user_prompt, re.IGNORECASE)
+        return True
+
+    return False
+
 def handle_hook(hook_type: str) -> None:
     """Unified hook handler for all HCOM hooks"""
     hook_data = json.load(sys.stdin)
 
     if not ensure_hcom_directories():
         log_hook_error('handle_hook', Exception('Failed to create directories'))
-        sys.exit(EXIT_SUCCESS)
+        sys.exit(0)
 
-    session_id_short = hook_data.get('session_id', 'none')[:8] if hook_data.get('session_id') else 'none'
-    source_debug = hook_data.get('source', 'NO_SOURCE')
+    # SessionStart is standalone - no instance files
+    if hook_type == 'sessionstart':
+        handle_sessionstart(hook_data)
+        sys.exit(0)
 
-    # Vanilla instance check (not hcom-launched)
-    # Exit early if no instance file exists, except:
-    # - PreToolUse (handles first send opt-in)
-    # - UserPromptSubmit with hcom command (shows preemptive bootstrap)
-    if hook_type != 'pre' and os.environ.get('HCOM_LAUNCHED') != '1':
-        session_id = hook_data.get('session_id', '')
-        if not session_id:
-            sys.exit(EXIT_SUCCESS)
-
-        instance_name = get_display_name(session_id, os.environ.get('HCOM_PREFIX'))
-        instance_file = hcom_path(INSTANCES_DIR, f'{instance_name}.json')
-
-        if not instance_file.exists():
-            # Allow UserPromptSubmit through if prompt contains hcom command
-            if hook_type == 'userpromptsubmit':
-                user_prompt = hook_data.get('prompt', '')
-                if not re.search(r'\bhcom\s+\w+', user_prompt, re.IGNORECASE):
-                    sys.exit(EXIT_SUCCESS)
-                # Continue - let handle_userpromptsubmit show bootstrap
-            else:
-                sys.exit(EXIT_SUCCESS)
+    # Vanilla instance check - exit early if should skip
+    if should_skip_vanilla_instance(hook_type, hook_data):
+        sys.exit(0)
 
     # Initialize instance context (creates file if needed, reuses existing if session_id matches)
-    instance_name, updates, is_resume_match, is_new_instance = init_hook_context(hook_data, hook_type)
+    instance_name, updates, is_matched_resume = init_hook_context(hook_data, hook_type)
 
-    # Special bypass for unmatched resume - must show critical warning even if disabled
-    # is_new_instance=True in UserPromptSubmit means SessionStart didn't create it (was skipped)
-    if hook_type == 'userpromptsubmit' and is_new_instance:
-        handle_userpromptsubmit(hook_data, instance_name, updates, is_resume_match, is_new_instance)
-        sys.exit(EXIT_SUCCESS)
-
-    # Check enabled status (PreToolUse handles toggle, so exempt)
+    # Load instance data once (for enabled check and to pass to handlers)
+    instance_data = None
     if hook_type != 'pre':
         instance_data = load_instance_position(instance_name)
-        if not instance_data.get('enabled', False):
-            sys.exit(EXIT_SUCCESS)
+
+        # Skip enabled check for UserPromptSubmit when bootstrap needs to be shown
+        # (alias_announced=false means bootstrap hasn't been shown yet)
+        skip_enabled_check = (hook_type == 'userpromptsubmit' and
+                             not instance_data.get('alias_announced', False))
+
+        if not skip_enabled_check and not instance_data.get('enabled', False):
+            sys.exit(0)
 
     match hook_type:
         case 'pre':
-            handle_pretooluse(hook_data, instance_name, updates)
+            handle_pretooluse(hook_data, instance_name)
+        case 'post':
+            handle_posttooluse(hook_data, instance_name)
         case 'poll':
-            handle_stop(hook_data, instance_name, updates)
+            handle_stop(hook_data, instance_name, updates, instance_data)
         case 'notify':
-            handle_notify(hook_data, instance_name, updates)
+            handle_notify(hook_data, instance_name, updates, instance_data)
         case 'userpromptsubmit':
-            handle_userpromptsubmit(hook_data, instance_name, updates, is_resume_match, is_new_instance)
-        case 'sessionstart':
-            handle_sessionstart(hook_data, instance_name, updates, is_resume_match)
+            handle_userpromptsubmit(hook_data, instance_name, updates, is_matched_resume, instance_data)
         case 'sessionend':
-            handle_sessionend(hook_data, instance_name, updates)
+            handle_sessionend(hook_data, instance_name, updates, instance_data)
 
-    sys.exit(EXIT_SUCCESS)
+    sys.exit(0)
 
 
 # ==================== Main Entry Point ====================
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int | None:
     """Main command dispatcher"""
     if argv is None:
         argv = sys.argv[1:]
     else:
         argv = argv[1:] if len(argv) > 0 and argv[0].endswith('hcom.py') else argv
 
-    # Check for help
-    if needs_help(argv):
-        return cmd_help()
-
-    # Handle hook commands (special case - no parsing needed)
-    if argv and argv[0] in ('poll', 'notify', 'pre', 'sessionstart', 'userpromptsubmit', 'sessionend'):
+    # Hook handlers only (called BY hooks, not users)
+    if argv and argv[0] in ('poll', 'notify', 'pre', 'post', 'sessionstart', 'userpromptsubmit', 'sessionend'):
         handle_hook(argv[0])
         return 0
 
-    # Handle send_cli (hidden command)
-    if argv and argv[0] == 'send_cli':
-        if len(argv) < 2:
-            print(format_error("Message required"), file=sys.stderr)
-            return 1
-        return cmd_send_cli(argv[1])
+    # Ensure directories exist first (required for version check cache)
+    if not ensure_hcom_directories():
+        print(format_error("Failed to create HCOM directories"), file=sys.stderr)
+        return 1
 
-    # Split on -- separator for forwarding args
-    hcom_args, forwarded = split_forwarded_args(argv)
+    # Check for updates and show message if available (once daily check, persists until upgrade)
+    if msg := get_update_notice():
+        print(msg, file=sys.stderr)
 
-    # Ensure directories exist for commands that need them
-    if hcom_args and hcom_args[0] not in ('help', '--help', '-h'):
-        if not ensure_hcom_directories():
-            print(format_error("Failed to create HCOM directories"), file=sys.stderr)
-            return 1
+    # Ensure hooks current (warns but never blocks)
+    ensure_hooks_current()
 
-    # Build parser and parse arguments
-    parser = build_parser()
-
+    # Route to commands
     try:
-        namespace = parser.parse_args(hcom_args)
-    except SystemExit as exc:
-        if exc.code != 0:
-            print("Run 'hcom -h' for help", file=sys.stderr)
-        return exc.code if isinstance(exc.code, int) else 1
-
-    # Dispatch to command parsers and get typed command objects
-    try:
-        command_obj = dispatch(namespace, forwarded)
-
-        # command_obj could be exit code (from help) or command dataclass
-        if isinstance(command_obj, int):
-            return command_obj
-
-        # Execute the command with typed object
-        if isinstance(command_obj, OpenCommand):
-            return cmd_open(command_obj)
-        elif isinstance(command_obj, WatchCommand):
-            return cmd_watch(command_obj)
-        elif isinstance(command_obj, StopCommand):
-            return cmd_stop(command_obj)
-        elif isinstance(command_obj, StartCommand):
-            return cmd_start(command_obj)
-        elif isinstance(command_obj, SendCommand):
-            return cmd_send(command_obj)
+        if not argv or argv[0] in ('help', '--help', '-h'):
+            return cmd_help()
+        elif argv[0] == 'send_cli':
+            if len(argv) < 2:
+                print(format_error("Message required"), file=sys.stderr)
+                return 1
+            return send_cli(argv[1])
+        elif argv[0] == 'watch':
+            return cmd_watch(argv[1:])
+        elif argv[0] == 'send':
+            return cmd_send(argv[1:])
+        elif argv[0] == 'stop':
+            return cmd_stop(argv[1:])
+        elif argv[0] == 'start':
+            return cmd_start(argv[1:])
+        elif argv[0] == 'reset':
+            return cmd_reset(argv[1:])
+        elif argv[0].isdigit() or argv[0] == 'claude':
+            # Launch instances: hcom <1-100> [args] or hcom claude [args]
+            return cmd_launch(argv)
         else:
-            print(format_error(f"Unknown command type: {type(command_obj)}"), file=sys.stderr)
+            print(format_error(
+                f"Unknown command: {argv[0]}",
+                "Run 'hcom --help' for usage"
+            ), file=sys.stderr)
             return 1
-
     except CLIError as exc:
         print(str(exc), file=sys.stderr)
         return 1
