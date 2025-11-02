@@ -1342,6 +1342,18 @@ class HcomTUI:
         visible_end = min(visible_start + instance_rows, total_instances)
         visible_instances = sorted_instances[visible_start:visible_end]
 
+        # Calculate dynamic name column width based on actual names
+        max_instance_name_len = max((len(name) for name, _ in sorted_instances), default=0)
+        # Check if any instance has background marker
+        has_background = any(info.get('data', {}).get('background', False) for _, info in sorted_instances)
+        bg_marker_len = 11 if has_background else 0  # " [headless]"
+        # Add space for state symbol on cursor row (2 chars: " +")
+        name_col_width = max_instance_name_len + bg_marker_len + 2
+        # Set bounds: min 20, max based on terminal width
+        # Reserve: 2 (icon) + 10 (age) + 2 (sep) + 30 (desc min) = 44
+        max_name_width = max(20, width - 44)
+        name_col_width = max(20, min(name_col_width, max_name_width))
+
         # Render instances - compact one-line format
         for i, (name, info) in enumerate(visible_instances):
             absolute_idx = visible_start + i
@@ -1384,9 +1396,9 @@ class HcomTUI:
                     if 0 < remaining < 60:
                         timeout_marker = f" {FG_YELLOW}⏱ {int(remaining)}s{RESET}"
 
-            # Smart truncate name to fit in 24 chars including [headless] and state symbol
-            # Available: 24 - bg_marker_len - (2 for " +/-" on cursor row)
-            max_name_len = 22 - bg_marker_visible_len  # Leave 2 chars for " +" or " -"
+            # Smart truncate name to fit in dynamic column width
+            # Available: name_col_width - bg_marker_len - (2 for " +/-" on cursor row)
+            max_name_len = name_col_width - bg_marker_visible_len - 2  # Leave 2 chars for " +" or " -"
             display_name = smart_truncate_name(name, max_name_len)
 
             # State indicator (only on cursor row)
@@ -1401,13 +1413,13 @@ class HcomTUI:
                 else:
                     state_symbol = "-"
                     state_color = color
-                # Format: name [headless] +/- (total 24 chars)
+                # Format: name [headless] +/-
                 name_with_marker = f"{display_name}{bg_marker_text} {state_symbol}"
-                name_padded = ansi_ljust(name_with_marker, 24)
+                name_padded = ansi_ljust(name_with_marker, name_col_width)
             else:
-                # Format: name [headless] (total 24 chars)
+                # Format: name [headless]
                 name_with_marker = f"{display_name}{bg_marker_text}"
-                name_padded = ansi_ljust(name_with_marker, 24)
+                name_padded = ansi_ljust(name_with_marker, name_col_width)
 
             # Description separator - only show if description exists
             desc_sep = ": " if display_text else ""
@@ -1466,9 +1478,12 @@ class HcomTUI:
         if self.messages:
             all_wrapped_lines = []
 
-            # Find longest sender name for alignment
-            max_sender_len = max(len(sender) for _, sender, _ in self.messages) if self.messages else 12
-            max_sender_len = min(max_sender_len, 12)  # Cap at reasonable width
+            # Find longest sender name for alignment - dynamic with reasonable max
+            max_sender_len = max((len(sender) for _, sender, _ in self.messages), default=12)
+            # Reserve: 5 (time) + 1 (space) + sender + 1 (space) + 50 (msg min) = 57 + sender
+            # Only expand sender column when width > 69 to avoid jumpiness with narrow terminals
+            max_sender_width = max(12, width - 57) if width > 69 else 12
+            max_sender_len = min(max_sender_len, max_sender_width)
 
             for time_str, sender, message in self.messages:
                 # Format timestamp
@@ -1807,7 +1822,7 @@ class HcomTUI:
             if field.value:
                 # Has value - color only if different from default (normalize quotes)
                 field_value_normalized = str(field.value).strip().strip("'\"")
-                default_normalized = default.strip().strip("'\"")
+                default_normalized = str(default).strip().strip("'\"")
                 is_modified = field_value_normalized != default_normalized
                 color = value_color if is_modified else FG_WHITE
                 value_str = f"{color}{field.value}{RESET}"
@@ -1985,7 +2000,7 @@ class HcomTUI:
                 for field in hcom_fields:
                     if is_field_modified(field):
                         val = field.value or ""
-                        if hasattr(field, 'type') and field.type == 'bool':
+                        if field.field_type == 'checkbox':
                             val_str = "true" if val == "true" else "false"
                         else:
                             val = str(val) if val else ""

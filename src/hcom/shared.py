@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 # ===== Core ANSI Codes =====
 RESET = "\033[0m"
@@ -192,6 +192,7 @@ def parse_env_value(value: str) -> str:
         inner = inner.replace('\\\\', '\x00')
         inner = inner.replace('\\n', '\n')
         inner = inner.replace('\\t', '\t')
+        inner = inner.replace('\\r', '\r')
         inner = inner.replace('\\"', '"')
         inner = inner.replace('\x00', '\\')
         return inner
@@ -207,8 +208,16 @@ def format_env_value(value: str) -> str:
     if not value:
         return value
 
-    if "'" in value:
-        escaped = value.replace('\\', '\\\\').replace('"', '\\"')
+    # Check if quoting needed for special characters
+    needs_quoting = any(c in value for c in ['\n', '\t', '"', "'", ' ', '\r'])
+
+    if needs_quoting:
+        # Use double quotes with proper escaping
+        escaped = value.replace('\\', '\\\\')  # Escape backslashes first
+        escaped = escaped.replace('\n', '\\n')  # Escape newlines
+        escaped = escaped.replace('\t', '\\t')  # Escape tabs
+        escaped = escaped.replace('\r', '\\r')  # Escape carriage returns
+        escaped = escaped.replace('"', '\\"')   # Escape double quotes
         return f'"{escaped}"'
 
     return value
@@ -553,6 +562,167 @@ def resolve_claude_args(
         return _parse_tokens(tokens, "env")
 
     return _parse_tokens([], "none")
+
+
+def merge_claude_args(env_spec: ClaudeArgsSpec, cli_spec: ClaudeArgsSpec) -> ClaudeArgsSpec:
+    """Merge env and CLI specs with smart precedence rules.
+
+    Rules:
+    1. If CLI has positional args, they REPLACE all env positionals
+       - Empty string positional ("") explicitly deletes env positionals
+       - No CLI positional means inherit env positionals
+    2. CLI flags override env flags (per-flag precedence)
+    3. Duplicate boolean flags are deduped
+    4. System prompts handled separately via system_entries
+
+    Args:
+        env_spec: Parsed spec from HCOM_CLAUDE_ARGS env
+        cli_spec: Parsed spec from CLI forwarded args
+
+    Returns:
+        Merged ClaudeArgsSpec with CLI taking precedence
+    """
+    # Handle positionals: CLI replaces env (if present), else inherit env
+    if cli_spec.positional_tokens:
+        # Check for empty string deletion marker
+        if cli_spec.positional_tokens == ("",):
+            final_positionals = []
+        else:
+            final_positionals = list(cli_spec.positional_tokens)
+    else:
+        # No CLI positional → inherit env positional
+        final_positionals = list(env_spec.positional_tokens)
+
+    # Extract flag names from CLI to know what to override
+    cli_flag_names = _extract_flag_names_from_tokens(cli_spec.clean_tokens)
+
+    # Filter out positionals from env and CLI clean_tokens to avoid duplication
+    env_positional_set = set(env_spec.positional_tokens)
+    cli_positional_set = set(cli_spec.positional_tokens)
+
+    # Build merged tokens: env flags (not overridden, not positionals) + CLI flags (not positionals)
+    merged_tokens = []
+    skip_next = False
+
+    for i, token in enumerate(env_spec.clean_tokens):
+        if skip_next:
+            skip_next = False
+            continue
+
+        # Skip positionals (will be added explicitly later)
+        if token in env_positional_set:
+            continue
+
+        # Check if this is a flag that CLI overrides
+        flag_name = _extract_flag_name_from_token(token)
+        if flag_name and flag_name in cli_flag_names:
+            # CLI overrides this flag, skip env version
+            # Check if next token is the value (space-separated syntax)
+            if '=' not in token and i + 1 < len(env_spec.clean_tokens):
+                next_token = env_spec.clean_tokens[i + 1]
+                # Only skip next if it's not a known flag (it's the value)
+                if not _looks_like_new_flag(next_token.lower()):
+                    skip_next = True
+            continue
+
+        merged_tokens.append(token)
+
+    # Append all CLI tokens (excluding positionals)
+    for token in cli_spec.clean_tokens:
+        if token not in cli_positional_set:
+            merged_tokens.append(token)
+
+    # Deduplicate boolean flags
+    merged_tokens = _deduplicate_boolean_flags(merged_tokens)
+
+    # Handle system prompts: CLI wins if present, else env
+    if cli_spec.system_entries:
+        system_entries = cli_spec.system_entries
+    else:
+        system_entries = env_spec.system_entries
+
+    # Rebuild spec from merged tokens
+    # Need to combine tokens and positionals properly
+    combined_tokens = list(merged_tokens)
+
+    # Insert positionals at correct position
+    # Find where positionals should go (after flags, before --)
+    insert_idx = len(combined_tokens)
+    try:
+        dash_idx = combined_tokens.index('--')
+        insert_idx = dash_idx
+    except ValueError:
+        pass
+
+    # Insert positionals before -- (or at end)
+    for pos in reversed(final_positionals):
+        combined_tokens.insert(insert_idx, pos)
+
+    # Add system prompts back
+    for flag, value in system_entries:
+        combined_tokens.extend([flag, value])
+
+    # Re-parse to get proper ClaudeArgsSpec with all fields populated
+    return _parse_tokens(combined_tokens, "cli")
+
+
+def _extract_flag_names_from_tokens(tokens: Sequence[str]) -> set[str]:
+    """Extract normalized flag names from token list.
+
+    Returns set of lowercase flag names (without values).
+    Examples: '--model' → '--model', '--model=opus' → '--model'
+    """
+    flag_names = set()
+    for token in tokens:
+        flag_name = _extract_flag_name_from_token(token)
+        if flag_name:
+            flag_names.add(flag_name)
+    return flag_names
+
+
+def _extract_flag_name_from_token(token: str) -> str | None:
+    """Extract flag name from a token.
+
+    Examples:
+        '--model' → '--model'
+        '--model=opus' → '--model'
+        '-p' → '-p'
+        'value' → None
+    """
+    token_lower = token.lower()
+
+    # Check if starts with - or --
+    if not token_lower.startswith('-'):
+        return None
+
+    # Extract name (before = if present)
+    if '=' in token_lower:
+        return token_lower.split('=')[0]
+
+    return token_lower
+
+
+def _deduplicate_boolean_flags(tokens: Sequence[str]) -> list[str]:
+    """Remove duplicate boolean flags, keeping first occurrence.
+
+    Only deduplicates known boolean flags like --verbose, -p, etc.
+    Unknown flags and value flags are left as-is (Claude CLI handles them).
+    """
+    seen_flags = set()
+    result = []
+
+    for token in tokens:
+        token_lower = token.lower()
+
+        # Check if this is a known boolean flag
+        if token_lower in _BOOLEAN_FLAGS or token_lower in _BACKGROUND_SWITCHES:
+            if token_lower in seen_flags:
+                continue  # Skip duplicate
+            seen_flags.add(token_lower)
+
+        result.append(token)
+
+    return result
 
 
 def merge_system_prompts(
