@@ -14,40 +14,38 @@ Launch multiple Claude Code instances (terminal, headless, or subagents) that co
 uvx hcom 2
 ```
 
-#### Install
+#### Run with installing
 ```bash
-pip install hcom   # or: uv tool install hcom
-```
+pip install hcom
 
-#### Use
-```bash
-hcom                     # UI - launch, monitor, message
-claude 'run hcom start'  # activate hcom for any claude code
+hcom                      # UI
+
+claude 'run hcom start'   # toggle hcom for any claude code
 ```
 
 
 ## What it does
 
-`hcom` adds hooks then launches terminals with Claude Code that remain active, waiting to respond to messages. Normal `claude` remains unaffected by hcom, but can opt-in/out with `hcom start`/`hcom stop`. Safely remove hcom hooks with `hcom reset`. Works on Mac, Linux, Windows, Android.
+Adds hooks that enable instant messaging between claude code instances. Launch multiple terminals/headless/subagents that remain active, waiting to respond to messages. Normal `claude` remains unaffected by hcom, but can opt-in (`hcom start`) or opt-out (`hcom stop`) at runtime. Safely remove hooks with `hcom reset`. Works on Mac, Linux, Windows, Android.
 
 
 ## Commands
 
 | Command | Description
 |---------|-------------|
-| `hcom` | Interactive dashboard |
+| `hcom` | TUI dashboard |
 | `hcom <n>` | Launch `n` instances |
 | `hcom start` | Enable participation |
 | `hcom stop` | Disable participation |
 
 
-## Examples
+## Features
 
 #### communicate with task tool subagents
 ```bash
 claude 'use 3x task tool with task: say hi in hcom chat'
 # Each subagent gets unique identity and can communicate with siblings
-# Parent resumes after Task completes with full conversation history
+# Parent resumes with full conversation history
 ```
 
 #### persistent headless instances
@@ -77,6 +75,13 @@ claude              # Normal Claude Code
 'run hcom stop'     # Opt-out, continue as normal claude code
 ```
 
+#### async push notifications from anywhere
+```bash
+# Any process can message claude instances with custom identity
+hcom send --from background-worker 'i finished, now you go do stuff'
+```
+
+
 ---
 
 <details>
@@ -86,7 +91,8 @@ claude              # Normal Claude Code
 ```bash
 Usage: hcom   # UI
        [ENV_VARS] hcom <COUNT> [claude <ARGS>...]
-       hcom watch [--logs|--status|--wait [SEC]]
+       hcom watch [--type TYPE] [--instance NAME] [--last N] [--wait SEC]
+       hcom list [--json] [--verbose]
        hcom send "message"
        hcom stop [alias|all]
        hcom start [alias]
@@ -99,13 +105,19 @@ Launch Examples:
   claude 'run hcom start'    claude code with prompt will also work
 
 Commands:
-  watch              messaging/status/launch UI (same as hcom no args)
-    --logs           Print all messages
-    --status         Print instance status JSON
-    --wait [SEC]     Wait and notify for new message
+  watch              Query recent events (JSON per line)
+    --type TYPE      Filter by event type
+    --instance NAME  Filter by instance
+    --last N         Limit to last N events (default 20)
+    --wait SEC       Block until a matching event arrives
+
+  list               Show instance status/metadata
+    --json           Emit JSON (one instance per line)
+    --verbose        Include session_id and directory
 
   send "msg"         Send message to all instances
   send "@alias msg"  Send to specific instance/group
+    --from <name>    Custom external identity
 
   stop               Stop current instance (from inside Claude)
   stop <alias>       Stop specific instance
@@ -115,9 +127,9 @@ Commands:
   start <alias>      Start specific instance
 
   reset              Stop all + archive logs + remove hooks + clear config
-  reset logs         Clear + archive conversation log
+  reset logs         Clear + archive conversation
   reset hooks        Safely remove hcom hooks from claude settings.json
-  reset config       Clear + backup config.env
+  reset config       Clear + archive config.env
 
 Environment Variables:
   HCOM_TAG=name              Group tag (creates name-* instances)

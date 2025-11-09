@@ -1,0 +1,94 @@
+"""Public API for TUI and external tools
+
+Simple re-export module providing consistent import point.
+Not a service layer - just consolidates public surface.
+
+CLI and internal code can import from specific modules.
+TUI and plugins should import from api.py for stability.
+"""
+from __future__ import annotations
+
+# Core utilities
+from .core.config import (
+    get_config,
+    reload_config,
+    HcomConfig,
+    HcomConfigError,
+    ConfigSnapshot,
+    load_config_snapshot,
+    save_config_snapshot,
+    save_config,
+    dict_to_hcom_config,
+)
+from .core.paths import hcom_path, ensure_hcom_directories
+from .core.instances import (
+    get_instance_status,
+    load_all_positions,
+    set_status,
+    load_instance_position,
+    update_instance_position,
+)
+from .core.messages import (
+    send_message,
+    get_unread_messages,
+)
+
+# Commands (for TUI to call directly)
+from .commands.admin import (
+    cmd_reset,
+    cmd_watch,
+    should_show_in_watch,
+)
+from .commands.lifecycle import (
+    cmd_launch,
+    cmd_start,
+    cmd_stop,
+)
+from .commands.messaging import cmd_send
+
+# Terminal utilities
+from .terminal import list_available_agents
+
+# Shared utilities and constants
+from .shared import (
+    ClaudeArgsSpec,
+    resolve_claude_args,
+)
+
+__all__ = [
+    # Config
+    'get_config',
+    'reload_config',
+    'HcomConfig',
+    'HcomConfigError',
+    'ConfigSnapshot',
+    'load_config_snapshot',
+    'save_config_snapshot',
+    'save_config',
+    'dict_to_hcom_config',
+    # Paths
+    'hcom_path',
+    'ensure_hcom_directories',
+    # Instances
+    'get_instance_status',
+    'load_all_positions',
+    'set_status',
+    'load_instance_position',
+    'update_instance_position',
+    # Messages
+    'send_message',
+    'get_unread_messages',
+    # Commands
+    'cmd_launch',
+    'cmd_start',
+    'cmd_stop',
+    'cmd_send',
+    'cmd_reset',
+    'cmd_watch',
+    'should_show_in_watch',
+    # Terminal
+    'list_available_agents',
+    # Shared
+    'ClaudeArgsSpec',
+    'resolve_claude_args',
+]

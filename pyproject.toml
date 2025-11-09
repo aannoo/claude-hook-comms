@@ -37,7 +37,7 @@ Issues = "https://github.com/aannoo/claude-hook-comms/issues"
 Documentation = "https://github.com/aannoo/claude-hook-comms#readme"
 
 [tool.setuptools]
-packages = ["hcom"]
+packages = ["hcom", "hcom.core", "hcom.hooks", "hcom.commands", "hcom.ui"]
 
 [tool.setuptools.package-dir]
 "" = "src"
