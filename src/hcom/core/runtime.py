@@ -4,7 +4,7 @@ import socket
 
 from .paths import hcom_path, CONFIG_FILE
 from .config import get_config, parse_env_file
-from .instances import load_instance_position, load_all_positions, update_instance_position
+from .instances import load_instance_position, update_instance_position
 
 
 def build_claude_env() -> dict[str, str]:
@@ -66,15 +66,14 @@ GROUP TAG: You are in the '{tag}' group.
 
 Your HCOM Tools:
 - hcom send "msg" (broadcast) / "@alias msg" (direct) / "@tag msg" (tag)
-- hcom list --json  → See participants/status (add --verbose for session/directory info)
-- hcom --new-terminal   → Open interactive TUI messaging+launch+monitor dashboard in a new terminal (for the human user)
+- hcom list [--json] [--verbose]  → See other participants, read receipts, state/current info
 - hcom start/stop   → Connect/disconnect from chat (you run these, user can't run it themselves unless they specify an alias)
 - hcom <count>  → Launch instances in new terminal (you must always run 'hcom help' first to get correct context/syntax/config defaults)
 - Claude code subagents launched with the Task tool can also connect to HCOM, just tell subagents to message via 'hcom' (no need for specific hcom commands, they use use different syntax)
 
 UI/dashboard:
-- You use 'hcom --new-terminal' to open the TUI for the user (offer to do so)
-- When mentioning it to the user, don't say 'hcom --new-terminal', call it the 'hcom' command (what they would run)
+- Use 'hcom --new-terminal' to open TUI (message+launch+monitor+manage) for user in new terminal (you can't display TUIs - no TTY)
+- When mentioning to user (offer to do it): "I can open the hcom dashboard" (don't say --new-terminal)
 
 Receiving Messages:
 - Format: [new message] sender → you: content
@@ -96,6 +95,7 @@ Note:
 - This is context for YOUR hcom session config. The human user cannot see this config text (but they can see subsequent hcom messages you receive).
 - On connection, tell the human user about only these commands: 'hcom <count>', 'hcom', 'hcom start', 'hcom stop'
 - Report to the human user using first-person, for example: "I'm connected to HCOM as {instance_name}, cool!"
+- Ensure you always run hcom help before launching instances for the first time.
 ------"""
 
 
@@ -120,14 +120,25 @@ Current ~/.hcom/config.env values:{config_display}
 
 USAGE/CONTROL TIPS:
 - launch is directory-specific (always cd to folder first)
-- default to launching normal foreground instances unless told to do headless or subagents (task tool)
+- default to launching normal foreground instances unless told to do headless or subagents (task tool - multiple in parallel)
 - Everyone shares the same group chat, isolate with tags/@mentions
-- 'hcom watch --wait' is not needed if you are connected to hcom as you will already recieve messages automatically
 - Headless instances can only read files by default unless you use --allowedTools=Bash,Write,<other-tools-comma-separated>
 - Resuming a dead instance will maintain hcom identity and history: --resume <sessionid> (get sessionid from hcom list --json)
+- Instances require an initial prompt otherwise they will not connect to hcom automatically and will need the human user to manually prompt them.
 
-STATUS INDICATORS:
-"active", "delivered" - working | "idle" - waiting for messages | "blocked" - permission request (needs user approval)
+EVENT QUERY (hcom watch == historial, hcom list == current):
+Output: NDJSON from ~/.hcom/hcom.db events table
+Schema: events(id, timestamp, type, instance, data)
+    type:
+    message - {{"from", "to", "text", "mention"}}
+    status  - {{status, context}}
+        status: active, delivered (working)| waiting (avaliable for work) | blocked (need user approval) | exited, stale, unknown (dead)
+        context: tool name, msg sender etc.
+Usage:
+    hcom watch --type status --last 50  # (most recent 50 status events)
+    hcom list --json | jq 'select(has("_self") | not) | .[] | select(.status_age_seconds < 300)' # Filter with jq
+    sqlite3 ~/.hcom/hcom.db "SELECT * FROM events WHERE type='message' LIMIT 20"  # Direct SQL
+    hcom watch --wait 60 --type status | while read -r e; do... (exit 0=match, 1=timeout) (use --wait instead of sleep)
 
 BEHAVIOUR:
 - All instances receive HCOM SESSION CONFIG info automatically
@@ -136,13 +147,13 @@ BEHAVIOUR:
 
 COORDINATION:
 - Instances need explicit instructions/structure about what to do and when/how they should use hcom to effectively coordinate/collaborate
-- Define precisely what each instance should and should not do in terms of roles and responsibilities
-- Context Sharing: Encourage instances to use markdown files to share large pieces of information between them.
-- Implement structured message passing logic between agents rather than free-form chat, as this reduces hallucination cascading
-- To orchestrate instances yourself, use --append-system-prompt "prioritize messages from <your_hcom_alias>" when launching instances.
-- Try to use HCOM_AGENT or --append-system-prompt individually per instance with a role when possible.
+- Define (in initial prompt, system prompt, HCOM_AGENT, HCOM_HINTS, etc.) precisely what each instance should and should not do in terms of roles and responsibilities
+- Context Sharing: Encourage instances to use markdown files to share large pieces of information between them
+- Define structured message passing logic between agents rather than free-form chat where possible, as this reduces hallucination cascading
+- To orchestrate instances yourself, use --append-system-prompt "prioritize messages from <your_hcom_alias>" when launching instances
+- You should generally always use a system prompt (via HCOM_AGENT or --append-system-prompt etc.) unless theres a good reason not to
 - Use coordination patterns where possible ie. peer review, controller-worker, pipeline, hub-spoke, parallel execution, async tasks, planner->coder->reviewer, iterative loops, tdd, ideally verify/reviewer/critique always included etc
-
+- Consider using source and subshell to launch if easier, ie long text difficult for command line: (source long-custom-vars.env && hcom 1)
 
 ENVIRONMENT VARIABLES
 

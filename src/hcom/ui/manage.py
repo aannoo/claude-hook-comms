@@ -88,164 +88,148 @@ class ManageScreen:
         # Empty state - no instances
         if total_instances == 0:
             lines.append('')
-            lines.append(f"{FG_GRAY}No instances running{RESET}")
+            lines.append(f"{FG_GRAY}No instances - Press Tab → LAUNCH{RESET}")
             lines.append('')
-            lines.append(f"{FG_GRAY}Press Tab → LAUNCH to create instances{RESET}")
             # Pad to instance_rows
             while len(lines) < instance_rows:
                 lines.append('')
-            # Skip to message section
-            lines.append(f"{FG_GRAY}{'─' * width}{RESET}")
-            # No messages to show either
-            lines.append(f"{FG_GRAY}(no messages){RESET}")
-            while len(lines) < instance_rows + message_rows + 1:
-                lines.append('')
-            lines.append(f"{FG_GRAY}{'─' * width}{RESET}")
-            # Input area (auto-wrapped)
-            input_lines = self.render_wrapped_input(width, input_rows)
-            lines.extend(input_lines)
-            # Separator after input (before footer)
-            lines.append(f"{FG_GRAY}{'─' * width}{RESET}")
-            while len(lines) < height:
-                lines.append('')
-            return lines[:height]
+        else:
+            # Calculate visible window
+            max_scroll = max(0, total_instances - instance_rows)
+            self.state.instance_scroll_pos = max(0, min(self.state.instance_scroll_pos, max_scroll))
 
-        # Calculate visible window
-        max_scroll = max(0, total_instances - instance_rows)
-        self.state.instance_scroll_pos = max(0, min(self.state.instance_scroll_pos, max_scroll))
+            visible_start = self.state.instance_scroll_pos
+            visible_end = min(visible_start + instance_rows, total_instances)
+            visible_instances = sorted_instances[visible_start:visible_end]
 
-        visible_start = self.state.instance_scroll_pos
-        visible_end = min(visible_start + instance_rows, total_instances)
-        visible_instances = sorted_instances[visible_start:visible_end]
+            # Calculate dynamic name column width based on actual names
+            max_instance_name_len = max((len(name) for name, _ in sorted_instances), default=0)
+            # Check if any instance has background marker
+            has_background = any(info.get('data', {}).get('background', False) for _, info in sorted_instances)
+            bg_marker_len = 11 if has_background else 0  # " [headless]"
+            # Add space for state symbol on cursor row (2 chars: " +")
+            name_col_width = max_instance_name_len + bg_marker_len + 2
+            # Set bounds: min 20, max based on terminal width
+            # Reserve: 2 (icon) + 10 (age) + 2 (sep) + 30 (desc min) = 44
+            max_name_width = max(20, width - 44)
+            name_col_width = max(20, min(name_col_width, max_name_width))
 
-        # Calculate dynamic name column width based on actual names
-        max_instance_name_len = max((len(name) for name, _ in sorted_instances), default=0)
-        # Check if any instance has background marker
-        has_background = any(info.get('data', {}).get('background', False) for _, info in sorted_instances)
-        bg_marker_len = 11 if has_background else 0  # " [headless]"
-        # Add space for state symbol on cursor row (2 chars: " +")
-        name_col_width = max_instance_name_len + bg_marker_len + 2
-        # Set bounds: min 20, max based on terminal width
-        # Reserve: 2 (icon) + 10 (age) + 2 (sep) + 30 (desc min) = 44
-        max_name_width = max(20, width - 44)
-        name_col_width = max(20, min(name_col_width, max_name_width))
+            # Render instances - compact one-line format
+            for i, (name, info) in enumerate(visible_instances):
+                absolute_idx = visible_start + i
 
-        # Render instances - compact one-line format
-        for i, (name, info) in enumerate(visible_instances):
-            absolute_idx = visible_start + i
+                enabled = info.get('enabled', False)
+                status = info.get('status', "unknown")
+                _, icon = STATUS_MAP.get(status, (BG_GRAY, '?'))
+                color = STATUS_FG.get(status, FG_WHITE)
 
-            enabled = info.get('enabled', False)
-            status = info.get('status', "unknown")
-            _, icon = STATUS_MAP.get(status, (BG_GRAY, '?'))
-            color = STATUS_FG.get(status, FG_WHITE)
+                # Always show description if non-empty
+                display_text = info.get('description', '')
 
-            # Always show description if non-empty
-            display_text = info.get('description', '')
+                # Use age_text from get_instance_status (clean format: "16m", no parens)
+                age_text = info.get('age_text', '')
+                age_str = f"{age_text} ago" if age_text else ""
+                # Right-align age in fixed width column (e.g., "  16m ago")
+                age_width = 10
+                age_padded = age_str.rjust(age_width)
 
-            # Use age_text from get_instance_status (clean format: "16m", no parens)
-            age_text = info.get('age_text', '')
-            age_str = f"{age_text} ago" if age_text else ""
-            # Right-align age in fixed width column (e.g., "  16m ago")
-            age_width = 10
-            age_padded = age_str.rjust(age_width)
+                # Background indicator - include in name before padding
+                is_background = info.get('data', {}).get('background', False)
+                bg_marker_text = " [headless]" if is_background else ""
+                bg_marker_visible_len = 11 if is_background else 0  # " [headless]" = 11 chars
 
-            # Background indicator - include in name before padding
-            is_background = info.get('data', {}).get('background', False)
-            bg_marker_text = " [headless]" if is_background else ""
-            bg_marker_visible_len = 11 if is_background else 0  # " [headless]" = 11 chars
+                # Timeout warning indicator
+                timeout_marker = ""
+                if enabled and status == "waiting":
+                    age_seconds = info.get('age_seconds', 0)
+                    data = info.get('data', {})
+                    is_subagent = bool(data.get('parent_session_id'))
 
-            # Timeout warning indicator
-            timeout_marker = ""
-            if enabled and status == "waiting":
-                age_seconds = info.get('age_seconds', 0)
-                data = info.get('data', {})
-                is_subagent = bool(data.get('parent_session_id'))
+                    if is_subagent:
+                        timeout = get_config().subagent_timeout
+                        remaining = timeout - age_seconds
+                        if 0 < remaining < 10:
+                            timeout_marker = f" {FG_YELLOW}⏱ {int(remaining)}s{RESET}"
+                    else:
+                        timeout = data.get('wait_timeout', get_config().timeout)
+                        remaining = timeout - age_seconds
+                        if 0 < remaining < 60:
+                            timeout_marker = f" {FG_YELLOW}⏱ {int(remaining)}s{RESET}"
 
-                if is_subagent:
-                    timeout = get_config().subagent_timeout
-                    remaining = timeout - age_seconds
-                    if 0 < remaining < 10:
-                        timeout_marker = f" {FG_YELLOW}⏱ {int(remaining)}s{RESET}"
+                # Smart truncate name to fit in dynamic column width
+                # Available: name_col_width - bg_marker_len - (2 for " +/-" on cursor row)
+                max_name_len = name_col_width - bg_marker_visible_len - 2  # Leave 2 chars for " +" or " -"
+                display_name = smart_truncate_name(name, max_name_len)
+
+                # State indicator (only on cursor row)
+                if absolute_idx == self.state.cursor:
+                    is_pending = self.state.pending_toggle == name and (time.time() - self.state.pending_toggle_time) <= self.tui.CONFIRMATION_TIMEOUT
+                    if is_pending:
+                        state_symbol = "±"
+                        state_color = FG_GOLD
+                    elif enabled:
+                        state_symbol = "+"
+                        state_color = color
+                    else:
+                        state_symbol = "-"
+                        state_color = color
+                    # Format: name [headless] +/-
+                    name_with_marker = f"{display_name}{bg_marker_text} {state_symbol}"
+                    name_padded = ansi_ljust(name_with_marker, name_col_width)
                 else:
-                    timeout = data.get('wait_timeout', get_config().timeout)
-                    remaining = timeout - age_seconds
-                    if 0 < remaining < 60:
-                        timeout_marker = f" {FG_YELLOW}⏱ {int(remaining)}s{RESET}"
+                    # Format: name [headless]
+                    name_with_marker = f"{display_name}{bg_marker_text}"
+                    name_padded = ansi_ljust(name_with_marker, name_col_width)
 
-            # Smart truncate name to fit in dynamic column width
-            # Available: name_col_width - bg_marker_len - (2 for " +/-" on cursor row)
-            max_name_len = name_col_width - bg_marker_visible_len - 2  # Leave 2 chars for " +" or " -"
-            display_name = smart_truncate_name(name, max_name_len)
+                # Description separator - only show if description exists
+                desc_sep = ": " if display_text else ""
 
-            # State indicator (only on cursor row)
-            if absolute_idx == self.state.cursor:
-                is_pending = self.state.pending_toggle == name and (time.time() - self.state.pending_toggle_time) <= self.tui.CONFIRMATION_TIMEOUT
-                if is_pending:
-                    state_symbol = "±"
-                    state_color = FG_GOLD
-                elif enabled:
-                    state_symbol = "+"
-                    state_color = color
+                # Bold if enabled, dim if disabled
+                weight = BOLD if enabled else DIM
+
+                if absolute_idx == self.state.cursor:
+                    # Highlighted row - Format: icon name [headless] +/-  age ago: description [timeout]
+                    line = f"{BG_CHARCOAL}{color}{icon} {weight}{color}{name_padded}{RESET}{BG_CHARCOAL}{weight}{FG_GRAY}{age_padded}{desc_sep}{display_text}{timeout_marker}{RESET}"
+                    line = truncate_ansi(line, width)
+                    line = bg_ljust(line, width, BG_CHARCOAL)
                 else:
-                    state_symbol = "-"
-                    state_color = color
-                # Format: name [headless] +/-
-                name_with_marker = f"{display_name}{bg_marker_text} {state_symbol}"
-                name_padded = ansi_ljust(name_with_marker, name_col_width)
-            else:
-                # Format: name [headless]
-                name_with_marker = f"{display_name}{bg_marker_text}"
-                name_padded = ansi_ljust(name_with_marker, name_col_width)
+                    # Normal row - Format: icon name [headless]  age ago: description [timeout]
+                    line = f"{color}{icon}{RESET} {weight}{color}{name_padded}{RESET}{weight}{FG_GRAY}{age_padded}{desc_sep}{display_text}{timeout_marker}{RESET}"
+                    line = truncate_ansi(line, width)
 
-            # Description separator - only show if description exists
-            desc_sep = ": " if display_text else ""
+                lines.append(line)
 
-            # Bold if enabled, dim if disabled
-            weight = BOLD if enabled else DIM
+            # Add scroll indicators if needed (indicator stays at edge, cursor moves if conflict)
+            if total_instances > instance_rows:
+                # If cursor will conflict with indicator, move cursor line first
+                if visible_start > 0 and self.state.cursor == visible_start:
+                    # Save cursor line (at position 0), move to position 1
+                    cursor_line = lines[0]
+                    lines[0] = lines[1] if len(lines) > 1 else ""
+                    if len(lines) > 1:
+                        lines[1] = cursor_line
 
-            if absolute_idx == self.state.cursor:
-                # Highlighted row - Format: icon name [headless] +/-  age ago: description [timeout]
-                line = f"{BG_CHARCOAL}{color}{icon} {weight}{color}{name_padded}{RESET}{BG_CHARCOAL}{weight}{FG_GRAY}{age_padded}{desc_sep}{display_text}{timeout_marker}{RESET}"
-                line = truncate_ansi(line, width)
-                line = bg_ljust(line, width, BG_CHARCOAL)
-            else:
-                # Normal row - Format: icon name [headless]  age ago: description [timeout]
-                line = f"{color}{icon}{RESET} {weight}{color}{name_padded}{RESET}{weight}{FG_GRAY}{age_padded}{desc_sep}{display_text}{timeout_marker}{RESET}"
-                line = truncate_ansi(line, width)
+                if visible_end < total_instances and self.state.cursor == visible_end - 1:
+                    # Save cursor line (at position -1), move to position -2
+                    cursor_line = lines[-1]
+                    lines[-1] = lines[-2] if len(lines) > 1 else ""
+                    if len(lines) > 1:
+                        lines[-2] = cursor_line
 
-            lines.append(line)
+                # Now add indicators at edges (may overwrite moved content, that's fine)
+                if visible_start > 0:
+                    count_above = visible_start
+                    indicator = f"{FG_GRAY}↑ {count_above} more{RESET}"
+                    lines[0] = ansi_ljust(indicator, width)
 
-        # Add scroll indicators if needed (indicator stays at edge, cursor moves if conflict)
-        if total_instances > instance_rows:
-            # If cursor will conflict with indicator, move cursor line first
-            if visible_start > 0 and self.state.cursor == visible_start:
-                # Save cursor line (at position 0), move to position 1
-                cursor_line = lines[0]
-                lines[0] = lines[1] if len(lines) > 1 else ""
-                if len(lines) > 1:
-                    lines[1] = cursor_line
+                if visible_end < total_instances:
+                    count_below = total_instances - visible_end
+                    indicator = f"{FG_GRAY}↓ {count_below} more{RESET}"
+                    lines[-1] = ansi_ljust(indicator, width)
 
-            if visible_end < total_instances and self.state.cursor == visible_end - 1:
-                # Save cursor line (at position -1), move to position -2
-                cursor_line = lines[-1]
-                lines[-1] = lines[-2] if len(lines) > 1 else ""
-                if len(lines) > 1:
-                    lines[-2] = cursor_line
-
-            # Now add indicators at edges (may overwrite moved content, that's fine)
-            if visible_start > 0:
-                count_above = visible_start
-                indicator = f"{FG_GRAY}↑ {count_above} more{RESET}"
-                lines[0] = ansi_ljust(indicator, width)
-
-            if visible_end < total_instances:
-                count_below = total_instances - visible_end
-                indicator = f"{FG_GRAY}↓ {count_below} more{RESET}"
-                lines[-1] = ansi_ljust(indicator, width)
-
-        # Pad instances
-        while len(lines) < instance_rows:
-            lines.append('')
+            # Pad instances
+            while len(lines) < instance_rows:
+                lines.append('')
 
         # Separator
         lines.append(f"{FG_GRAY}{'─' * width}{RESET}")

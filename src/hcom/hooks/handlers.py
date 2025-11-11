@@ -202,7 +202,7 @@ def _cleanup_orphaned_subagents(instance_name: str, instance_data: dict[str, Any
     ).fetchall()
 
     for row in rows:
-        disable_instance(row['name'])
+        disable_instance(row['name'], initiated_by=instance_name, reason='orphaned')
         if row['status'] != 'exited':
             set_status(row['name'], 'exited', 'orphaned')
 
@@ -570,13 +570,16 @@ def handle_userpromptsubmit(hook_data: dict[str, Any], instance_name: str, updat
             (instance_name,)
         ).fetchall()
         for row in subagents:
-            disable_instance(row['name'])
+            disable_instance(row['name'], initiated_by=instance_name, reason='orphaned')
             # Only set exited if not already exited
             if row['status'] != 'exited':
                 set_status(row['name'], 'exited', 'orphaned')
         # Clear current subagents list if set
         if (instance_data.get('current_subagents')):
             update_instance_position(instance_name, {'current_subagents': []})
+
+    # Persist updates (transcript_path, directory, tag, etc.) unconditionally
+    update_instance_position(instance_name, updates)
 
     # Coordinate with Stop hook only if enabled AND Stop hook is active
     # Determine if stop hook is active - check tcp_mode or timestamp
@@ -598,8 +601,7 @@ def handle_userpromptsubmit(hook_data: dict[str, Any], instance_name: str, updat
             pass
 
         # Set timestamp (backup mechanism)
-        updates['last_user_input'] = time.time()
-        update_instance_position(instance_name, updates)
+        update_instance_position(instance_name, {'last_user_input': time.time()})
 
         # Send TCP notification LAST (Stop hook wakes, sees flag, exits immediately)
         if notify_port:
@@ -652,7 +654,7 @@ def handle_sessionstart(hook_data: dict[str, Any]) -> None:
 
     if session_id and env_file:
         try:
-            with open(env_file, 'a') as f:
+            with open(env_file, 'a', newline='\n') as f:
                 f.write(f'\nexport HCOM_SESSION_ID={session_id}\n')
         except Exception as e:
             # Fail silently - hook safety
@@ -717,7 +719,9 @@ def _deliver_task_freeze_messages(instance_name: str, parent_event_id: int) -> d
         if sender in subagent_names:
             subagent_msgs.append(msg)
         # Messages TO subagents via @mentions or broadcasts
-        elif subagent_names and any(should_deliver_message(msg, name, subagent_names) for name in subagent_names):
+        elif subagent_names and any(
+            should_deliver_message(msg, name, all_instance_names) for name in subagent_names
+        ):
             if msg not in subagent_msgs:  # Avoid duplicates
                 subagent_msgs.append(msg)
 
@@ -773,7 +777,7 @@ def _mark_task_subagents_exited(instance_name: str) -> None:
 def _handle_task_completion(instance_name: str, instance_data: dict[str, Any] | None, tool_input: dict[str, Any], tool_response: dict[str, Any]) -> dict[str, Any] | None:
     """Parent context: Task tool completion flow
 
-    CRITICAL: Maintains atomic sequencing of state updates:
+    Maintains atomic sequencing of state updates:
     1. Deliver freeze messages
     2. Update position + clear current_subagents (atomic)
     3. Save resume mapping

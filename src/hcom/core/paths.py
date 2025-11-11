@@ -6,14 +6,7 @@ import time
 import json
 import tempfile
 from pathlib import Path
-from contextlib import contextmanager
 from typing import Callable, Any, TextIO
-
-# Conditional imports for file locking
-if os.name == 'nt':
-    import msvcrt
-else:
-    import fcntl
 
 from ..shared import IS_WINDOWS
 
@@ -26,44 +19,6 @@ SCRIPTS_DIR = ".tmp/scripts"
 FLAGS_DIR = ".tmp/flags"
 CONFIG_FILE = "config.env"
 ARCHIVE_DIR = "archive"
-
-# ==================== File Locking ====================
-
-@contextmanager
-def locked(fp, timeout=5.0):
-    """Context manager for cross-platform file locking with timeout"""
-    start = time.time()
-
-    if os.name == 'nt':
-        fp.seek(0)
-        # Lock entire file (0x7fffffff = 2GB max)
-        while time.time() - start < timeout:
-            try:
-                msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 0x7fffffff)
-                break
-            except OSError:
-                time.sleep(0.01)
-        else:
-            raise TimeoutError(f"Lock timeout after {timeout}s")
-    else:
-        # Non-blocking with retry
-        while time.time() - start < timeout:
-            try:
-                fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                time.sleep(0.01)
-        else:
-            raise TimeoutError(f"Lock timeout after {timeout}s")
-
-    try:
-        yield
-    finally:
-        if os.name == 'nt':
-            fp.seek(0)
-            msvcrt.locking(fp.fileno(), msvcrt.LK_UNLCK, 0x7fffffff)
-        else:
-            fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
 
 # ==================== Path Utilities ====================
 

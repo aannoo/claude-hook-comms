@@ -23,7 +23,6 @@ from .core.config import (
 from .core.paths import hcom_path, ensure_hcom_directories
 from .core.instances import (
     get_instance_status,
-    load_all_positions,
     set_status,
     load_instance_position,
     update_instance_position,
@@ -31,6 +30,7 @@ from .core.instances import (
 from .core.messages import (
     send_message,
     get_unread_messages,
+    get_read_receipts,
 )
 
 # Commands (for TUI to call directly)
@@ -71,13 +71,13 @@ __all__ = [
     'ensure_hcom_directories',
     # Instances
     'get_instance_status',
-    'load_all_positions',
     'set_status',
     'load_instance_position',
     'update_instance_position',
     # Messages
     'send_message',
     'get_unread_messages',
+    'get_read_receipts',
     # Commands
     'cmd_launch',
     'cmd_start',

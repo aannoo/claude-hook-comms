@@ -8,11 +8,23 @@ import re
 import os
 from pathlib import Path
 
-__version__ = "0.6.2"
+__version__ = "0.6.3"
 
 # ===== Platform Detection =====
 IS_WINDOWS = sys.platform == 'win32'
 CREATE_NO_WINDOW = 0x08000000  # Windows: prevent console window creation
+
+# ===== Terminal Identity =====
+# Windows/cross-platform terminal session identifier
+# Used for command identity resolution when HCOM_SESSION_ID not available
+MAPID = (
+    os.environ.get('HCOM_LAUNCH_TOKEN')
+    or os.environ.get('WT_SESSION')
+    or os.environ.get('WEZTERM_PANE')
+    or os.environ.get('WAVETERM_BLOCKID')
+    or os.environ.get('KITTY_WINDOW_ID')
+    or os.environ.get('TMUX_PANE')
+)
 
 def is_wsl() -> bool:
     """Detect if running in WSL"""
@@ -43,11 +55,11 @@ def is_termux() -> bool:
 # Capture group must start with alphanumeric (prevents @-test, @_test, @123)
 MENTION_PATTERN = re.compile(r'(?<![a-zA-Z0-9._-])@([a-zA-Z0-9][\w-]*)')
 AGENT_NAME_PATTERN = re.compile(r'^[a-z-]+$')
-TIMESTAMP_SPLIT_PATTERN = re.compile(r'\n(?=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+\|)')
 
 # Sender constants
-SENDER = 'bigboss'
-SENDER_EMOJI = '🐳'
+SENDER = 'bigboss'  # CLI sender identity
+CLAUDE_SENDER = 'john'  # Fallback when no session_id/MAPID available (edge case in Windows or potential rare claude code thing)
+SENDER_EMOJI = '🐳' # Legacy whale, unused but kept here to remind me about cake intake
 MAX_MESSAGES_PER_DELIVERY = 50
 MAX_MESSAGE_SIZE = 1048576  # 1MB
 

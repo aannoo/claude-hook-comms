@@ -12,7 +12,7 @@ import re
 from ..shared import SENDER
 from ..core.paths import hcom_path, LOGS_DIR, FLAGS_DIR
 from ..core.config import get_config
-from ..core.instances import load_instance_position, update_instance_position, load_all_positions
+from ..core.instances import load_instance_position, update_instance_position
 from ..core.messages import format_hook_messages
 from ..core.runtime import (
     build_claude_env,
@@ -109,23 +109,29 @@ def build_hcom_command() -> str:
         return _build_quoted_invocation()
 
 
-# Functions moved to core/runtime.py:
-# - build_claude_env()
-# - build_hcom_bootstrap_text()
-# - build_launch_context()
-# - notify_instance()
-# - notify_all_instances()
-
-
-def disable_instance(instance_name: str) -> None:
-    """Disable instance - stops Stop hook polling"""
+def disable_instance(instance_name: str, initiated_by: str = 'unknown', reason: str = '') -> None:
+    """Disable instance and log event
+    Args:
+        instance_name: Instance to disable
+        initiated_by: Who initiated (from resolve_identity())
+        reason: Context (e.g., 'manual', 'timeout', 'orphaned', 'external')
+    """
     updates = {
         'enabled': False
     }
     update_instance_position(instance_name, updates)
-
     # Notify instance to wake and see enabled=false
     notify_instance(instance_name)
+    # Log all disable operations
+    try:
+        from ..core.db import log_event
+        log_event('life', instance_name, {
+            'action': 'stopped',
+            'by': initiated_by,
+            'reason': reason
+        })
+    except Exception:
+        pass  # Don't break disable if logging fails
 
 
 def init_hook_context(hook_data: dict[str, Any], hook_type: str | None = None) -> tuple[str, dict[str, Any], bool]:
@@ -133,10 +139,11 @@ def init_hook_context(hook_data: dict[str, Any], hook_type: str | None = None) -
     Initialize instance context. Flow:
     1. Resolve instance name (search by session_id, generate if not found)
     2. Create instance in DB if fresh start
-    3. Build updates dict (directory, tag, session_id, background, transcript_path)
+    3. Build updates dict (directory, tag, session_id, mapid, background, transcript_path)
     4. Return (instance_name, updates, is_matched_resume)
     """
     from ..core.instances import resolve_instance_name, initialize_instance_in_position_file
+    from ..shared import MAPID
 
     session_id = hook_data.get('session_id', '')
     transcript_path = hook_data.get('transcript_path', '')
@@ -147,7 +154,7 @@ def init_hook_context(hook_data: dict[str, Any], hook_type: str | None = None) -
 
     # Initialize if fresh start (UserPromptSubmit or first hook)
     if not existing_data:
-        initialize_instance_in_position_file(instance_name, session_id=session_id)
+        initialize_instance_in_position_file(instance_name, session_id=session_id, mapid=MAPID)
 
     # Build updates dict (CRITICAL: dispatcher relies on these fields)
     updates: dict[str, Any] = {
@@ -158,6 +165,10 @@ def init_hook_context(hook_data: dict[str, Any], hook_type: str | None = None) -
     # Update session_id (may have changed on resume)
     if session_id:
         updates['session_id'] = session_id
+
+    # Update mapid if it exists and has changed (resume in different terminal)
+    if MAPID and existing_data and existing_data.get('mapid') != MAPID:
+        updates['mapid'] = MAPID
 
     # Update transcript_path if provided
     if transcript_path:
@@ -177,6 +188,8 @@ def init_hook_context(hook_data: dict[str, Any], hook_type: str | None = None) -
 
 def is_safe_hcom_command(command: str) -> bool:
     """Auto-approve hcom commands with safe chaining/redirects
+    The security guarantee is: Only auto-approve if 100% certain it's safe hcom-only commands. If uncertain → ask
+  for permission (one prompt).
 
     Security model:
     - Blocks all command/variable injection: `, $, (, )

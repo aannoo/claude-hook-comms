@@ -65,7 +65,6 @@ from .commands import (
     cmd_start,
     cmd_send,
     cmd_done,
-    send_cli,
     cmd_watch,
     cmd_reset,
     cmd_help,
@@ -83,16 +82,6 @@ if sys.version_info < (3, 10):
 # Platform detection, message patterns, sender constants moved to shared.py (imported above)
 # STATUS_MAP and status constants in shared.py (imported above)
 # ANSI codes in shared.py (imported above)
-
-# ==================== Windows/WSL Console Unicode ====================
-
-# Apply UTF-8 encoding for Windows and WSL
-if IS_WINDOWS or is_wsl():
-    try:
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
-    except (AttributeError, OSError):
-        pass # Fallback if stream redirection fails
 
 # ==================== Error Handling Strategy ====================
 # Hooks: Must never raise exceptions (breaks hcom). Functions return True/False.
@@ -363,6 +352,16 @@ def ensure_hooks_current() -> bool:
 
 def main(argv: list[str] | None = None) -> int | None:
     """Main command dispatcher"""
+    # Apply UTF-8 encoding for Windows and WSL (Git Bash, MSYS use cp1252 by default)
+    if IS_WINDOWS or is_wsl():
+        try:
+            if not isinstance(sys.stdout, io.TextIOWrapper) or sys.stdout.encoding != 'utf-8':
+                sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+            if not isinstance(sys.stderr, io.TextIOWrapper) or sys.stderr.encoding != 'utf-8':
+                sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+        except (AttributeError, OSError):
+            pass  # Fallback if stream redirection fails
+
     if argv is None:
         argv = sys.argv[1:]
     else:
@@ -403,11 +402,6 @@ def main(argv: list[str] | None = None) -> int | None:
         elif argv[0] in ('--version', '-v'):
             print(f"hcom {__version__}")
             return 0
-        elif argv[0] == 'send_cli':
-            if len(argv) < 2:
-                print(format_error("Message required"), file=sys.stderr)
-                return 1
-            return send_cli(argv[1])
         elif argv[0] == 'watch':
             return cmd_watch(argv[1:])
         elif argv[0] == 'send':

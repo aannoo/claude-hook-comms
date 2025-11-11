@@ -8,7 +8,8 @@ from datetime import datetime
 from typing import Any
 from .utils import get_help_text, format_error
 from ..core.paths import hcom_path, SCRIPTS_DIR, LOGS_DIR, ARCHIVE_DIR
-from ..core.instances import load_all_positions, get_instance_status
+from ..core.instances import get_instance_status
+from ..core.db import iter_instances
 from ..shared import STATUS_ICONS
 
 
@@ -129,28 +130,61 @@ def cmd_watch(argv: list[str]) -> int:
 
 def cmd_list(argv: list[str]) -> int:
     """List instances: hcom list [--json] [--verbose]"""
-    positions = load_all_positions()
+    from .utils import resolve_identity
+    from ..core.instances import load_instance_position
+    from ..core.messages import get_read_receipts
+    from ..shared import SENDER, CLAUDE_SENDER
+
     json_output = '--json' in argv
     verbose_output = '--verbose' in argv
 
+    # Resolve current instance identity
+    current_alias = resolve_identity()
+
+    # Load read receipts for all contexts (bigboss, john, instances)
+    # Limit based on verbose flag: 3 messages if verbose, 1 otherwise
+    read_limit = 3 if verbose_output else 1
+    read_receipts = get_read_receipts(current_alias, limit=read_limit)
+
+    # Only show connection status for actual instances (not CLI/fallback)
+    show_connection = current_alias not in (SENDER, CLAUDE_SENDER)
+    current_enabled = False
+    if show_connection:
+        current_data = load_instance_position(current_alias)
+        current_enabled = current_data.get('enabled', False) if current_data else False
+
     # Sort by creation time (newest first) - same as TUI
-    sorted_positions = sorted(
-        positions.items(),
-        key=lambda x: -x[1].get('created_at', 0.0)
+    sorted_instances = sorted(
+        iter_instances(),
+        key=lambda x: -x.get('created_at', 0.0)
     )
 
     if json_output:
-        # JSON per line
-        for name, data in sorted_positions:
+        # JSON per line - _self entry first always
+        self_payload = {
+            "_self": {
+                "alias": current_alias,
+                "read_receipts": read_receipts
+            }
+        }
+        # Only include connection status for actual instances
+        if show_connection:
+            self_payload["_self"]["hcom_connected"] = current_enabled
+        print(json.dumps(self_payload))
+
+        for data in sorted_instances:
             if not should_show_in_watch(data):
                 continue
-            enabled, status, age, description = get_instance_status(data)
+            name = data['name']
+            enabled, status, age_str, description, age_seconds = get_instance_status(data)
             payload = {
                 name: {
                     "hcom_connected": enabled,
                     "status": status,
-                    "status_age": age,
+                    "status_age_seconds": int(age_seconds),
                     "description": description,
+                    "headless": bool(data.get("background", False)),
+                    "wait_timeout": data.get("wait_timeout", 1800),
                 }
             }
             if verbose_output:
@@ -158,21 +192,52 @@ def cmd_list(argv: list[str]) -> int:
                 payload[name]["directory"] = data.get("directory", "")
             print(json.dumps(payload))
     else:
-        # Human-readable
-        for name, data in sorted_positions:
+        # Human-readable - show header with alias and read receipts
+        print(f"Your alias: {current_alias}")
+
+        # Show connection status only for actual instances (not bigboss/john)
+        if show_connection:
+            state_symbol = "+" if current_enabled else "-"
+            state_text = "enabled" if current_enabled else "disabled"
+            print(f"  Your hcom connection: {state_text} ({state_symbol})")
+
+        # Show read receipts if any
+        if read_receipts:
+            print(f"  Read receipts:")
+            for msg in read_receipts:
+                read_count = len(msg['read_by'])
+                total = msg['total_recipients']
+
+                if verbose_output:
+                    # Verbose: show list of who has read + ratio
+                    readers = ", ".join(msg['read_by']) if msg['read_by'] else "(none)"
+                    print(f"    #{msg['id']} {msg['age']} \"{msg['text']}\" | read by ({read_count}/{total}): {readers}")
+                else:
+                    # Default: just show ratio
+                    print(f"    #{msg['id']} {msg['age']} \"{msg['text']}\" | read by {read_count}/{total}")
+
+        print()
+
+        for data in sorted_instances:
             if not should_show_in_watch(data):
                 continue
-            enabled, status, age, description = get_instance_status(data)
+            name = data['name']
+            enabled, status, age_str, description, age_seconds = get_instance_status(data)
             icon = STATUS_ICONS.get(status, '◦')
             state = "+" if enabled else "-"
-            age_str = f"{age} ago" if age else ""
+            age_display = f"{age_str} ago" if age_str else ""
             desc_sep = ": " if description else ""
+
+            # Add [headless] badge
+            headless_badge = " [headless]" if data.get("background", False) else ""
+
             if verbose_output:
                 directory = data.get("directory", "unknown")
                 session_id = data.get("session_id", "")
-                print(f"{icon} {name:15} {state}  {age_str}{desc_sep}{description} (dir: {directory}, session: {session_id})")
+                timeout = data.get("wait_timeout", 1800)
+                print(f"{icon} {name:15}{headless_badge} {state}  {age_display}{desc_sep}{description} (dir: {directory}, session_id: {session_id}, timeout: {timeout}s)")
             else:
-                print(f"{icon} {name:15} {state}  {age_str}{desc_sep}{description}")
+                print(f"{icon} {name:15}{headless_badge} {state}  {age_display}{desc_sep}{description}")
 
     return 0
 

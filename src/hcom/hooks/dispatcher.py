@@ -9,6 +9,7 @@ import re
 from ..core.paths import ensure_hcom_directories
 from ..core.instances import load_instance_position, in_subagent_context, get_display_name
 from ..core.config import get_config
+from ..core.db import get_instance, find_instance_by_session
 from .handlers import (
     handle_pretooluse, handle_posttooluse, handle_stop,
     handle_subagent_stop, handle_userpromptsubmit,
@@ -34,10 +35,12 @@ def should_skip_vanilla_instance(hook_type: str, hook_data: dict) -> bool:
     if not session_id:  # No session_id = can't identify instance, skip hook
         return True
 
+    stored_name = find_instance_by_session(session_id)
+    if stored_name:
+        return False
+
     instance_name = get_display_name(session_id, get_config().tag)
 
-    # Check DB for instance existence
-    from ..core.db import get_instance
     if not get_instance(instance_name):
         # Allow UserPromptSubmit if prompt contains hcom command
         if hook_type == 'userpromptsubmit':

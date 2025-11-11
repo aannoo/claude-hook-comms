@@ -188,6 +188,9 @@ class HcomTUI:
         """Reset logs (archive and clear)"""
         try:
             cmd_reset(['logs'])
+            # Clear message state
+            self.state.messages = []
+            self.state.last_event_id = 0
             # Reload to clear instance list from display
             self.load_status()
             archive_path = f"{Path.home()}/.hcom/archive/"
@@ -260,10 +263,7 @@ class HcomTUI:
         # Build instance info dict (replace old instances, don't just add)
         new_instances = {}
         for name, data in instances.items():
-            enabled, status_type, age_text, description = get_instance_status(data)
-
-            last_time = data.get('status_time', 0.0)
-            age_seconds = time.time() - last_time if last_time > 0 else 999.0
+            enabled, status_type, age_text, description, age_seconds = get_instance_status(data)
 
             new_instances[name] = {
                 'enabled': enabled,
@@ -271,7 +271,6 @@ class HcomTUI:
                 'age_text': age_text,
                 'description': description,
                 'age_seconds': age_seconds,
-                'last_time': last_time,
                 'data': data,
             }
 
@@ -578,9 +577,9 @@ class HcomTUI:
                         self.state.last_message_time = 0.0
 
                     self.state.last_event_id = current_max_id
-            except Exception:
-                # DB query failed - keep existing messages
-                pass
+            except Exception as e:
+                # DB query failed - flash error and keep existing messages
+                self.flash_error(f"Message load failed: {e}", duration=5.0)
 
     def build_status_bar(self, highlight_tab: str | None = None) -> str:
         """Build status bar with tabs - shared by TUI header and native log view
@@ -822,8 +821,10 @@ class HcomTUI:
                             'message': event_data.get('text', '')
                         }
                         self.render_log_message(msg)
-            except Exception:
-                pass
+            except Exception as e:
+                # Show error message instead of silent pass
+                print(f"{FG_RED}Failed to load messages: {e}{RESET}")
+                print()
 
             # Separator and status
             if has_messages:
@@ -920,9 +921,9 @@ class HcomTUI:
                             self.render_status_with_separator("LOG")
                             has_messages_state = True  # We now have messages
                         last_pos = current_max_id
-                except Exception:
-                    # DB query failed - skip this update
-                    pass
+                except Exception as e:
+                    # DB query failed - show error in flash
+                    self.flash_error(f"Stream failed: {e}", duration=3.0)
 
                 time.sleep(0.01)
 

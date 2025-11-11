@@ -159,11 +159,18 @@ def has_claude_arg(claude_args: list[str] | None, arg_names: list[str], arg_pref
 
 def build_env_string(env_vars: dict[str, Any], format_type: str = "bash") -> str:
     """Build environment variable string for bash shells"""
+    # Filter out invalid bash variable names (must be letters, digits, underscores only)
+    valid_vars = {k: v for k, v in env_vars.items() if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', k)}
+
+    # On Windows, exclude PATH (let Git Bash handle it to avoid Windows vs Unix path format issues)
+    if platform.system() == 'Windows':
+        valid_vars = {k: v for k, v in valid_vars.items() if k != 'PATH'}
+
     if format_type == "bash_export":
         # Properly escape values for bash
-        return ' '.join(f'export {k}={shlex.quote(str(v))};' for k, v in env_vars.items())
+        return ' '.join(f'export {k}={shlex.quote(str(v))};' for k, v in valid_vars.items())
     else:
-        return ' '.join(f'{k}={shlex.quote(str(v))}' for k, v in env_vars.items())
+        return ' '.join(f'{k}={shlex.quote(str(v))}' for k, v in valid_vars.items())
 
 def build_claude_command(agent_content: str | None = None, claude_args: list[str] | None = None, model: str | None = None, tools: str | None = None) -> tuple[str, str | None]:
     """Build Claude command with proper argument handling
@@ -218,9 +225,13 @@ def build_claude_command(agent_content: str | None = None, claude_args: list[str
 
 def find_bash_on_windows() -> str | None:
     """Find Git Bash on Windows, avoiding WSL's bash launcher"""
+    # 0. User-specified path via env var (highest priority)
+    if user_bash := os.environ.get('CLAUDE_CODE_GIT_BASH_PATH'):
+        if Path(user_bash).exists():
+            return user_bash
     # Build prioritized list of bash candidates
     candidates = []
-    # 1. Common Git Bash locations (highest priority)
+    # 1. Common Git Bash locations
     for base in [os.environ.get('PROGRAMFILES', r'C:\Program Files'),
                  os.environ.get('PROGRAMFILES(X86)', r'C:\Program Files (x86)')]:
         if base:

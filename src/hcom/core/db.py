@@ -97,6 +97,7 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
         CREATE TABLE IF NOT EXISTS instances (
             name TEXT PRIMARY KEY,
             session_id TEXT UNIQUE,
+            mapid TEXT,
             parent_session_id TEXT,
             parent_name TEXT,
             tag TEXT,
@@ -126,6 +127,13 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
         )
     """)
 
+    # Migrate existing databases: add mapid column if missing
+    cursor = conn.execute("PRAGMA table_info(instances)")
+    columns = {row['name'] for row in cursor.fetchall()}
+    if 'mapid' not in columns:
+        conn.execute("ALTER TABLE instances ADD COLUMN mapid TEXT DEFAULT ''")
+        conn.commit()
+
     # Create indexes for common query patterns
     conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON events(timestamp)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_type ON events(type)")
@@ -140,6 +148,7 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_enabled ON instances(enabled)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON instances(created_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON instances(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mapid ON instances(mapid) WHERE mapid != ''")
 
     conn.commit()
 
@@ -305,21 +314,6 @@ def get_instance(name: str) -> dict[str, Any] | None:
 
     return data
 
-def get_all_instances() -> dict[str, dict[str, Any]]:
-    """Get all instances. Returns {name: data} dict."""
-    conn = get_db()
-    rows = conn.execute("SELECT * FROM instances ORDER BY created_at DESC").fetchall()
-
-    result = {}
-    for row in rows:
-        data = dict(row)
-        # Parse JSON fields
-        data['current_subagents'] = json.loads(data['current_subagents'])
-        data['subagent_mappings'] = json.loads(data['subagent_mappings'])
-        result[row['name']] = data
-
-    return result
-
 def save_instance(name: str, data: dict[str, Any]) -> bool:
     """Insert or update instance using UPSERT. Returns True on success."""
     conn = get_db()
@@ -403,6 +397,31 @@ def find_instance_by_session(session_id: str) -> str | None:
     row = conn.execute("SELECT name FROM instances WHERE session_id = ?", (session_id,)).fetchone()
     return row['name'] if row else None
 
+def get_instance_by_mapid(mapid: str) -> dict[str, Any] | None:
+    """Get instance by mapid (launch token or WT_SESSION). Returns latest if multiple match.
+
+    Note: Multiple instances can share same mapid (terminal reused for new conversations).
+    Returns latest by created_at.
+    """
+    if not mapid:
+        return None
+
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM instances WHERE mapid = ? ORDER BY created_at DESC LIMIT 1",
+        (mapid,)
+    ).fetchone()
+
+    if not row:
+        return None
+
+    # Convert Row to dict, parse JSON fields
+    data = dict(row)
+    data['current_subagents'] = json.loads(data['current_subagents'])
+    data['subagent_mappings'] = json.loads(data['subagent_mappings'])
+
+    return data
+
 def delete_instance(name: str) -> bool:
     """Delete instance. CASCADE handles cleanup. Returns True on success."""
     conn = get_db()
@@ -452,10 +471,10 @@ __all__ = [
     'DB_FILE',
     # Instances (low-level)
     'get_instance',
-    'get_all_instances',
     'save_instance',
     'update_instance',
     'find_instance_by_session',
+    'get_instance_by_mapid',
     'delete_instance',
     # Instances (high-level queries)
     'iter_instances',

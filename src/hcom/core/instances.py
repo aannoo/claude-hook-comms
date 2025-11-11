@@ -45,6 +45,7 @@ def save_instance_position(instance_name: str, data: dict[str, Any]) -> bool:
         defaults = {
             "name": instance_name,
             "session_id": None,
+            "mapid": "",
             "parent_session_id": None,
             "parent_name": None,
             "created_at": time.time(),
@@ -81,15 +82,6 @@ def save_instance_position(instance_name: str, data: dict[str, Any]) -> bool:
             complete_data[bool_field] = int(complete_data[bool_field])
 
     return save_instance(instance_name, complete_data)
-
-def load_all_positions() -> dict[str, dict[str, Any]]:
-    """Load all instance positions (DB wrapper)
-
-    DEPRECATED: Use iter_instances() for efficiency.
-    Returns giant dict for backwards compat, but prefer generator.
-    """
-    from .db import get_all_instances
-    return get_all_instances()
 
 def update_instance_position(instance_name: str, update_fields: dict[str, Any]) -> None:
     """Update instance position atomically (DB wrapper)
@@ -165,10 +157,11 @@ def in_subagent_context(instance_data: dict[str, Any] | None) -> bool:
 
 # ==================== Status Functions ====================
 
-def get_instance_status(pos_data: dict[str, Any]) -> tuple[bool, str, str, str]:
-    """Get current status of instance. Returns (enabled, status, age_string, description).
+def get_instance_status(pos_data: dict[str, Any]) -> tuple[bool, str, str, str, int]:
+    """Get current status of instance. Returns (enabled, status, age_string, description, age_seconds).
 
     age_string format: "16m" (clean format, no parens/suffix - consumers handle display)
+    age_seconds: raw integer seconds for programmatic filtering
 
     Status is activity state (what instance is doing).
     Enabled is participation flag (whether instance can send/receive HCOM).
@@ -217,7 +210,7 @@ def get_instance_status(pos_data: dict[str, Any]) -> tuple[bool, str, str, str]:
     # Build description from status and context
     description = get_status_description(status, status_context)
 
-    return (enabled, status, format_age(age), description)
+    return (enabled, status, format_age(age), description, age)
 
 
 def get_status_description(status: str, context: str = '') -> str:
@@ -385,7 +378,7 @@ def resolve_instance_name(session_id: str, tag: str | None = None) -> tuple[str,
 
     raise RuntimeError(f"Cannot generate unique name for session after {max_retries} attempts")
 
-def initialize_instance_in_position_file(instance_name: str, session_id: str | None = None, parent_session_id: str | None = None, enabled: bool | None = None, parent_name: str | None = None) -> bool:
+def initialize_instance_in_position_file(instance_name: str, session_id: str | None = None, parent_session_id: str | None = None, enabled: bool | None = None, parent_name: str | None = None, mapid: str | None = None) -> bool:
     """Initialize instance in DB with required fields (idempotent). Returns True on success, False on failure."""
     from .db import get_instance, save_instance, get_last_event_id
     import sqlite3
@@ -403,6 +396,8 @@ def initialize_instance_in_position_file(instance_name: str, session_id: str | N
             if enabled is not None:
                 updates['enabled'] = int(enabled)
                 updates['previously_enabled'] = int(enabled)
+            if mapid is not None:
+                updates['mapid'] = mapid
             if updates:
                 from .db import update_instance
                 update_instance(instance_name, updates)
@@ -437,6 +432,7 @@ def initialize_instance_in_position_file(instance_name: str, session_id: str | N
             "last_stop": 0,
             "created_at": time.time(),
             "session_id": session_id if session_id else None,  # NULL not empty string
+            "mapid": mapid or "",
             "transcript_path": "",
             "notification_message": "",
             "alias_announced": 0,
@@ -452,7 +448,28 @@ def initialize_instance_in_position_file(instance_name: str, session_id: str | N
             data["parent_name"] = parent_name
 
         try:
-            return save_instance(instance_name, data)
+            success = save_instance(instance_name, data)
+
+            # Log creation event (only for HCOM participants)
+            if success and default_enabled:
+                try:
+                    from .db import log_event
+
+                    # Determine who launched this instance
+                    launcher = os.environ.get('HCOM_LAUNCHED_BY', 'unknown')
+
+                    log_event('life', instance_name, {
+                        'action': 'created',
+                        'by': launcher,
+                        'enabled': default_enabled,
+                        'is_hcom_launched': is_hcom_launched,
+                        'is_subagent': bool(parent_session_id),
+                        'parent_name': parent_name or ''
+                    })
+                except Exception:
+                    pass  # Don't break creation if logging fails
+
+            return success
         except sqlite3.IntegrityError:
             # UNIQUE constraint violation (race condition - another thread created same name)
             # This is expected and safe - just return success (instance exists)
@@ -460,17 +477,31 @@ def initialize_instance_in_position_file(instance_name: str, session_id: str | N
     except Exception:
         return False
 
-def enable_instance(instance_name: str) -> None:
-    """Enable instance - enables Stop hook polling"""
+def enable_instance(instance_name: str, initiated_by: str = 'unknown', reason: str = '') -> None:
+    """Enable instance
+    Args:
+        instance_name: Instance to enable
+        initiated_by: Who initiated (from resolve_identity())
+        reason: Context (e.g., 'manual', 'resume', 'launch')
+    """
     update_instance_position(instance_name, {
         'enabled': True,
         'previously_enabled': True
     })
+    # Log all enable operations
+    try:
+        from .db import log_event
+        log_event('life', instance_name, {
+            'action': 'started',
+            'by': initiated_by,
+            'reason': reason
+        })
+    except Exception:
+        pass  # Don't break enable if logging fails
 
 __all__ = [
     'load_instance_position',
     'save_instance_position',
-    'load_all_positions',
     'update_instance_position',
     'is_parent_instance',
     'is_subagent_instance',

@@ -3,18 +3,19 @@ import os
 import sys
 import time
 import random
-from .utils import CLIError, format_error, is_interactive
-from ..shared import FG_YELLOW, RESET
+import uuid
+from .utils import CLIError, format_error, is_interactive, resolve_identity
+from ..shared import FG_YELLOW, RESET, IS_WINDOWS
 from ..claude_args import resolve_claude_args, merge_claude_args, add_background_defaults, validate_conflicts
 from ..core.config import get_config
 from ..core.paths import hcom_path
 from ..core.instances import (
     load_instance_position,
     update_instance_position,
-    load_all_positions,
     is_subagent_instance,
     in_subagent_context,
 )
+from ..core.db import iter_instances
 from ..core.runtime import build_claude_env
 from ..hooks.utils import disable_instance
 
@@ -120,13 +121,20 @@ def cmd_launch(argv: list[str]) -> int:
                 instance_type = agent
                 instance_env = base_env.copy()
 
-                # Mark all hcom-launched instances with timestamp and event ID
+                # Generate unique launch token for Windows identity
+                launch_token = str(uuid.uuid4())
+                instance_env['HCOM_LAUNCH_TOKEN'] = launch_token
+
+                # Mark all hcom-launched instances with event ID
                 instance_env['HCOM_LAUNCHED'] = '1'
-                instance_env['HCOM_LAUNCH_TIME'] = str(time.time())
 
                 # Capture launch event ID for consistent message history start
                 from ..core.db import get_last_event_id
                 instance_env['HCOM_LAUNCH_EVENT_ID'] = str(get_last_event_id())
+
+                # Track who launched this instance
+                launcher = resolve_identity()
+                instance_env['HCOM_LAUNCHED_BY'] = launcher
 
                 # Mark background instances via environment with log filename
                 if background:
@@ -145,8 +153,6 @@ def cmd_launch(argv: list[str]) -> int:
                     # Agent instance
                     try:
                         agent_content, agent_config = resolve_agent(instance_type)
-                        # Mark this as a subagent instance for SessionStart hook
-                        instance_env['HCOM_SUBAGENT_TYPE'] = instance_type
                         # Prepend agent instance awareness to system prompt
                         agent_prefix = f"You are an instance of {instance_type}. Do not start a subagent with {instance_type} unless explicitly asked.\n\n"
                         agent_content = agent_prefix + agent_content
@@ -189,6 +195,24 @@ def cmd_launch(argv: list[str]) -> int:
         else:
             print(f"Launched {launched} Claude instance{'s' if launched != 1 else ''}")
 
+        # Log launch event
+        if launched > 0:
+            try:
+                from ..core.db import log_event
+                launcher = resolve_identity()
+                log_event('life', launcher, {
+                    'action': 'launched',
+                    'by': launcher,
+                    'count_requested': count,
+                    'agents': agents,
+                    'launched': launched,
+                    'failed': failed,
+                    'background': background,
+                    'tag': tag or ''
+                })
+            except Exception:
+                pass  # Don't break launch if logging fails
+
         # Auto-launch watch dashboard if in new window mode (new or custom) and all instances launched successfully
         terminal_mode = get_config().terminal
 
@@ -227,37 +251,30 @@ def cmd_launch(argv: list[str]) -> int:
 
 def cmd_stop(argv: list[str]) -> int:
     """Stop instances: hcom stop [alias|all]"""
-    # Import identity helpers from core
-    from ..core.instances import resolve_instance_name
     from .admin import should_show_in_watch
-
-    # Parse arguments
-    target = None
-
-    # Read session ID from env var (set by SessionStart hook)
-    session_id = os.environ.get('HCOM_SESSION_ID')
 
     # Remove flags to get target
     args_without_flags = [a for a in argv if not a.startswith('--')]
-    if args_without_flags:
-        target = args_without_flags[0]
+    target = args_without_flags[0] if args_without_flags else None
 
     # Handle 'all' target
     if target == 'all':
-        positions = load_all_positions()
+        instances = list(iter_instances())
 
-        if not positions:
+        if not instances:
             print("No instances found")
             return 0
 
         stopped_count = 0
         bg_logs = []
         stopped_names = []
-        for instance_name, instance_data in positions.items():
+        for instance_data in instances:
             if instance_data.get('enabled', False):
+                instance_name = instance_data['name']
                 # Set external stop flag (stop all is always external)
                 update_instance_position(instance_name, {'external_stop_pending': True})
-                disable_instance(instance_name)
+                launcher = resolve_identity()
+                disable_instance(instance_name, initiated_by=launcher, reason='stop_all')
                 stopped_names.append(instance_name)
                 stopped_count += 1
 
@@ -281,30 +298,31 @@ def cmd_stop(argv: list[str]) -> int:
 
         return 0
 
-    # Stop specific instance or self
-    # Get instance name from injected session or target
-    if session_id and not target:
-        instance_name, _ = resolve_instance_name(session_id, get_config().tag)
-    else:
+    # Resolve identity (target overrides automatic resolution)
+    if target:
         instance_name = target
+    else:
+        try:
+            instance_name = resolve_identity()
+        except ValueError:
+            instance_name = None
 
-    position = load_instance_position(instance_name) if instance_name else None
-
-    if not instance_name:
-        if os.environ.get('CLAUDECODE') == '1':
-            print("Error: Cannot determine instance", file=sys.stderr)
-            print("Usage: Prompt Claude to run 'hcom stop' (or directly use: hcom stop <alias> or hcom stop all)", file=sys.stderr)
+    # Handle CLAUDE_SENDER or SENDER (not real instances, but cake is real. spongecake.)
+    from ..shared import SENDER, CLAUDE_SENDER
+    if instance_name in (CLAUDE_SENDER, SENDER):
+        if IS_WINDOWS:
+            print(format_error("Use 'hcom <n>' or Windows Terminal for stable identity"), file=sys.stderr)
         else:
-            print("Error: Alias required", file=sys.stderr)
-            print("Usage: hcom stop <alias>", file=sys.stderr)
-            print("   Or: hcom stop all", file=sys.stderr)
-            print("   Or: prompt claude to run 'hcom stop' on itself", file=sys.stderr)
-            positions = load_all_positions()
-            visible = [alias for alias, data in positions.items() if should_show_in_watch(data)]
-            if visible:
-                print(f"Active aliases: {', '.join(sorted(visible))}", file=sys.stderr)
+            print(format_error("Launch via 'hcom <n>' for stable identity"), file=sys.stderr)
         return 1
 
+    # Error handling
+    if not instance_name:
+        print(format_error("Cannot determine instance identity"), file=sys.stderr)
+        print("Usage: hcom stop <alias> | hcom stop all | prompt Claude to run 'hcom stop'", file=sys.stderr)
+        return 1
+
+    position = load_instance_position(instance_name)
     if not position:
         print(format_error(f"Instance '{instance_name}' not found"), file=sys.stderr)
         return 1
@@ -317,14 +335,15 @@ def cmd_stop(argv: list[str]) -> int:
     # Check if this is a subagent - disable all siblings
     if is_subagent_instance(position):
         parent_session_id = position.get('parent_session_id')
-        positions = load_all_positions()
         disabled_count = 0
         disabled_names = []
 
-        for name, data in positions.items():
+        for data in iter_instances():
             if data.get('parent_session_id') == parent_session_id and data.get('enabled', False):
+                name = data['name']
                 update_instance_position(name, {'external_stop_pending': True})
-                disable_instance(name)
+                launcher = resolve_identity()
+                disable_instance(name, initiated_by=launcher, reason='subagent_group')
                 disabled_count += 1
                 disabled_names.append(name)
 
@@ -342,7 +361,9 @@ def cmd_stop(argv: list[str]) -> int:
             # Set flag to notify instance via PostToolUse
             update_instance_position(instance_name, {'external_stop_pending': True})
 
-        disable_instance(instance_name)
+        launcher = resolve_identity()
+        reason = 'external' if is_external_stop else 'manual'
+        disable_instance(instance_name, initiated_by=launcher, reason=reason)
         print(f"Stopped HCOM for {instance_name}. Will no longer receive chat messages automatically.")
 
     # Show background log location if applicable
@@ -357,128 +378,102 @@ def cmd_stop(argv: list[str]) -> int:
 
 def cmd_start(argv: list[str]) -> int:
     """Enable HCOM participation: hcom start [alias]"""
-    # Import identity helpers from core
-    from ..core.instances import resolve_instance_name, initialize_instance_in_position_file, enable_instance, set_status
-
-    # Parse arguments
-    target = None
-
-    # Read session ID from env var (set by SessionStart hook)
-    session_id = os.environ.get('HCOM_SESSION_ID')
+    from ..core.instances import initialize_instance_in_position_file, enable_instance, set_status
 
     # Extract --_hcom_sender if present (for subagents)
-    sender_override = None
+    subagent_id = None
     if '--_hcom_sender' in argv:
         idx = argv.index('--_hcom_sender')
         if idx + 1 < len(argv):
-            sender_override = argv[idx + 1]
+            subagent_id = argv[idx + 1]
             argv = argv[:idx] + argv[idx + 2:]
 
-    # Remove flags to get target
-    args_without_flags = [a for a in argv if not a.startswith('--')]
-    if args_without_flags:
-        target = args_without_flags[0]
-
     # SUBAGENT PATH: --_hcom_sender provided
-    if sender_override:
-        instance_data = load_instance_position(sender_override)
+    if subagent_id:
+        instance_data = load_instance_position(subagent_id)
         if not instance_data or instance_data.get('status') == 'exited':
-            print(f"Error: Instance '{sender_override}' not found or has exited", file=sys.stderr)
+            print(f"Error: Instance '{subagent_id}' not found or has exited", file=sys.stderr)
             return 1
 
         already = 'already ' if instance_data.get('enabled', False) else ''
-        enable_instance(sender_override)
-        set_status(sender_override, 'active', 'start')
-        print(f"HCOM {already} started for {sender_override}")
-        print(f"Send: hcom send 'message' --_hcom_sender {sender_override}")
-        print(f"When finished working always run: hcom done --_hcom_sender {sender_override}")
+        launcher = resolve_identity()
+        enable_instance(subagent_id, initiated_by=launcher, reason='manual')
+        set_status(subagent_id, 'active', 'start')
+        print(f"HCOM {already} started for {subagent_id}")
+        print(f"Send: hcom send 'message' --_hcom_sender {subagent_id}")
+        print(f"When finished working always run: hcom done --_hcom_sender {subagent_id}")
         return 0
 
-    # Get instance name from injected session or target
-    if session_id and not target:
-        instance_name, existing_data = resolve_instance_name(session_id, get_config().tag)
+    # Remove flags to get target
+    args_without_flags = [a for a in argv if not a.startswith('--')]
+    target = args_without_flags[0] if args_without_flags else None
 
-        # Check for Task ambiguity (parent frozen, subagent calling)
-        if existing_data and in_subagent_context(existing_data):
-            # Get list of subagents from THIS Task execution that are disabled
-            active_list = existing_data.get('current_subagents', [])
-            positions = load_all_positions()
-            subagent_ids = [
-                sid for sid in active_list
-                if sid in positions and not positions[sid].get('enabled', False)
-            ]
+    # Resolve identity (target overrides automatic resolution)
+    if target:
+        instance_name = target
+    else:
+        try:
+            instance_name = resolve_identity()
+        except ValueError:
+            instance_name = None
 
-            print("Task tool running - you must provide an alias", file=sys.stderr)
-            print("Use: hcom start --_hcom_sender {alias}", file=sys.stderr)
-            if subagent_ids:
-                print(f"Choose from one of these valid aliases: {', '.join(subagent_ids)}", file=sys.stderr)
-            return 1
-
-        # Create instance if it doesn't exist (opt-in for vanilla instances)
-        if not existing_data:
-            initialize_instance_in_position_file(instance_name, session_id)
-            # Enable instance (clears all stop flags)
-            enable_instance(instance_name)
-            print(f"\nStarted HCOM for {instance_name}")
+    # Handle CLAUDE_SENDER or SENDER (not real instances)
+    from ..shared import SENDER, CLAUDE_SENDER
+    if instance_name in (CLAUDE_SENDER, SENDER):
+        if IS_WINDOWS:
+            print(format_error("Use 'hcom <n>' or Windows Terminal for stable identity"), file=sys.stderr)
         else:
-            # Skip already started instances
-            if existing_data.get('enabled', False):
-                print(f"HCOM already started for {instance_name}")
-                return 0
+            print(format_error("Launch via 'hcom <n>' for stable identity"), file=sys.stderr)
+        return 1
 
-            # Check if background instance has exited permanently
-            if existing_data.get('session_ended') and existing_data.get('background'):
-                session = existing_data.get('session_id', '')
-                print(f"Cannot start {instance_name}: headless instance has exited permanently", file=sys.stderr)
-                print(f"Headless instances terminate when stopped and cannot be restarted", file=sys.stderr)
-                if session:
-                    print(f"Resume conversation with same alias: hcom 1 claude -p --resume {session}", file=sys.stderr)
-                return 1
+    # Error handling
+    if not instance_name:
+        print(format_error("Cannot determine instance identity"), file=sys.stderr)
+        print("Usage: hcom start <alias> | prompt Claude to run 'hcom start' | use 'hcom <count>' to launch", file=sys.stderr)
+        return 1
 
-            # Re-enabling existing instance
-            enable_instance(instance_name)
-            print(f"Started HCOM for {instance_name}")
+    # Load or create instance
+    existing_data = load_instance_position(instance_name)
 
+    # Check for Task ambiguity (parent frozen, subagent calling)
+    if existing_data and not target and in_subagent_context(existing_data):
+        active_list = existing_data.get('current_subagents', [])
+        subagent_ids = [
+            data['name'] for data in iter_instances()
+            if data['name'] in active_list and not data.get('enabled', False)
+        ]
+
+        print("Task tool running - you must provide an alias", file=sys.stderr)
+        print("Use: hcom start --_hcom_sender {alias}", file=sys.stderr)
+        if subagent_ids:
+            print(f"Choose from one of these valid aliases: {', '.join(subagent_ids)}", file=sys.stderr)
+        return 1
+
+    # Create instance if it doesn't exist (opt-in for vanilla instances)
+    if not existing_data:
+        session_id = os.environ.get('HCOM_SESSION_ID')
+        initialize_instance_in_position_file(instance_name, session_id)
+        launcher = resolve_identity()
+        enable_instance(instance_name, initiated_by=launcher, reason='manual')
+        print(f"\nStarted HCOM for {instance_name}")
         return 0
-
-    # CLI path: start specific instance
-    positions = load_all_positions()
-
-    # Handle missing target from external CLI
-    if not target:
-        if os.environ.get('CLAUDECODE') == '1':
-            print("Error: Cannot determine instance", file=sys.stderr)
-            print("Usage: Prompt Claude to run 'hcom start' (or: hcom start <alias>)", file=sys.stderr)
-        else:
-            print("Error: Alias required", file=sys.stderr)
-            print("Usage: hcom start <alias> (or: prompt claude to run 'hcom start')", file=sys.stderr)
-            print("To launch new instances: hcom <count>", file=sys.stderr)
-        return 1
-
-    # Start specific instance
-    instance_name = target
-    position = positions.get(instance_name)
-
-    if not position:
-        print(f"Instance not found: {instance_name}")
-        return 1
 
     # Skip already started instances
-    if position.get('enabled', False):
+    if existing_data.get('enabled', False):
         print(f"HCOM already started for {instance_name}")
         return 0
 
     # Check if background instance has exited permanently
-    if position.get('session_ended') and position.get('background'):
-        session = position.get('session_id', '')
-        print(f"Cannot start {instance_name}: headless instance has exited permanently")
-        print(f"Headless instances terminate when stopped and cannot be restarted")
+    if existing_data.get('session_ended') and existing_data.get('background'):
+        session = existing_data.get('session_id', '')
+        print(f"Cannot start {instance_name}: headless instance has exited permanently", file=sys.stderr)
+        print(f"Headless instances terminate when stopped and cannot be restarted", file=sys.stderr)
         if session:
-            print(f"Resume conversation with same alias: hcom 1 claude -p --resume {session}")
+            print(f"Resume conversation with same alias: hcom 1 claude -p --resume {session}", file=sys.stderr)
         return 1
 
-    # Enable instance (clears all stop flags)
-    enable_instance(instance_name)
-
+    # Re-enabling existing instance
+    launcher = resolve_identity()
+    enable_instance(instance_name, initiated_by=launcher, reason='manual')
     print(f"Started HCOM for {instance_name}")
     return 0
