@@ -9,7 +9,7 @@ import re
 from ..core.paths import ensure_hcom_directories
 from ..core.instances import load_instance_position, in_subagent_context, get_display_name
 from ..core.config import get_config
-from ..core.db import get_instance, find_instance_by_session
+from ..core.db import get_instance, find_instance_by_session, get_db
 from .handlers import (
     handle_pretooluse, handle_posttooluse, handle_stop,
     handle_subagent_stop, handle_userpromptsubmit,
@@ -59,6 +59,9 @@ def handle_hook(hook_type: str) -> None:
         log_hook_error('handle_hook', Exception('Failed to create directories'))
         sys.exit(0)
 
+    # Ensure database connection (runs schema/migrations on first use)
+    get_db()
+
     # SessionStart is standalone - no instance files
     if hook_type == 'sessionstart':
         handle_sessionstart(hook_data)
@@ -76,11 +79,6 @@ def handle_hook(hook_type: str) -> None:
     if hook_type != 'pre':
         instance_data = load_instance_position(instance_name)
 
-        # Clean up current_subagents if set (regardless of enabled state)
-        # Skip for PostToolUse - let handle_posttooluse deliver messages first, then cleanup
-        # Only run for parent instances (subagents don't manage current_subagents)
-        # NOW: LET HOOKS HANDLE THIS
-
         # Skip enabled check for UserPromptSubmit when bootstrap needs to be shown
         # (alias_announced=false means bootstrap hasn't been shown yet)
         # Skip enabled check for PostToolUse when launch context needs to be shown
@@ -89,7 +87,7 @@ def handle_hook(hook_type: str) -> None:
         skip_enabled_check = (
             (hook_type == 'userpromptsubmit' and not instance_data.get('alias_announced', False)) or
             (hook_type == 'post' and not instance_data.get('launch_context_announced', False)) or
-            (hook_type == 'post' and in_subagent_context(instance_data)) or
+            (hook_type == 'post' and in_subagent_context(instance_name)) or
             (hook_type == 'subagent-stop')
         )
 

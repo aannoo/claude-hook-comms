@@ -106,7 +106,6 @@ __all__ = [
     'ensure_hcom_directories',
     'atomic_write',
     'read_file_with_retry',
-    'locked',
     # Path constants
     'LOGS_DIR',
     'SCRIPTS_DIR',

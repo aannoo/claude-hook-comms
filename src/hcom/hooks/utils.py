@@ -10,7 +10,7 @@ import shlex
 import re
 
 from ..shared import SENDER
-from ..core.paths import hcom_path, LOGS_DIR, FLAGS_DIR
+from ..core.paths import hcom_path, LOGS_DIR
 from ..core.config import get_config
 from ..core.instances import load_instance_position, update_instance_position
 from ..core.messages import format_hook_messages
@@ -156,11 +156,14 @@ def init_hook_context(hook_data: dict[str, Any], hook_type: str | None = None) -
     if not existing_data:
         initialize_instance_in_position_file(instance_name, session_id=session_id, mapid=MAPID)
 
-    # Build updates dict (CRITICAL: dispatcher relies on these fields)
+    # Build updates dict (CRITICAL: dispatcher relies on these fields (does it?))
     updates: dict[str, Any] = {
         'directory': str(Path.cwd()),
-        'tag': tag,
     }
+
+    # Set tag only at creation (prevents tag field drifting from name prefix)
+    if not existing_data and tag:
+        updates['tag'] = tag
 
     # Update session_id (may have changed on resume)
     if session_id:
@@ -192,7 +195,8 @@ def is_safe_hcom_command(command: str) -> bool:
   for permission (one prompt).
 
     Security model:
-    - Blocks all command/variable injection: `, $, (, )
+    - Blocks command/variable injection: ` (everywhere), $VAR/${VAR}/$(cmd) (dangerous $), () (outside quotes only)
+    - Allows harmless $: $.field (JSONPath), $5 (digits), $! (special chars)
     - ALL segments must be hcom commands (pure hcom-only)
     - Only /dev/null redirects allowed (no file writes)
     - Operators inside quotes treated as message text (safe)
@@ -200,15 +204,25 @@ def is_safe_hcom_command(command: str) -> bool:
     """
     from ..shared import HCOM_COMMAND_PATTERN
 
-    # Block dangerous characters (command substitution, variable expansion)
-    if any(c in command for c in ['`', '$', '(', ')']):
+    # Block backticks everywhere (command substitution)
+    if '`' in command:
+        return False
+
+    # Block dangerous $ patterns (allow harmless ones like JSONPath '$.field')
+    # Shell expands: $VAR, ${VAR}, $(cmd) but NOT $.field (. terminates expansion)
+    # Check for actual variable expansion or command substitution
+    if re.search(r'\$(?:[a-zA-Z_][a-zA-Z0-9_]*|\{|\()', command):
         return False
 
     cmd = command.strip()
 
-    # Remove quoted strings to check for operators/redirects outside quotes
-    # This prevents "message with && inside" from being treated as operator
+    # Remove quoted strings to check for operators/redirects/parens outside quotes
+    # This prevents "message with && inside" or "SQL with ()" from being treated as unsafe
     cmd_no_quotes = re.sub(r'''(['"])(?:(?=(\\?))\2.)*?\1''', '', cmd)
+
+    # Block command substitution parens (only outside quotes - inside quotes they're inert)
+    if any(c in cmd_no_quotes for c in ['(', ')']):
+        return False
 
     # Block output redirects to files (only allow /dev/null)
     if re.search(r'>\s*(?!&|/dev/null\b)\S+', cmd_no_quotes):

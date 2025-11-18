@@ -243,11 +243,19 @@ class HcomTUI:
             self.save_launch_state()
             return 0
         except Exception as e:
-            sys.stderr.write(f"Error: {e}\n")
+            # Restore terminal BEFORE writing error (so it's visible)
+            sys.stdout.write('\033[?1049l')  # Exit alternate screen
+            sys.stdout.write('\033[?25h')     # Show cursor
+            sys.stdout.flush()
+            # Now write error with traceback
+            import traceback
+            sys.stderr.write(f"\nError: {e}\n")
+            traceback.print_exc()
             return 1
         finally:
-            # Exit alternate screen
+            # Ensure terminal restored (idempotent)
             sys.stdout.write('\033[?1049l')
+            sys.stdout.write('\033[?25h')
             sys.stdout.flush()
 
     def load_status(self):
@@ -285,22 +293,23 @@ class HcomTUI:
             claude_args_str = self.state.config_edit.get('HCOM_CLAUDE_ARGS', '')
             spec = resolve_claude_args(None, claude_args_str if claude_args_str else None)
 
-            # System flag matches background mode
-            system_flag = None
-            system_value = None
-            if self.state.launch_system_prompt:
-                system_flag = "--system-prompt" if self.state.launch_background else "--append-system-prompt"
-                system_value = self.state.launch_system_prompt
-            else:
-                system_value = ""
-
-            # Update spec with form values
+            # Update spec with background and prompt
             spec = spec.update(
                 background=self.state.launch_background,
-                system_flag=system_flag,
-                system_value=system_value,
                 prompt=self.state.launch_prompt,  # Always pass value (empty string deletes)
             )
+
+            # Build tokens manually to support both system prompt types
+            tokens = list(spec.clean_tokens)
+
+            # Add system prompts if present
+            if self.state.launch_system_prompt:
+                tokens.extend(['--system-prompt', self.state.launch_system_prompt])
+            if self.state.launch_append_system_prompt:
+                tokens.extend(['--append-system-prompt', self.state.launch_append_system_prompt])
+
+            # Re-parse to get proper spec
+            spec = resolve_claude_args(tokens, None)
 
             # Persist to in-memory edits
             self.state.config_edit['HCOM_CLAUDE_ARGS'] = spec.to_env_string()
@@ -327,17 +336,14 @@ class HcomTUI:
             self.state.launch_background = spec.is_background
             self.state.launch_prompt = spec.positional_tokens[0] if spec.positional_tokens else ""
 
-            # Extract system prompt (prefer user_system, fallback to user_append)
-            if spec.user_system:
-                self.state.launch_system_prompt = spec.user_system
-            elif spec.user_append:
-                self.state.launch_system_prompt = spec.user_append
-            else:
-                self.state.launch_system_prompt = ""
+            # Extract both system prompt types
+            self.state.launch_system_prompt = spec.user_system or ""
+            self.state.launch_append_system_prompt = spec.user_append or ""
 
             # Initialize cursors to end of text for first-time navigation
             self.state.launch_prompt_cursor = len(self.state.launch_prompt)
             self.state.launch_system_prompt_cursor = len(self.state.launch_system_prompt)
+            self.state.launch_append_system_prompt_cursor = len(self.state.launch_append_system_prompt)
         except Exception as e:
             # Failed to parse - use defaults and log warning
             sys.stderr.write(f"Warning: Failed to load launch state (using defaults): {e}\n")
@@ -557,7 +563,15 @@ class HcomTUI:
                     new_messages = []
                     for e in events:
                         event_data = e['data']  # Already a dict from db.py
-                        new_messages.append((e['timestamp'], event_data.get('from', ''), event_data.get('text', '')))
+                        # Include recipients and event_id for read receipt tracking
+                        recipients = event_data.get('recipients', [])
+                        new_messages.append((
+                            e['timestamp'],
+                            event_data.get('from', ''),
+                            event_data.get('text', ''),
+                            recipients,
+                            e['id']  # event_id for read receipt lookup
+                        ))
 
                     # Append new messages and keep last N
                     all_messages = list(self.state.messages) + new_messages
@@ -744,7 +758,7 @@ class HcomTUI:
             self.flash("Launch Instances")
         elif self.mode == Mode.LAUNCH:
             # Go directly to native log view instead of LOG mode
-            self.flash("Message History")
+            self.flash(f"Event History {RESET}{FG_ORANGE}- type to filter")
             self.show_log_native()
             # After returning from native view, go to MANAGE
             self.mode = Mode.MANAGE
@@ -792,137 +806,349 @@ class HcomTUI:
         sys.stdout.write(status)
         sys.stdout.flush()
 
+    def sanitize_filter_input(self, text: str) -> str:
+        """Remove dangerous chars, limit length for filter input"""
+        # Strip control chars except printable
+        cleaned = ''.join(c for c in text if c.isprintable() or c in ' \t')
+        # Truncate to prevent paste bombs
+        return cleaned[:200]
+
+    def matches_filter(self, event: dict, query: str) -> bool:
+        """Check if event matches query (multi-word AND). May raise KeyError/TypeError."""
+        if not query or not query.strip():
+            return True  # Empty query = show all
+
+        # Split query into words (AND logic)
+        words = [w.casefold() for w in query.split()]
+
+        # Build searchable string from all event fields
+        data = event.get('data', '')
+        if isinstance(data, dict):
+            # Extract values from dict for better searchability
+            data_str = ' '.join(str(v) for v in data.values())
+        elif isinstance(data, str):
+            data_str = data
+        else:
+            data_str = str(data)
+
+        searchable = (
+            event.get('type', '') + ' ' +
+            event.get('instance', '') + ' ' +
+            data_str
+        ).casefold()
+
+        # All words must match (AND)
+        return all(word in searchable for word in words)
+
+    def matches_filter_safe(self, event: dict, query: str) -> bool:
+        """Match event against query with error boundary"""
+        try:
+            return self.matches_filter(event, query)
+        except (KeyError, TypeError, AttributeError, UnicodeDecodeError) as e:
+            # Malformed event or encoding issue - treat as non-match
+            import sys
+            print(f"DEBUG: Event {event.get('id', '?')} match failed: {e}", file=sys.stderr)
+            return False
+
+    def render_event(self, event: dict):
+        """Render event by type with defensive defaults"""
+        event_type = event.get('type', 'unknown')
+        timestamp = event.get('timestamp', '')
+        instance = event.get('instance', '?')
+        data = event.get('data', {})
+
+        if event_type == 'message':
+            # Reuse existing render_log_message
+            msg = {
+                'timestamp': timestamp,
+                'from': data.get('from', '?'),
+                'message': data.get('text', '')
+            }
+            self.render_log_message(msg)
+
+        elif event_type == 'status':
+            # status: {status: "active", context: "Bash"}
+            status = data.get('status', '?')
+            context = data.get('context', '')
+            ctx = f" {context}" if context else ""
+            print(f"{FG_GRAY}{format_timestamp(timestamp)}{RESET} "
+                  f"{FG_CYAN}{instance}{RESET}: {status}{ctx}")
+            print()  # Empty line between events
+
+        elif event_type == 'life':
+            # life: {action: "created|started|stopped|exited"}
+            action = data.get('action', '?')
+            print(f"{FG_GRAY}{format_timestamp(timestamp)}{RESET} "
+                  f"{FG_YELLOW}{instance}{RESET}: {action}")
+            print()  # Empty line between events
+
+        else:
+            # Unknown type - generic fallback
+            print(f"{FG_GRAY}{format_timestamp(timestamp)}{RESET} "
+                  f"{instance} [{event_type}]: {data}")
+            print()  # Empty line between events
+
+    def render_event_safe(self, event: dict):
+        """Render event with fallback for malformed data"""
+        try:
+            self.render_event(event)
+        except Exception as e:
+            # Complete rendering failure - show minimal fallback
+            event_id = event.get('id', '?')
+            print(f"{FG_GRAY}[malformed event {event_id}]{RESET}")
+            print()
+            import sys
+            print(f"DEBUG: Render failed for event {event_id}: {e}", file=sys.stderr)
+
     def show_log_native(self):
-        """Exit TUI, show streaming log in native buffer with status line"""
+        """Exit TUI, show streaming log in native buffer with filtering support"""
+        # Clear filter on entry (fresh start each time)
+        self.state.log_filter = ""
+        self.state.log_filter_cursor = 0
+
         # Exit alt screen
         sys.stdout.write('\033[?1049l' + SHOW_CURSOR)
         sys.stdout.flush()
 
         def redraw_all():
-            """Redraw entire log and status (on entry or resize)"""
-            from ..core.db import get_events_since
-            import json
+            """Redraw entire log with filtering (on entry or resize)"""
+            from ..core.db import get_events_since, get_last_event_id
 
             # Clear screen
             sys.stdout.write('\033[2J\033[H')
             sys.stdout.flush()
 
-            # Dump existing log with formatting
-            has_messages = False
+            # Determine event type to load (None = all types)
+            event_type = None if self.state.log_event_type == "all" else self.state.log_event_type
+
+            # Load events with error boundary
+            has_events = False
+            matched_count = 0
+            total_count = 0
+            rendered_lines = 0  # Track lines rendered for padding calculation
             try:
-                events = get_events_since(0, event_type='message')
-                has_messages = bool(events)
+                events = get_events_since(0, event_type=event_type)
+                total_count = len(events)
+                has_events = bool(events)
+
                 if events:
+                    # Filter and render all matching events
                     for event in events:
-                        event_data = event['data']  # Already a dict from db.py
-                        msg = {
-                            'timestamp': event['timestamp'],
-                            'from': event_data.get('from', ''),
-                            'message': event_data.get('text', '')
-                        }
-                        self.render_log_message(msg)
+                        if self.matches_filter_safe(event, self.state.log_filter):
+                            self.render_event_safe(event)
+                            matched_count += 1
+
+                    # Show message if no matches when filtering
+                    if matched_count == 0 and self.state.log_filter.strip():
+                        print(f"{FG_GRAY}(no matching events){RESET}")
+                        print()
+                else:
+                    # Add spacing even when no events
+                    print()
             except Exception as e:
-                # Show error message instead of silent pass
-                print(f"{FG_RED}Failed to load messages: {e}{RESET}")
+                print(f"{FG_RED}Failed to load events: {e}{RESET}")
                 print()
 
-            # Separator and status
-            if has_messages:
-                self.render_status_with_separator("LOG")
+            # Extra blank line before status rows for visual separation
+            print()
+
+            # Position cursor at bottom for filter/status rows (row = height - 2)
+            cols, rows = get_terminal_size()
+            target_row = rows - 1  # 0-indexed, so rows-1 is second-to-last row
+            sys.stdout.write(f'\033[{target_row};1H')  # Move to target row, column 1
+            sys.stdout.flush()
+
+            # Render bottom rows (filter + status or separator + status)
+            filter_active = bool(self.state.log_filter.strip())
+
+            if filter_active:
+                # Filter row: "Filter: query_    [matched/total]"
+                filter_prefix = "Filter: "
+                available = cols - len(filter_prefix) - 20  # Reserve space for count
+                filter_text = self.state.log_filter[:available] if len(self.state.log_filter) > available else self.state.log_filter
+                cursor_display = "_" if self.state.log_filter_cursor == len(self.state.log_filter) else ""
+                filter_display = filter_text[:self.state.log_filter_cursor] + cursor_display + filter_text[self.state.log_filter_cursor:]
+                count_str = f" [{matched_count}/{total_count}]"
+                filter_line = f"{filter_prefix}{filter_display}{count_str}"
+                print(truncate_ansi(filter_line, cols))
             else:
-                # No messages - show placeholder
-                self.render_status_with_separator("LOG")
-                print()
-                print(f"{FG_GRAY}No messages - Tab to LAUNCH to create instances{RESET}")
+                # Separator or flash line (when not filtering)
+                flash = self.build_flash()
+                if flash:
+                    flash_len = ansi_len(flash)
+                    remaining = cols - flash_len - 1
+                    separator = f"{FG_GRAY}{'─' * remaining}{RESET}" if remaining > 0 else ""
+                    print(f"{flash} {separator}")
+                else:
+                    print(f"{FG_GRAY}{'─' * cols}{RESET}")
 
-            cols, _ = get_terminal_size()
-            from ..core.db import get_last_event_id
-            return get_last_event_id(), cols
+            # Status bar with enter indicator and current type
+            type_suffix = f" {DIM}[ ↵ {self.state.log_event_type} ]{RESET}"
+            status = self.build_status_bar(highlight_tab="LOG") + type_suffix
+            sys.stdout.write(truncate_ansi(status, cols))
+            sys.stdout.flush()
+
+            return get_last_event_id(), cols, matched_count, total_count
 
         # Initial draw
-        last_pos, last_width = redraw_all()
+        last_pos, last_width, last_matched, last_total = redraw_all()
         last_status_update = time.time()
-        has_messages_state = last_pos > 0  # Track if we have messages
+        has_events_state = last_pos > 0
 
         with KeyboardInput() as kbd:
             while True:
                 key = kbd.get_key()
+
+                # Tab always exits (user requirement)
                 if key == 'TAB':
-                    # Tab to exit back to TUI
                     sys.stdout.write('\r\033[K')  # Clear status line
                     break
 
-                # Update status every 0.5s - also check for resize
+                # Enter cycles event types (all → message → status → life → all)
+                elif key == 'ENTER':
+                    cycle = {"all": "message", "message": "status", "status": "life", "life": "all"}
+                    self.state.log_event_type = cycle[self.state.log_event_type]
+                    last_pos, last_width, last_matched, last_total = redraw_all()
+                    has_events_state = last_pos > 0
+
+                # ESC clears filter
+                elif key == 'ESC':
+                    if self.state.log_filter:
+                        self.state.log_filter = ""
+                        self.state.log_filter_cursor = 0
+                        last_pos, last_width, last_matched, last_total = redraw_all()
+                        has_events_state = last_pos > 0
+
+                # Backspace deletes char
+                elif key == 'BACKSPACE':
+                    if self.state.log_filter and self.state.log_filter_cursor > 0:
+                        self.state.log_filter = (
+                            self.state.log_filter[:self.state.log_filter_cursor-1] +
+                            self.state.log_filter[self.state.log_filter_cursor:]
+                        )
+                        self.state.log_filter_cursor -= 1
+                        last_pos, last_width, last_matched, last_total = redraw_all()
+                        has_events_state = last_pos > 0
+
+                # Printable chars: type-to-activate filtering
+                elif key and len(key) == 1 and key.isprintable():
+                    sanitized = self.sanitize_filter_input(key)
+                    if sanitized:
+                        self.state.log_filter = (
+                            self.state.log_filter[:self.state.log_filter_cursor] +
+                            sanitized +
+                            self.state.log_filter[self.state.log_filter_cursor:]
+                        )
+                        self.state.log_filter_cursor += len(sanitized)
+                        last_pos, last_width, last_matched, last_total = redraw_all()
+                        has_events_state = last_pos > 0
+
+                # Update status periodically
                 now = time.time()
                 if now - last_status_update > 0.5:
                     current_cols, _ = get_terminal_size()
-                    self.load_status()  # Refresh instance data
+                    self.load_status()
 
-                    # Check if status line is too long for current terminal width
-                    status_line = self.build_status_bar(highlight_tab="LOG")
-                    status_len = ansi_len(status_line)
-
-                    if status_len >= current_cols - 2:
-                        # Status would wrap - need full redraw to fix it
-                        last_pos, last_width = redraw_all()
-                        has_messages_state = last_pos > 0
+                    # Check if resize requires redraw
+                    if current_cols != last_width:
+                        last_pos, last_width, last_matched, last_total = redraw_all()
+                        has_events_state = last_pos > 0
                     else:
-                        # Status fits - just update it
-                        safe_width = current_cols - 2
-                        new_status = truncate_ansi(status_line, safe_width)
+                        # Just update status line
+                        filter_active = bool(self.state.log_filter.strip())
+                        n_rows = 2  # Both modes have 2 rows (filter/separator + status)
+                        sys.stdout.write('\r' + '\033[A\033[K' * (n_rows - 1))
 
-                        # If we were in "no messages" state, cursor is 2 lines below status
-                        if not has_messages_state:
-                            # Move up 2 lines to status, clear all 3 lines, update status, re-print message
-                            sys.stdout.write('\033[A\033[A\r\033[K' + new_status + '\n\033[K\n\033[K')
-                            sys.stdout.write(f"{FG_GRAY}No messages - Tab to LAUNCH to create instances{RESET}")
+                        # Re-render bottom rows
+                        if filter_active:
+                            filter_prefix = "Filter: "
+                            available = current_cols - len(filter_prefix) - 20
+                            filter_text = self.state.log_filter[:available] if len(self.state.log_filter) > available else self.state.log_filter
+                            cursor_display = "_" if self.state.log_filter_cursor == len(self.state.log_filter) else ""
+                            filter_display = filter_text[:self.state.log_filter_cursor] + cursor_display + filter_text[self.state.log_filter_cursor:]
+                            count_str = f" [{last_matched}/{last_total}]"
+                            filter_line = f"{filter_prefix}{filter_display}{count_str}"
+                            sys.stdout.write(truncate_ansi(filter_line, current_cols) + '\n')
                         else:
-                            # Normal update - update separator/flash line and status line
-                            # Move up to separator line, update it, then update status
+                            # Separator or flash line
                             flash = self.build_flash()
                             if flash:
-                                # Flash message on left, separator fills rest
                                 flash_len = ansi_len(flash)
-                                remaining = current_cols - flash_len - 1  # -1 for space
+                                remaining = current_cols - flash_len - 1
                                 separator = f"{FG_GRAY}{'─' * remaining}{RESET}" if remaining > 0 else ""
-                                separator_line = f"{flash} {separator}"
+                                sys.stdout.write(f"{flash} {separator}\n")
                             else:
-                                separator_line = f"{FG_GRAY}{'─' * current_cols}{RESET}"
-                            sys.stdout.write('\r\033[A\033[K' + separator_line + '\n\033[K' + new_status)
+                                sys.stdout.write(f"{FG_GRAY}{'─' * current_cols}{RESET}\n")
 
+                        # Status bar with enter indicator and current type
+                        type_suffix = f" {DIM}[ ↵ {self.state.log_event_type} ]{RESET}"
+                        status = self.build_status_bar(highlight_tab="LOG") + type_suffix
+                        sys.stdout.write(truncate_ansi(status, current_cols))
                         sys.stdout.flush()
-                        last_width = current_cols
 
                     last_status_update = now
+                    last_width = current_cols
 
-                # Stream new messages
+                # Stream new events
                 from ..core.db import get_last_event_id, get_events_since
-                import json
 
                 try:
                     current_max_id = get_last_event_id()
                     if current_max_id > last_pos:
-                        events = get_events_since(last_pos, event_type='message')
+                        event_type = None if self.state.log_event_type == "all" else self.state.log_event_type
+                        events = get_events_since(last_pos, event_type=event_type)
+
                         if events:
-                            # Clear separator and status: move up to separator, clear it and status, return to position
-                            sys.stdout.write('\r\033[A\033[K\n\033[K\033[A\r')
-
-                            # Render new messages
+                            # Count new matches
+                            new_matches = []
                             for event in events:
-                                event_data = event['data']  # Already a dict from db.py
-                                msg = {
-                                    'timestamp': event['timestamp'],
-                                    'from': event_data.get('from', ''),
-                                    'message': event_data.get('text', '')
-                                }
-                                self.render_log_message(msg)
+                                if self.matches_filter_safe(event, self.state.log_filter):
+                                    new_matches.append(event)
 
-                            # Redraw separator and status
-                            self.render_status_with_separator("LOG")
-                            has_messages_state = True  # We now have messages
+                            if new_matches:
+                                # Clear bottom rows (always 2 rows: filter/separator + status)
+                                filter_active = bool(self.state.log_filter.strip())
+                                sys.stdout.write('\r\033[A\033[K\n\033[K\033[A\r')
+
+                                # Render new matching events
+                                for event in new_matches:
+                                    self.render_event_safe(event)
+                                    last_matched += 1
+
+                                last_total += len(events)
+
+                                # Re-render bottom rows
+                                cols, _ = get_terminal_size()
+                                if filter_active:
+                                    filter_prefix = "Filter: "
+                                    available = cols - len(filter_prefix) - 20
+                                    filter_text = self.state.log_filter[:available] if len(self.state.log_filter) > available else self.state.log_filter
+                                    cursor_display = "_" if self.state.log_filter_cursor == len(self.state.log_filter) else ""
+                                    filter_display = filter_text[:self.state.log_filter_cursor] + cursor_display + filter_text[self.state.log_filter_cursor:]
+                                    count_str = f" [{last_matched}/{last_total}]"
+                                    filter_line = f"{filter_prefix}{filter_display}{count_str}"
+                                    print(truncate_ansi(filter_line, cols))
+                                else:
+                                    # Separator or flash line
+                                    flash = self.build_flash()
+                                    if flash:
+                                        flash_len = ansi_len(flash)
+                                        remaining = cols - flash_len - 1
+                                        separator = f"{FG_GRAY}{'─' * remaining}{RESET}" if remaining > 0 else ""
+                                        print(f"{flash} {separator}")
+                                    else:
+                                        print(f"{FG_GRAY}{'─' * cols}{RESET}")
+
+                                # Status bar with enter indicator and current type
+                                type_suffix = f" {DIM}[ ↵ {self.state.log_event_type} ]{RESET}"
+                                status = self.build_status_bar(highlight_tab="LOG") + type_suffix
+                                sys.stdout.write(truncate_ansi(status, cols))
+                                sys.stdout.flush()
+
+                                has_events_state = True
+
                         last_pos = current_max_id
                 except Exception as e:
-                    # DB query failed - show error in flash
                     self.flash_error(f"Stream failed: {e}", duration=3.0)
 
                 time.sleep(0.01)

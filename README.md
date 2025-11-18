@@ -91,8 +91,8 @@ hcom send --from background-worker 'i finished, now you go do stuff'
 ```bash
 Usage: hcom                           # TUI dashboard
        [ENV_VARS] hcom <COUNT> [claude <ARGS>...]
-       hcom watch [--type TYPE] [--instance NAME] [--last N] [--wait SEC]
-       hcom list [--json] [--verbose]
+       hcom watch [--last N] [--wait SEC] [--sql EXPR]
+       hcom list [--json] [--verbose] [--sql EXPR]
        hcom send "message"
        hcom stop [alias|all]
        hcom start [alias]
@@ -106,18 +106,18 @@ Launch Examples:
 
 Commands:
   watch               Query recent events (JSON per line)
-    --type TYPE       Filter by event type (message, status)
-    --instance ALIAS  Filter by instance
     --last N          Limit to last N events (default: 20)
-    --wait SEC        Block until a matching event arrives
+    --wait [SEC]      Block until matching event (default: 60s timeout)
+    --sql EXPR        SQL WHERE clause filter
 
-  list                Show instance status/metadata
+  list                Show instance current status/metadata
     --json            Emit JSON (one instance per line)
     --verbose         Include additional metadata
 
   send "msg"          Send message to all instances
   send "@alias msg"   Send to specific instance/group
     --from <name>     Custom external identity
+    --wait            Block until reply with --from
 
   stop                Stop current instance (from inside Claude)
   stop <alias>        Stop specific instance

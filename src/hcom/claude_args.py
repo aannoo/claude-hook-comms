@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Iterable, Literal, Mapping, Sequence, Tuple
 
 
-CanonicalFlag = Literal["--model", "--allowedTools"]
+CanonicalFlag = Literal["--model", "--allowedTools", "--disallowedTools"]
 
 # All flag keys stored in lowercase (aside from short-form switches) for comparisons;
 # values use canonical casing when recorded.
@@ -15,14 +15,21 @@ _FLAG_ALIASES: Mapping[str, CanonicalFlag] = {
     "--model": "--model",
     "--allowedtools": "--allowedTools",
     "--allowed-tools": "--allowedTools",
+    "--disallowedtools": "--disallowedTools",
+    "--disallowed-tools": "--disallowedTools",
 }
 
 _CANONICAL_PREFIXES: Mapping[str, CanonicalFlag] = {
     "--model=": "--model",
     "--allowedtools=": "--allowedTools",
     "--allowed-tools=": "--allowedTools",
+    "--disallowedtools=": "--disallowedTools",
+    "--disallowed-tools=": "--disallowedTools",
 }
 
+# Background switches: NOT in _BOOLEAN_FLAGS to enable special handling.
+# has_flag() detects them by scanning clean_tokens directly, so they remain
+# discoverable via spec.has_flag(['-p']) or spec.has_flag(['--print']).
 _BACKGROUND_SWITCHES = {"-p", "--print"}
 _SYSTEM_FLAGS = {"--system-prompt", "--append-system-prompt"}
 _BOOLEAN_FLAGS = {
@@ -85,6 +92,7 @@ _VALUE_FLAGS = {
     "--session-id",
     "--setting-sources",
     "--settings",
+    "--tools",
 }
 
 _VALUE_FLAG_PREFIXES = {
@@ -106,6 +114,7 @@ _VALUE_FLAG_PREFIXES = {
     "--session-id=",
     "--setting-sources=",
     "--settings=",
+    "--tools=",
 }
 
 
@@ -459,28 +468,33 @@ def merge_system_prompts(
     user_append: str | None,
     user_system: str | None,
     agent_content: str | None,
-    *,
-    prefer_system_flag: bool,
-) -> Tuple[str | None, str]:
-    """Merge user/agent system prompts, returning content and flag."""
-    if not agent_content:
-        if user_system:
-            return user_system, "--system-prompt"
-        if user_append:
-            return user_append, "--append-system-prompt"
-        return None, ""
+) -> Tuple[str | None, str | None]:
+    """Merge agent content with user system prompts.
 
-    blocks = []
+    Returns: (system_prompt_value, append_system_prompt_value)
+
+    Agent behavior (matches Task tool subagents):
+    - Agent content always goes in --system-prompt
+    - User's --system-prompt appends to agent: "agent\n\nuser_system"
+    - User's --append-system-prompt passes through separately
+
+    No agent:
+    - User's flags pass through as-is
+    """
+    system_blocks = []
+
+    # Agent content first (if present)
+    if agent_content:
+        system_blocks.append(agent_content)
+
+    # User's system prompt second (if present)
     if user_system:
-        blocks.append(user_system)
-    if user_append:
-        blocks.append(user_append)
-    blocks.append(agent_content)
+        system_blocks.append(user_system)
 
-    merged = "\n\n".join(blocks)
-    if user_system or prefer_system_flag:
-        return merged, "--system-prompt"
-    return merged, "--append-system-prompt"
+    system_value = "\n\n".join(system_blocks) if system_blocks else None
+    append_value = user_append
+
+    return system_value, append_value
 
 
 def extract_system_prompt_args(tokens: Sequence[str]) -> Tuple[list[str], str | None, str | None]:
@@ -545,13 +559,20 @@ def validate_conflicts(spec: ClaudeArgsSpec) -> list[str]:
     """
     warnings = []
 
-    # Check for multiple system prompt entries
+    # Check for unusual system prompt combinations (not the standard --system-prompt + --append-system-prompt)
     if len(spec.system_entries) > 1:
         flags = [f for f, _ in spec.system_entries]
-        warnings.append(
-            f"Multiple system prompts detected: {', '.join(flags)}. "
-            f"All will be included in order."
+        # Standard pattern: one --system-prompt and one --append-system-prompt (no warning)
+        is_standard_pattern = (
+            len(flags) == 2 and
+            '--system-prompt' in flags and
+            '--append-system-prompt' in flags
         )
+        if not is_standard_pattern:
+            warnings.append(
+                f"Multiple system prompts detected: {', '.join(flags)}. "
+                f"All will be included in order."
+            )
 
     # Could add more conflict checks here:
     # - --print with interactive-only flags
@@ -740,6 +761,9 @@ def _parse_tokens(
             i += 1
             continue
 
+        # System prompts: intentionally excluded from clean_tokens and tracked
+        # via system_entries for special merge/update behavior. DO NOT add these
+        # to _VALUE_FLAGS - would break the special handling path.
         if token_lower in _SYSTEM_FLAGS:
             pending_system = "--system-prompt" if token_lower == "--system-prompt" else "--append-system-prompt"
             i += 1

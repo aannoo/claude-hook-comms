@@ -1,4 +1,4 @@
-"""SQLite event storage - unified database for messages and status events"""
+"""SQLite event storage - unified database for messages, status, and lifecycle events"""
 from __future__ import annotations
 import sqlite3
 import json
@@ -57,23 +57,21 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
         events(id, timestamp, type, instance, data)
         - id: autoincrement primary key for position tracking
         - timestamp: ISO 8601 datetime for time-based queries
-        - type: event type ('message', 'status')
-        - instance: instance alias (sender for messages, subject for status)
+        - type: event type ('message', 'status', 'life')
+        - instance: instance alias (sender for messages, subject for status/life)
         - data: JSON blob with type-specific fields
 
         instances(name, session_id, parent_session_id, ...)
         - name: instance alias (primary key)
         - session_id: unique session identifier (NULL for vanilla)
         - parent_session_id: parent's session_id for subagents
-        - current_subagents: JSON array of active subagent names
-        - subagent_mappings: JSON object mapping subagent names to session_ids
 
     Indexes:
         - timestamp for time-range queries
         - type for filtering by event type
         - instance for per-instance queries
         - type+instance composite for common filtered queries
-        - session_id, parent_session_id, tag, enabled, created_at, status
+        - session_id, parent_session_id, enabled, created_at, status, mapid
 
     Note: Foreign key constraints are enabled per-connection in get_db(),
     not here (PRAGMA settings are connection-specific).
@@ -116,13 +114,11 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
             notify_port INTEGER,
             background INTEGER DEFAULT 0,
             background_log_file TEXT DEFAULT '',
-            notification_message TEXT DEFAULT '',
             alias_announced INTEGER DEFAULT 0,
             launch_context_announced INTEGER DEFAULT 0,
             external_stop_pending INTEGER DEFAULT 0,
             session_ended INTEGER DEFAULT 0,
-            current_subagents TEXT DEFAULT '[]' CHECK(json_valid(current_subagents)),
-            subagent_mappings TEXT DEFAULT '{}' CHECK(json_valid(subagent_mappings)),
+            agent_id TEXT,
             FOREIGN KEY (parent_session_id) REFERENCES instances(session_id) ON DELETE SET NULL
         )
     """)
@@ -134,6 +130,18 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
         conn.execute("ALTER TABLE instances ADD COLUMN mapid TEXT DEFAULT ''")
         conn.commit()
 
+    # Migrate existing databases: add agent_id column if missing
+    cursor = conn.execute("PRAGMA table_info(instances)")
+    columns = {row['name'] for row in cursor.fetchall()}
+    if 'agent_id' not in columns:
+        try:
+            conn.execute("ALTER TABLE instances ADD COLUMN agent_id TEXT")
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            # Concurrent process may have added it - ignore if duplicate column error
+            if 'duplicate column' not in str(e).lower():
+                raise
+
     # Create indexes for common query patterns
     conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON events(timestamp)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_type ON events(type)")
@@ -144,11 +152,11 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_session_id ON instances(session_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_parent_session_id ON instances(parent_session_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_parent_name ON instances(parent_name)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_tag ON instances(tag)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_enabled ON instances(enabled)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON instances(created_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON instances(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mapid ON instances(mapid) WHERE mapid != ''")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_id ON instances(agent_id) WHERE agent_id IS NOT NULL")
 
     conn.commit()
 
@@ -165,8 +173,8 @@ def log_event(
     Thread-safe: Uses lock to protect concurrent writes.
 
     Args:
-        event_type: Event type ('message', 'status')
-        instance: Instance alias (sender for messages, subject for status)
+        event_type: Event type ('message', 'status', 'life')
+        instance: Instance alias (sender for messages, subject for status/life)
         data: Type-specific event data
         timestamp: Optional ISO 8601 timestamp (defaults to now)
 
@@ -227,66 +235,6 @@ def get_events_since(
         for row in cursor.fetchall()
     ]
 
-def query_events(
-    start_time: Optional[str] = None,
-    end_time: Optional[str] = None,
-    event_type: Optional[str] = None,
-    instance: Optional[str] = None,
-    limit: Optional[int] = None
-) -> list[dict[str, Any]]:
-    """Query events by time range with optional filters.
-
-    Primary use case: orchestrators querying event snapshots to monitor instances.
-
-    Args:
-        start_time: Optional ISO 8601 timestamp (inclusive)
-        end_time: Optional ISO 8601 timestamp (exclusive)
-        event_type: Optional filter by event type
-        instance: Optional filter by instance
-        limit: Optional limit on number of results
-
-    Returns:
-        List of events ordered by timestamp, each with: id, timestamp, type, instance, data (parsed JSON)
-    """
-    conn = get_db()
-
-    query = "SELECT id, timestamp, type, instance, data FROM events WHERE 1=1"
-    params: list[Any] = []
-
-    if start_time is not None:
-        query += " AND timestamp >= ?"
-        params.append(start_time)
-
-    if end_time is not None:
-        query += " AND timestamp < ?"
-        params.append(end_time)
-
-    if event_type is not None:
-        query += " AND type = ?"
-        params.append(event_type)
-
-    if instance is not None:
-        query += " AND instance = ?"
-        params.append(instance)
-
-    query += " ORDER BY timestamp"
-
-    if limit is not None:
-        query += " LIMIT ?"
-        params.append(limit)
-
-    cursor = conn.execute(query, params)
-    return [
-        {
-            "id": row["id"],
-            "timestamp": row["timestamp"],
-            "type": row["type"],
-            "instance": row["instance"],
-            "data": json.loads(row["data"])
-        }
-        for row in cursor.fetchall()
-    ]
-
 def get_last_event_id() -> int:
     """Get current maximum event ID.
 
@@ -307,12 +255,8 @@ def get_instance(name: str) -> dict[str, Any] | None:
     if not row:
         return None
 
-    # Convert Row to dict, parse JSON fields
-    data = dict(row)
-    data['current_subagents'] = json.loads(data['current_subagents'])
-    data['subagent_mappings'] = json.loads(data['subagent_mappings'])
-
-    return data
+    # Convert Row to dict
+    return dict(row)
 
 def save_instance(name: str, data: dict[str, Any]) -> bool:
     """Insert or update instance using UPSERT. Returns True on success."""
@@ -320,12 +264,7 @@ def save_instance(name: str, data: dict[str, Any]) -> bool:
 
     try:
         with _write_lock:
-            # Serialize JSON fields
             data_copy = data.copy()
-            if 'current_subagents' in data_copy:
-                data_copy['current_subagents'] = json.dumps(data_copy['current_subagents'])
-            if 'subagent_mappings' in data_copy:
-                data_copy['subagent_mappings'] = json.dumps(data_copy['subagent_mappings'])
 
             # UPSERT - simpler and race-free
             columns = ', '.join(data_copy.keys())
@@ -360,14 +299,9 @@ def update_instance(name: str, updates: dict[str, Any]) -> bool:
 
     try:
         with _write_lock:
-            # Serialize JSON fields if present
             updates_copy = updates.copy()
-            if 'current_subagents' in updates_copy:
-                updates_copy['current_subagents'] = json.dumps(updates_copy['current_subagents'])
-            if 'subagent_mappings' in updates_copy:
-                updates_copy['subagent_mappings'] = json.dumps(updates_copy['subagent_mappings'])
 
-            # Simple UPDATE - JSON columns handled like any other field
+            # Simple UPDATE
             set_clause = ', '.join(f"{k} = ?" for k in updates_copy.keys())
             conn.execute(
                 f"UPDATE instances SET {set_clause} WHERE name = ?",
@@ -415,23 +349,8 @@ def get_instance_by_mapid(mapid: str) -> dict[str, Any] | None:
     if not row:
         return None
 
-    # Convert Row to dict, parse JSON fields
-    data = dict(row)
-    data['current_subagents'] = json.loads(data['current_subagents'])
-    data['subagent_mappings'] = json.loads(data['subagent_mappings'])
-
-    return data
-
-def delete_instance(name: str) -> bool:
-    """Delete instance. CASCADE handles cleanup. Returns True on success."""
-    conn = get_db()
-    try:
-        with _write_lock:
-            conn.execute("DELETE FROM instances WHERE name = ?", (name,))
-            conn.commit()
-            return True
-    except Exception:
-        return False
+    # Convert Row to dict
+    return dict(row)
 
 # ==================== High-Level Query Helpers ====================
 
@@ -444,20 +363,7 @@ def iter_instances(enabled_only: bool = False):
     query += " ORDER BY created_at DESC"
 
     for row in conn.execute(query):
-        data = dict(row)
-        data['current_subagents'] = json.loads(data['current_subagents'])
-        data['subagent_mappings'] = json.loads(data['subagent_mappings'])
-        yield data
-
-
-def list_instances_for_watch(limit: int = 0):
-    """Get instances for watch/list commands (structured query)."""
-    conn = get_db()
-    query = "SELECT name, enabled, status, status_time, status_context FROM instances WHERE previously_enabled = 1 ORDER BY created_at DESC"
-    if limit > 0:
-        query += f" LIMIT {limit}"
-
-    return conn.execute(query).fetchall()
+        yield dict(row)
 
 __all__ = [
     # Events
@@ -466,7 +372,6 @@ __all__ = [
     'init_db',
     'log_event',
     'get_events_since',
-    'query_events',
     'get_last_event_id',
     'DB_FILE',
     # Instances (low-level)
@@ -475,8 +380,6 @@ __all__ = [
     'update_instance',
     'find_instance_by_session',
     'get_instance_by_mapid',
-    'delete_instance',
     # Instances (high-level queries)
     'iter_instances',
-    'list_instances_for_watch',
 ]

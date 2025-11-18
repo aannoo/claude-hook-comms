@@ -3,10 +3,131 @@ from __future__ import annotations
 
 from .instances import (
     load_instance_position,
-    update_instance_position, is_parent_instance, in_same_group
+    update_instance_position, is_parent_instance
 )
 from .config import get_config
-from ..shared import MENTION_PATTERN, SENDER
+from ..shared import MENTION_PATTERN, SENDER, CLAUDE_SENDER, SenderIdentity
+from .helpers import in_same_group_by_id, validate_scope, get_group_session_id, is_mentioned
+import sys
+
+# ==================== Scope Computation ====================
+
+def compute_scope(identity: SenderIdentity, message: str, all_instances: list[str]) -> tuple[str, dict] | None:
+    """Compute message scope and routing data.
+
+    Args:
+        identity: Sender identity (kind + name + instance_data)
+        message: Message text
+        all_instances: List of all active instance names (for @mention validation)
+
+    Returns:
+        (scope, extra_data) tuple, or None on validation failure
+
+    Scope types:
+        - 'broadcast': External senders to everyone
+        - 'mentions': @-mention routing (cross all boundaries)
+        - 'parent_broadcast': Parent broadcasting to other parents
+        - 'subagent_group': Subagent broadcasting to same group
+
+    STRICT FAILURE: Unmatched @mentions return None and print error
+    """
+    # Check for @mentions FIRST (crosses all boundaries)
+    if '@' in message:
+        mentions = MENTION_PATTERN.findall(message)
+        if mentions:
+            # Validate all mentions match real instances
+            matched_instances = []
+            unmatched = []
+
+            for mention in mentions:
+                # Check if mention matches any instance (prefix match, case insensitive)
+                matches = [name for name in all_instances
+                          if name.lower().startswith(mention.lower())]
+                if matches:
+                    matched_instances.extend(matches)
+                else:
+                    unmatched.append(mention)
+
+            # STRICT: fail loud on unmatched mentions
+            if unmatched:
+                print(
+                    f"Error: Unmatched @mentions: {', '.join(f'@{m}' for m in unmatched)}",
+                    file=sys.stderr
+                )
+                # Show available instances (up to 10)
+                available = all_instances[:10]
+                if all_instances:
+                    more = f" (and {len(all_instances) - 10} more)" if len(all_instances) > 10 else ""
+                    print(f"Available instances: {', '.join(available)}{more}", file=sys.stderr)
+                return None
+
+            # Deduplicate matched instances
+            unique_instances = list(dict.fromkeys(matched_instances))
+            return ('mentions', {'mentioned_instances': unique_instances})
+
+    # External senders broadcast (no mentions)
+    if identity.broadcasts:
+        return ('broadcast', {})
+
+    # No mentions - determine broadcast scope
+    if not identity.instance_data:
+        # Shouldn't happen for kind='instance', but handle gracefully
+        return ('broadcast', {})
+
+    # Check if sender is parent or subagent
+    if is_parent_instance(identity.instance_data):
+        return ('parent_broadcast', {})
+    else:
+        # Subagent - broadcast within group only
+        group_id = identity.group_id
+        if not group_id:
+            # Subagent without group? Shouldn't happen, fail loud
+            print(f"Error: Subagent '{identity.name}' has no group_id", file=sys.stderr)
+            return None
+        return ('subagent_group', {'group_id': group_id})
+
+
+def _should_deliver(scope: str, extra: dict, receiver_name: str, sender_name: str) -> bool:
+    """Check if message should be delivered to receiver based on scope.
+
+    Internal helper for computing recipient snapshots at send time.
+
+    Args:
+        scope: Message scope ('broadcast', 'mentions', 'parent_broadcast', 'subagent_group')
+        extra: Extra scope data (mentioned_instances, group_id, etc)
+        receiver_name: Instance to check delivery for
+        sender_name: Sender name (excluded from delivery)
+
+    Returns:
+        True if receiver should get the message
+    """
+    # Never deliver to self
+    if receiver_name == sender_name:
+        return False
+
+    # Validate scope
+    validate_scope(scope)
+
+    # Match on scope
+    if scope == 'broadcast':
+        return True
+
+    if scope == 'mentions':
+        return receiver_name in extra.get('mentioned_instances', [])
+
+    if scope == 'parent_broadcast':
+        receiver_data = load_instance_position(receiver_name)
+        return is_parent_instance(receiver_data)
+
+    if scope == 'subagent_group':
+        group_id = extra.get('group_id')
+        if not group_id:
+            return False
+        receiver_data = load_instance_position(receiver_name)
+        return in_same_group_by_id(group_id, receiver_data)
+
+    # Should never reach here if validate_scope works
+    return False
 
 # ==================== Core Message Operations ====================
 
@@ -33,51 +154,101 @@ def unescape_bash(text: str) -> str:
         text = text.replace(escaped, unescaped)
     return text
 
-def send_message(from_instance: str, message: str) -> bool:
+def send_message(identity: SenderIdentity, message: str) -> list[str] | None:
     """Send a message to the database and notify all instances.
 
-    This function handles both writing to SQLite and sending TCP
-    notifications to wake instances for immediate delivery.
+    Args:
+        identity: Sender identity (kind + name + instance_data)
+        message: Message text
+
+    Returns:
+        List of recipient names on success, None on failure (unmatched @mentions or DB error)
     """
+    from .db import log_event, get_db
+
+    # Get real instances for recipient computation
+    conn = get_db()
+    real_instances = [
+        row['name'] for row in
+        conn.execute("SELECT name FROM instances WHERE previously_enabled = 1").fetchall()
+    ]
+
+    # For @mention validation: include CLI/TUI identities as valid targets
+    mentionable = real_instances + [SENDER, CLAUDE_SENDER]
+
+    # Compute scope and routing data
+    scope_result = compute_scope(identity, message, mentionable)
+    if scope_result is None:
+        # Failed validation (unmatched @mentions) - error already printed
+        return None
+
+    scope, extra = scope_result
+
+    # Compute recipient snapshot using only real instances
+    recipients = [
+        inst_name for inst_name in real_instances
+        if _should_deliver(scope, extra, inst_name, identity.name)
+    ]
+
+    # Build event data
+    data = {
+        'from': identity.name,          # Display name for output
+        'sender_kind': identity.kind,   # 'external' or 'instance' for filtering
+        'scope': scope,                 # Routing scope
+        'text': message,
+        'recipients': recipients        # Snapshot for read receipts
+    }
+
+    # Add scope extra data
+    if extra:
+        data.update(extra)
+
+    # Log to SQLite with namespace separation
+    # External senders use 'ext_{name}' prefix for clear namespace isolation
+    # System senders use 'sys_{name}' prefix (e.g., sys_[hcom-launcher])
+    # Instance senders use real instance name
+    # Actual sender name preserved in data['from'] for display
+    if identity.kind == 'external':
+        routing_instance = f'ext_{identity.name}'
+    elif identity.kind == 'system':
+        routing_instance = f'sys_{identity.name}'
+    else:
+        routing_instance = identity.name
+
     try:
-        from .db import log_event
-
-        # Extract recipients from @mentions or default to "all"
-        recipients = "all"
-        has_mention = False
-        if '@' in message:
-            mentions = MENTION_PATTERN.findall(message)
-            if mentions:
-                recipients = mentions
-                has_mention = True
-
-        # Snapshot actual recipients at send time for accurate read receipts
-        actual_recipients = determine_message_recipients(message, from_instance)
-
-        # Log to SQLite
         log_event(
             event_type='message',
-            instance=from_instance,
-            data={
-                'from': from_instance,
-                'to': recipients,
-                'text': message,
-                'mention': has_mention,
-                'recipients': actual_recipients
-            }
+            instance=routing_instance,
+            data=data
         )
+    except Exception as e:
+        # DB write failed - print clear error for debugging
+        print(f"Error: Failed to write message to database: {e}", file=sys.stderr)
+        return None
 
-        # Notify all instances after successful write
-        from .runtime import notify_all_instances
-        notify_all_instances()
+    # Notify all instances after successful write
+    from .runtime import notify_all_instances
+    notify_all_instances()
 
-        return True
-    except Exception:
-        return False
+    return recipients
+
+
+def send_system_message(sender_name: str, message: str) -> list[str] | None:
+    """Send a system notification message.
+
+    Args:
+        sender_name: System sender identifier (e.g., 'hcom-launcher', 'hcom-watchdog')
+        message: Message text (can include @mentions for targeting)
+
+    Returns:
+        List of recipient names on success, None on failure
+    """
+    identity = SenderIdentity(kind='system', name=sender_name, instance_data=None)
+    return send_message(identity, message)
 
 
 def get_unread_messages(instance_name: str, update_position: bool = False) -> tuple[list[dict[str, str]], int]:
-    """Get unread messages for instance with @-mention filtering
+    """Get unread messages for instance with scope-based filtering
     Args:
         instance_name: Name of instance to get messages for
         update_position: If True, mark messages as read by updating position
@@ -96,31 +267,39 @@ def get_unread_messages(instance_name: str, update_position: bool = False) -> tu
     if not events:
         return [], last_event_id
 
-    # Filter messages:
-    # 1. Exclude own messages
-    # 2. Apply @-mention filtering
-    from .db import get_db
-    conn = get_db()
-    all_instance_names = [row['name'] for row in conn.execute("SELECT name FROM instances").fetchall()]
     messages = []
-
     for event in events:
         event_data = event['data']
 
-        # Skip own messages
-        if event_data['from'] == instance_name:
+        # Validate scope field present
+        if 'scope' not in event_data:
+            print(
+                f"Error: Message event {event['id']} missing 'scope' field (old format). "
+                f"Run 'hcom reset logs' to clear old messages.",
+                file=sys.stderr
+            )
             continue
 
-        # Build message dict for filtering
-        msg = {
-            'timestamp': event['timestamp'],
-            'from': event_data['from'],
-            'message': event_data['text']
-        }
+        # Skip own messages
+        sender_name = event_data['from']
+        if sender_name == instance_name:
+            continue
 
-        # Apply existing filtering logic
-        if should_deliver_message(msg, instance_name, all_instance_names):
-            messages.append(msg)
+        # Apply scope-based filtering
+        try:
+            if should_deliver_message(event_data, instance_name, sender_name):
+                messages.append({
+                    'timestamp': event['timestamp'],
+                    'from': sender_name,
+                    'message': event_data['text']
+                })
+        except ValueError as e:
+            print(
+                f"Error: Corrupt message data in event {event['id']}: {e}. "
+                f"Run 'hcom reset logs' to clear corrupt messages.",
+                file=sys.stderr
+            )
+            continue
 
     # Max event ID from events we processed
     max_event_id = events[-1]['id'] if events else last_event_id
@@ -133,124 +312,60 @@ def get_unread_messages(instance_name: str, update_position: bool = False) -> tu
 
 # ==================== Message Filtering & Routing ====================
 
-def should_deliver_message(msg: dict[str, str], instance_name: str, all_instance_names: list[str] | None = None) -> bool:
-    """Check if message should be delivered based on @-mentions and group isolation.
-    Group isolation rules:
-    - CLI (bigboss) broadcasts → everyone (all parents and subagents)
-    - Parent broadcasts → other parents only (subagents shut down during their own parent activity)
-    - Subagent broadcasts → same group subagents only (parent frozen during their subagents activity)
-    - @-mentions → cross all boundaries like a nice piece of chocolate cake or fried chicken
+def should_deliver_message(event_data: dict, receiver_name: str, sender_name: str) -> bool:
+    """Check if message should be delivered based on scope (15-line implementation).
+
+    Args:
+        event_data: Message event data with 'scope' field and scope-specific data
+        receiver_name: Instance to check delivery for
+        sender_name: Sender name (excluded from delivery)
+
+    Returns:
+        True if receiver should get the message
+
+    Raises:
+        KeyError: If scope field missing (old message format)
+        ValueError: If scope value invalid
     """
-    text = msg['message']
-    sender = msg['from']
+    # Never deliver to self
+    if receiver_name == sender_name:
+        return False
 
-    # Load instance data for group membership
-    sender_data = load_instance_position(sender)
-    receiver_data = load_instance_position(instance_name)
+    # Extract and validate scope
+    if 'scope' not in event_data:
+        raise KeyError(f"Message missing 'scope' field (old format)")
 
-    # Determine if sender/receiver are parents or subagents
-    sender_is_parent = is_parent_instance(sender_data)
-    receiver_is_parent = is_parent_instance(receiver_data)
+    scope = event_data['scope']
+    validate_scope(scope)  # Raises ValueError if invalid
 
-    # Check for @-mentions first (crosses all boundaries! yay!)
-    if '@' in text:
-        mentions = MENTION_PATTERN.findall(text)
-
-        if mentions:
-            # Check if this instance matches any mention
-            this_instance_matches = any(instance_name.lower().startswith(mention.lower()) for mention in mentions)
-            if this_instance_matches:
-                return True
-
-            # Check if CLI sender (bigboss) is mentioned
-            sender_mentioned = any(SENDER.lower().startswith(mention.lower()) for mention in mentions)
-
-            # Broadcast fallback: no matches anywhere = broadcast with group rules
-            if all_instance_names:
-                any_mention_matches = any(
-                    any(name.lower().startswith(mention.lower()) for name in all_instance_names)
-                    for mention in mentions
-                ) or sender_mentioned
-
-                if not any_mention_matches:
-                    # Fall through to group isolation rules
-                    pass
-                else:
-                    # Mention matches someone else, not us
-                    return False
-            else:
-                # No instance list provided, assume mentions are valid and we're not the target
-                return False
-        # else: Has @ but no valid mentions, fall through to broadcast rules
-
-    # Special case: CLI sender (bigboss) broadcasts to everyone
-    if sender == SENDER:
+    # Scope-based routing
+    if scope == 'broadcast':
         return True
 
-    # GROUP ISOLATION for broadcasts
-    # Rule 1: Parent → Parent (main communication)
-    if sender_is_parent and receiver_is_parent:
-        # Different groups = allow (parent-to-parent is the main channel)
-        return True
+    if scope == 'mentions':
+        return receiver_name in event_data.get('mentioned_instances', [])
 
-    # Rule 2: Subagent → Subagent (same group only)
-    if not sender_is_parent and not receiver_is_parent:
-        return in_same_group(sender_data, receiver_data)
+    if scope == 'parent_broadcast':
+        receiver_data = load_instance_position(receiver_name)
+        return is_parent_instance(receiver_data)
 
-    # Rule 3: Parent ↔ Subagent (allow - delivered via PostToolUse)
-    # Parent receives subagent messages after Task completes (PostToolUse delivers freeze-period history)
-    # Subagents can receive parent messages if sent while subagent still running
-    # Temporal isolation is handled by delivery mechanism (PostToolUse), not filtering
-    if sender_is_parent or receiver_is_parent:
-        return in_same_group(sender_data, receiver_data)
+    if scope == 'subagent_group':
+        group_id = event_data.get('group_id')
+        if not group_id:
+            return False
+        receiver_data = load_instance_position(receiver_name)
+        return in_same_group_by_id(group_id, receiver_data)
 
-    # Fallback: should not reach here
+    # Should never reach here if validate_scope works
     return False
 
 
-def determine_message_recipients(message_text: str, sender_name: str) -> list[str]:
-    """Determine which instances will receive a message using actual delivery logic.
-    Args:
-        message_text: The message content (for @mention parsing)
-        sender_name: Name of sender (excluded from recipients)
-    Returns:
-        List of instance names that will receive the message
-    """
-    from .db import get_db
-
-    conn = get_db()
-
-    # Get all instances that could potentially receive (previously_enabled = 1)
-    # Exclude sender from recipient list
-    all_instances = conn.execute(
-        "SELECT name FROM instances WHERE previously_enabled = 1 AND name != ?",
-        (sender_name,)
-    ).fetchall()
-
-    if not all_instances:
-        return []
-
-    # Get all instance names for @mention validation
-    all_instance_names = [row['name'] for row in all_instances]
-
-    # Build message dict for should_deliver_message()
-    msg = {
-        'from': sender_name,
-        'message': message_text
-    }
-
-    # Filter instances using actual delivery logic
-    recipients = []
-    for row in all_instances:
-        instance_name = row['name']
-        if should_deliver_message(msg, instance_name, all_instance_names):
-            recipients.append(instance_name)
-
-    return recipients
+# Note: determine_message_recipients() removed - obsolete after scope refactor
+# Use compute_scope() + _should_deliver() directly instead (see send_message() or get_recipient_feedback())
 
 
 def get_subagent_messages(parent_name: str, since_id: int = 0, limit: int = 0) -> tuple[list[dict[str, str]], int, dict[str, int]]:
-    """Get messages from/to subagents of parent instance
+    """Get messages from/to subagents of parent instance with scope-based filtering
     Args:
         parent_name: Parent instance name (e.g., 'alice')
         since_id: Event ID to read from (default 0 = all messages)
@@ -281,32 +396,59 @@ def get_subagent_messages(parent_name: str, since_id: int = 0, limit: int = 0) -
     subagent_messages = []
     for event in events:
         event_data = event['data']
-        sender = event_data['from']
+
+        # Validate scope field present
+        if 'scope' not in event_data:
+            print(
+                f"Error: Message event {event['id']} missing 'scope' field (old format). "
+                f"Run 'hcom reset logs' to clear old messages.",
+                file=sys.stderr
+            )
+            continue
+
+        sender_name = event_data['from']
 
         # Build message dict
         msg = {
             'timestamp': event['timestamp'],
-            'from': sender,
+            'from': sender_name,
             'message': event_data['text']
         }
 
         # Messages FROM subagents
-        if sender in subagent_names_set:
+        if sender_name in subagent_names_set:
             subagent_messages.append(msg)
             # Track which subagents would receive this message
             for subagent_name in subagent_names:
-                if subagent_name != sender and should_deliver_message(msg, subagent_name, subagent_names):
-                    per_subagent_counts[subagent_name] += 1
+                if subagent_name != sender_name:
+                    try:
+                        if should_deliver_message(event_data, subagent_name, sender_name):
+                            per_subagent_counts[subagent_name] += 1
+                    except ValueError as e:
+                        print(
+                            f"Error: Corrupt message data in event {event['id']}: {e}. "
+                            f"Run 'hcom reset logs' to clear corrupt messages.",
+                            file=sys.stderr
+                        )
+                        continue
         # Messages TO subagents via @mentions or broadcasts
         elif subagent_names:
             # Check which subagents should receive this message
             matched = False
             for subagent_name in subagent_names:
-                if should_deliver_message(msg, subagent_name, subagent_names):
-                    if not matched:
-                        subagent_messages.append(msg)
-                        matched = True
-                    per_subagent_counts[subagent_name] += 1
+                try:
+                    if should_deliver_message(event_data, subagent_name, sender_name):
+                        if not matched:
+                            subagent_messages.append(msg)
+                            matched = True
+                        per_subagent_counts[subagent_name] += 1
+                except ValueError as e:
+                    print(
+                        f"Error: Corrupt message data in event {event['id']}: {e}. "
+                        f"Run 'hcom reset logs' to clear corrupt messages.",
+                        file=sys.stderr
+                    )
+                    break  # Skip remaining subagents for this message
 
     if limit > 0:
         subagent_messages = subagent_messages[-limit:]
@@ -332,10 +474,10 @@ def format_hook_messages(messages: list[dict[str, str]], instance_name: str) -> 
 
     return reason
 
-def get_read_receipts(instance_name: str, max_text_length: int = 50, limit: int = None) -> list[dict]:
-    """Get read receipts for messages sent by instance.
+def get_read_receipts(identity: SenderIdentity, max_text_length: int = 50, limit: int = None) -> list[dict]:
+    """Get read receipts for messages sent by sender.
     Args:
-        instance_name: Name of instance to check sent messages for
+        identity: SenderIdentity for the sender (external or instance)
         max_text_length: Maximum text length before truncation (default 50)
         limit: Maximum number of recent messages to return (default None = all)
     Returns:
@@ -348,7 +490,10 @@ def get_read_receipts(instance_name: str, max_text_length: int = 50, limit: int 
 
     conn = get_db()
 
-    # Get messages sent by this instance (most recent first)
+    # Determine storage name: external senders use ext_ prefix, instances use real name
+    storage_name = f'ext_{identity.name}' if identity.kind == 'external' else identity.name
+
+    # Query by storage name
     query = """
         SELECT e.id, e.timestamp, e.data
         FROM events e
@@ -356,26 +501,28 @@ def get_read_receipts(instance_name: str, max_text_length: int = 50, limit: int 
           AND e.instance = ?
         ORDER BY e.id DESC
     """
+
     if limit is not None:
         query += f" LIMIT {int(limit)}"
 
-    sent_messages = conn.execute(query, (instance_name,)).fetchall()
+    sent_messages = conn.execute(query, (storage_name,)).fetchall()
 
     if not sent_messages:
         return []
 
     # Get all active instances (previously_enabled = True)
     active_instances_query = """
-        SELECT name, last_event_id
+        SELECT name, last_event_id, session_id, mapid, parent_session_id
         FROM instances
         WHERE previously_enabled = 1 AND name != ?
     """
-    active_instances = conn.execute(active_instances_query, (instance_name,)).fetchall()
+    active_instances = conn.execute(active_instances_query, (identity.name,)).fetchall()
 
     if not active_instances:
         return []
 
     instance_reads = {row['name']: row['last_event_id'] for row in active_instances}
+    instance_data_cache = {row['name']: {'session_id': row['session_id'], 'mapid': row['mapid'], 'parent_session_id': row['parent_session_id']} for row in active_instances}
     receipts = []
     now = datetime.now(timezone.utc)
 
@@ -384,6 +531,10 @@ def get_read_receipts(instance_name: str, max_text_length: int = 50, limit: int 
         msg_timestamp = msg_row['timestamp']
         msg_data = json.loads(msg_row['data'])
         msg_text = msg_data['text']
+
+        # Validate scope field present (skip old messages)
+        if 'scope' not in msg_data:
+            continue
 
         # Use snapshotted recipients from send time
         if 'recipients' not in msg_data:
@@ -394,7 +545,17 @@ def get_read_receipts(instance_name: str, max_text_length: int = 50, limit: int 
         # Find recipients that HAVE read this message
         read_by = []
         for inst_name in recipients:
+            # Check if instance has advanced past this message
             if instance_reads.get(inst_name, 0) >= msg_id:
+                # For external senders, only mark as read if they were @mentioned
+                # (they only receive messages they're mentioned in)
+                inst_data = instance_data_cache.get(inst_name)
+                if inst_data:
+                    from ..core.instances import is_external_sender
+                    if is_external_sender(inst_data):
+                        # Only count as read if @mentioned
+                        if not is_mentioned(msg_text, inst_name):
+                            continue
                 read_by.append(inst_name)
 
         total_recipients = len(recipients)
@@ -426,11 +587,12 @@ def get_read_receipts(instance_name: str, max_text_length: int = 50, limit: int 
     return receipts
 
 __all__ = [
+    'compute_scope',
+    '_should_deliver',
     'unescape_bash',
     'send_message',
     'get_unread_messages',
     'should_deliver_message',
-    'determine_message_recipients',
     'get_subagent_messages',
     'format_hook_messages',
     'get_read_receipts',

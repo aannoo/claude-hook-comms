@@ -107,7 +107,8 @@ class LaunchScreen:
         claude_args_default = CONFIG_DEFAULTS.get('HCOM_CLAUDE_ARGS', '')
         default_spec = resolve_claude_args(None, claude_args_default if claude_args_default else None)
         default_prompt = default_spec.positional_tokens[0] if default_spec.positional_tokens else ""
-        default_system = default_spec.user_system or default_spec.user_append or ""
+        default_system = default_spec.user_system or ""
+        default_append = default_spec.user_append or ""
         default_background = default_spec.is_background
 
         if self.state.launch_background != default_background:
@@ -115,6 +116,8 @@ class LaunchScreen:
         if self.state.launch_prompt != default_prompt:
             claude_set += 1
         if self.state.launch_system_prompt != default_system:
+            claude_set += 1
+        if self.state.launch_append_system_prompt != default_append:
             claude_set += 1
         # claude_args: check if raw value differs from default (normalize quotes)
         claude_args_val = self.state.config_edit.get('HCOM_CLAUDE_ARGS', '').strip().strip("'\"")
@@ -146,6 +149,10 @@ class LaunchScreen:
                     sys_str = str(self.state.launch_system_prompt) if self.state.launch_system_prompt else ""
                     sys_preview = sys_str[:20] + "..." if len(sys_str) > 20 else sys_str
                     previews.append(f'system: "{sys_preview}"')
+                if self.state.launch_append_system_prompt != default_append:
+                    append_str = str(self.state.launch_append_system_prompt) if self.state.launch_append_system_prompt else ""
+                    append_preview = append_str[:20] + "..." if len(append_str) > 20 else append_str
+                    previews.append(f'append: "{append_preview}"')
                 if claude_args_val != claude_args_default_normalized:
                     args_str = str(claude_args_val) if claude_args_val else ""
                     args_preview = args_str[:25] + "..." if len(args_str) > 25 else args_str
@@ -154,7 +161,7 @@ class LaunchScreen:
                     preview_text = ", ".join(previews)
                     lines.append(f"    {DIM}{FG_GRAY}{truncate_ansi(preview_text, width - 4)}{RESET}")
             else:
-                lines.append(f"    {DIM}{FG_GRAY}prompt, system, headless, args{RESET}")
+                lines.append(f"    {DIM}{FG_GRAY}prompt, system, append, headless, args{RESET}")
 
         # Claude fields (if expanded or cursor inside)
         result = self.render_section_fields(
@@ -163,6 +170,10 @@ class LaunchScreen:
         )
         if result is not None:
             selected_field_start_line = result
+
+        # Add spacing after expanded section
+        if self.state.claude_expanded:
+            lines.append('')
 
         # HCOM section header (with left padding)
         hcom_selected = (self.state.launch_field == LaunchField.HCOM_SECTION and self.state.hcom_cursor == -1)
@@ -221,6 +232,10 @@ class LaunchScreen:
         if result is not None:
             selected_field_start_line = result
 
+        # Add spacing after expanded section
+        if self.state.hcom_expanded:
+            lines.append('')
+
         # Custom Env section header (with left padding)
         custom_selected = (self.state.launch_field == LaunchField.CUSTOM_ENV_SECTION and self.state.custom_env_cursor == -1)
         expand_marker = '\u25bc' if self.state.custom_env_expanded else '\u25b6'
@@ -259,6 +274,10 @@ class LaunchScreen:
         )
         if result is not None:
             selected_field_start_line = result
+
+        # Add spacing after expanded section
+        if self.state.custom_env_expanded:
+            lines.append('')
 
         # Open config in editor entry (at bottom, less prominent)
         lines.append('')  # Spacer
@@ -326,6 +345,10 @@ class LaunchScreen:
                 editor_color = FG_CLAUDE_ORANGE
                 field_name = "System Prompt"
                 help_text = "instructions that guide behavior"
+            elif field_key == 'append_system_prompt':
+                editor_color = FG_CLAUDE_ORANGE
+                field_name = "Append System Prompt"
+                help_text = "appends to Claude Code's default system prompt"
             elif field_key == 'HCOM_CLAUDE_ARGS':
                 editor_color = FG_CLAUDE_ORANGE
                 field_name = "Claude Args"
@@ -506,6 +529,8 @@ class LaunchScreen:
                             self.state.launch_prompt_cursor = new_cursor
                         elif field_key == 'system_prompt':
                             self.state.launch_system_prompt_cursor = new_cursor
+                        elif field_key == 'append_system_prompt':
+                            self.state.launch_append_system_prompt_cursor = new_cursor
                         else:
                             self.state.config_field_cursors[field_key] = new_cursor
 
@@ -551,6 +576,10 @@ class LaunchScreen:
                         elif field.key == 'system_prompt':
                             self.state.launch_system_prompt = ""
                             self.state.launch_system_prompt_cursor = 0
+                            self.tui.save_launch_state()
+                        elif field.key == 'append_system_prompt':
+                            self.state.launch_append_system_prompt = ""
+                            self.state.launch_append_system_prompt_cursor = 0
                             self.tui.save_launch_state()
                         elif field.key == 'claude_args':
                             self.state.config_edit['HCOM_CLAUDE_ARGS'] = ""
@@ -633,19 +662,21 @@ class LaunchScreen:
             claude_args_str = self.state.config_edit.get('HCOM_CLAUDE_ARGS', '')
             spec = resolve_claude_args(None, claude_args_str if claude_args_str else None)
 
-            # Update spec with form values
-            system_flag = None
-            system_value = None
-            if self.state.launch_system_prompt:
-                system_flag = "--system-prompt" if self.state.launch_background else "--append-system-prompt"
-                system_value = self.state.launch_system_prompt
-
+            # Update spec with background and prompt
             spec = spec.update(
                 background=self.state.launch_background,
-                system_flag=system_flag,
-                system_value=system_value,
                 prompt=self.state.launch_prompt,
             )
+
+            # Build tokens manually to support both system prompt types
+            tokens = list(spec.clean_tokens)
+            if self.state.launch_system_prompt:
+                tokens.extend(['--system-prompt', self.state.launch_system_prompt])
+            if self.state.launch_append_system_prompt:
+                tokens.extend(['--append-system-prompt', self.state.launch_append_system_prompt])
+
+            # Re-parse to get proper spec
+            spec = resolve_claude_args(tokens, None)
 
             # Build preview
             parts = []
@@ -700,6 +731,10 @@ class LaunchScreen:
                     if self.state.launch_system_prompt_cursor > len(self.state.launch_system_prompt):
                         self.state.launch_system_prompt_cursor = len(self.state.launch_system_prompt)
                     return ('system_prompt', self.state.launch_system_prompt, self.state.launch_system_prompt_cursor)
+                elif field.key == 'append_system_prompt':
+                    if self.state.launch_append_system_prompt_cursor > len(self.state.launch_append_system_prompt):
+                        self.state.launch_append_system_prompt_cursor = len(self.state.launch_append_system_prompt)
+                    return ('append_system_prompt', self.state.launch_append_system_prompt, self.state.launch_append_system_prompt_cursor)
                 elif field.key == 'claude_args':
                     value = self.state.config_edit.get('HCOM_CLAUDE_ARGS', '')
                     cursor = self.state.config_field_cursors.get('HCOM_CLAUDE_ARGS', len(value))
@@ -737,6 +772,10 @@ class LaunchScreen:
             self.state.launch_system_prompt = new_value
             self.state.launch_system_prompt_cursor = new_cursor
             self.tui.save_launch_state()
+        elif field_key == 'append_system_prompt':
+            self.state.launch_append_system_prompt = new_value
+            self.state.launch_append_system_prompt_cursor = new_cursor
+            self.tui.save_launch_state()
         elif field_key == 'HCOM_CLAUDE_ARGS':
             self.state.config_edit[field_key] = new_value
             self.state.config_field_cursors[field_key] = new_cursor
@@ -753,6 +792,7 @@ class LaunchScreen:
         return [
             Field("prompt", "Prompt", "text", self.state.launch_prompt, hint="text string"),
             Field("system_prompt", "System Prompt", "text", self.state.launch_system_prompt, hint="text string"),
+            Field("append_system_prompt", "Append System Prompt", "text", self.state.launch_append_system_prompt, hint="text string"),
             Field("background", "Headless", "checkbox", self.state.launch_background, hint="enter to toggle"),
             Field("claude_args", "Claude Args", "text", self.state.config_edit.get('HCOM_CLAUDE_ARGS', ''), hint="flags string"),
         ]
@@ -840,14 +880,16 @@ class LaunchScreen:
         in_config = field.key in self.state.config_edit
 
         # Format value based on type
-        # For Claude fields (prompt, system_prompt, background), extract defaults from HCOM_CLAUDE_ARGS
-        if field.key in ('prompt', 'system_prompt', 'background'):
+        # For Claude fields (prompt, system_prompt, append_system_prompt, background), extract defaults from HCOM_CLAUDE_ARGS
+        if field.key in ('prompt', 'system_prompt', 'append_system_prompt', 'background'):
             claude_args_default = CONFIG_DEFAULTS.get('HCOM_CLAUDE_ARGS', '')
             default_spec = resolve_claude_args(None, claude_args_default if claude_args_default else None)
             if field.key == 'prompt':
                 default = default_spec.positional_tokens[0] if default_spec.positional_tokens else ""
             elif field.key == 'system_prompt':
-                default = default_spec.user_system or default_spec.user_append or ""
+                default = default_spec.user_system or ""
+            elif field.key == 'append_system_prompt':
+                default = default_spec.user_append or ""
             else:  # background
                 default = default_spec.is_background
         else:
@@ -998,19 +1040,21 @@ class LaunchScreen:
             self.tui.flash_error(f"Invalid HCOM_CLAUDE_ARGS: {'; '.join(spec.errors)}")
             return
 
-        # System flag matches background mode
-        system_flag = None
-        system_value = None
-        if self.state.launch_system_prompt:
-            system_flag = "--system-prompt" if self.state.launch_background else "--append-system-prompt"
-            system_value = self.state.launch_system_prompt
-
+        # Update spec with background and prompt
         spec = spec.update(
             background=self.state.launch_background,
-            system_flag=system_flag,
-            system_value=system_value,
             prompt=self.state.launch_prompt,  # Always pass value (empty string deletes)
         )
+
+        # Build tokens manually to support both system prompt types
+        tokens = list(spec.clean_tokens)
+        if self.state.launch_system_prompt:
+            tokens.extend(['--system-prompt', self.state.launch_system_prompt])
+        if self.state.launch_append_system_prompt:
+            tokens.extend(['--append-system-prompt', self.state.launch_append_system_prompt])
+
+        # Re-parse to get proper spec
+        spec = resolve_claude_args(tokens, None)
 
         # Build argv using spec (preserves all flags from HCOM_CLAUDE_ARGS)
         argv = [str(count), 'claude'] + spec.rebuild_tokens(include_system=True)

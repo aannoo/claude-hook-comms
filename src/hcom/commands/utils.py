@@ -1,7 +1,7 @@
 """Command utilities for HCOM"""
 import sys
 import re
-from ..shared import __version__, MAX_MESSAGE_SIZE
+from ..shared import __version__, MAX_MESSAGE_SIZE, SenderIdentity, SENDER, CLAUDE_SENDER
 
 
 class CLIError(Exception):
@@ -15,8 +15,8 @@ Hook-based communication bus for real-time messaging between Claude Code instanc
 
 Usage: hcom                           # TUI dashboard
        [ENV_VARS] hcom <COUNT> [claude <ARGS>...]
-       hcom watch [--type TYPE] [--instance NAME] [--last N] [--wait SEC]
-       hcom list [--json] [--verbose]
+       hcom watch [--last N] [--wait SEC] [--sql EXPR]
+       hcom list [--json] [-v|--verbose]
        hcom send "message"
        hcom stop [alias|all]
        hcom start [alias]
@@ -29,19 +29,19 @@ Launch Examples:
   claude 'run hcom start'        claude code with prompt also works
 
 Commands:
-  watch               Query recent events (JSON per line)
-    --type TYPE       Filter by event type (message, status)
-    --instance ALIAS  Filter by instance
+  watch               Query recent events (JSON)
     --last N          Limit to last N events (default: 20)
-    --wait SEC        Block until a matching event arrives
+    --wait [SEC]      Block until matching event (default: 60s timeout)
+    --sql EXPR        SQL WHERE clause filter
 
-  list                Show instance status/metadata
-    --json            Emit JSON (one instance per line)
-    --verbose         Include additional metadata
+  list                List current instances status
+    -v, --verbose     Show detailed metadata
+    --json            Emit JSON with detailed data
 
   send "msg"          Send message to all instances
   send "@alias msg"   Send to specific instance/group
     --from <name>     Custom external identity
+    --wait            Block until reply with --from
 
   stop                Stop current instance (from inside Claude)
   stop <alias>        Stop specific instance
@@ -83,40 +83,63 @@ def is_interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
-def resolve_identity(subagent_id: str | None = None) -> str:
-    """Resolve identity in CLI/non-hook context. Returns instance name, 'bigboss', or 'john'"""
+def resolve_identity(subagent_id: str | None = None, custom_from: str | None = None, system_sender: str | None = None) -> SenderIdentity:
+    """Resolve identity in CLI/hook context.
+
+    Args:
+        subagent_id: Explicit subagent ID (from Task tool context)
+        custom_from: Custom display name (--from flag)
+        system_sender: System notification sender name (e.g., 'hcom-launcher')
+
+    Returns:
+        SenderIdentity with kind, name, and instance_data
+
+    Identity kind:
+        - 'external': Custom sender or CLI (--from or bigboss)
+        - 'instance': Real instance (Claude Code with session)
+        - 'system': System notifications (launcher, watchdog, etc)
+    """
     import os
     from ..shared import MAPID
+    from ..core.instances import load_instance_position, resolve_instance_name
+    from ..core.config import get_config
+
+    # System sender (internal notifications) - always system
+    if system_sender:
+        return SenderIdentity(kind='system', name=system_sender, instance_data=None)
+
+    # Custom sender (--from) - always external
+    if custom_from:
+        return SenderIdentity(kind='external', name=custom_from, instance_data=None)
 
     # Subagent explicit (Task tool)
     if subagent_id:
-        from ..core.instances import load_instance_position
         data = load_instance_position(subagent_id)
         if not data:
-            raise ValueError(f"Subagent {subagent_id} not found")
-        return subagent_id
+            # This shouldn't happen - cmd_send validates before calling
+            raise ValueError(f"Subagent '{subagent_id}' position data missing")
+        return SenderIdentity(kind='instance', name=subagent_id, instance_data=data)
 
-    # CLI context
+    # CLI context (not in Claude Code)
     if os.environ.get('CLAUDECODE') != '1':
-        return 'bigboss'
+        return SenderIdentity(kind='external', name=SENDER, instance_data=None)
 
-    # Inside Claude: try session_id, mapid, fallback to john
+    # Inside Claude: try session_id
     session_id = os.environ.get('HCOM_SESSION_ID')
     if session_id:
-        from ..core.instances import resolve_instance_name
-        from ..core.config import get_config
         name, data = resolve_instance_name(session_id, get_config().tag)
         if data:
-            return name
+            return SenderIdentity(kind='instance', name=name, instance_data=data)
 
+    # Try MAPID
     if MAPID:
         from ..core.db import get_instance_by_mapid
         data = get_instance_by_mapid(MAPID)
         if data:
-            return data['name']
+            return SenderIdentity(kind='instance', name=data['name'], instance_data=data)
 
-    # No identity available
-    return 'john'
+    # No identity available - fallback to external 'john'
+    return SenderIdentity(kind='external', name=CLAUDE_SENDER, instance_data=None)
 
 
 def validate_message(message: str) -> str | None:

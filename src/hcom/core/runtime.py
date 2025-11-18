@@ -65,11 +65,11 @@ GROUP TAG: You are in the '{tag}' group.
 - Your hcom connection: {"enabled" if instance_data.get('enabled', False) else "disabled"}
 
 Your HCOM Tools:
-- hcom send "msg" (broadcast) / "@alias msg" (direct) / "@tag msg" (tag)
-- hcom list [--json] [--verbose]  → See other participants, read receipts, state/current info
+- hcom send "msg" (broadcast to all) / "@alias msg" (direct) / "@tag msg" (tag)
+- hcom list [--json]  → See all participants, read receipts, state/current info
 - hcom start/stop   → Connect/disconnect from chat (you run these, user can't run it themselves unless they specify an alias)
-- hcom <count>  → Launch instances in new terminal (you must always run 'hcom help' first to get correct context/syntax/config defaults)
-- Claude code subagents launched with the Task tool can also connect to HCOM, just tell subagents to message via 'hcom' (no need for specific hcom commands, they use use different syntax)
+- hcom <count>  → Launch instances in new terminal (you MUST always run 'hcom help' first to get correct context/syntax/config defaults)
+- Claude code subagents launched with the Task tool can also connect to HCOM, tell subagents to run hcom start.
 
 UI/dashboard:
 - Use 'hcom --new-terminal' to open TUI (message+launch+monitor+manage) for user in new terminal (you can't display TUIs - no TTY)
@@ -79,8 +79,16 @@ Receiving Messages:
 - Format: [new message] sender → you: content
 - Targets specific instance: "@alias".
 - Targets all api-* tagged instances: "@api message".
-- Arrives automatically via hooks/bash. No proactive checking needed.
-- Stop hook feedback shows: {{"decision": "block"}} (this is normal operation).
+- Arrives automatically like push notifications via hooks/bash. No proactive checking needed.
+
+Status Indicators:
+- ▶ active (working on task)
+- ▷ delivered (received message, working)
+- ◉ waiting (idle, ready for work)
+- ■ blocked (needs user approval)
+- ○ exited (session ended)
+- ⊙ stale (timeout, can't receive messages)
+- ◦ unknown (status unavailable)
 
 Response Routing:
 - HCOM message (via hook/bash) → Respond with hcom send
@@ -113,162 +121,159 @@ def build_launch_context(instance_name: str) -> str:
     instance_data = load_instance_position(instance_name)
     return f"""[HCOM LAUNCH INFORMATION]
 
-YOUR CURRENT HCOM INFO:
+## YOUR CURRENT HCOM INFO:
 Alias: {instance_name}
 Connection: {"enabled" if instance_data.get('enabled', False) else "disabled"}
-Current ~/.hcom/config.env values:{config_display}
+Current ~/.hcom/config.env values have been set to:{config_display}
 
-USAGE/CONTROL TIPS:
-- launch is directory-specific (always cd to folder first)
-- default to launching normal foreground instances unless told to do headless or subagents (task tool - multiple in parallel)
-- Everyone shares the same group chat, isolate with tags/@mentions
-- Headless instances can only read files by default unless you use --allowedTools=Bash,Write,<other-tools-comma-separated>
-- Resuming a dead instance will maintain hcom identity and history: --resume <sessionid> (get sessionid from hcom list --json)
-- Instances require an initial prompt otherwise they will not connect to hcom automatically and will need the human user to manually prompt them.
+## USAGE/CONTROL:
+- launch is directory-specific (always cd first)
+- default to normal foreground instances unless told to use headless/subagents
+- Everyone shares group chat, isolate with tags/@mentions
+- Headless instances can only read files and respond in hcom by default, for more, use --tools Bash,Write
+- Resume dead instances to maintain hcom identity/history: --resume <session_id> (get id from hcom list --verbose)
+- Instances require an initial prompt to auto-connect to hcom otherwise needs human user intervention
+- Do not use sleep commands, instead use hcom watch --wait with the specific condition you are waiting for
 
-EVENT QUERY (hcom watch == historial, hcom list == current):
-Output: NDJSON from ~/.hcom/hcom.db events table
-Schema: events(id, timestamp, type, instance, data)
-    type:
-    message - {{"from", "to", "text", "mention"}}
-    status  - {{status, context}}
-        status: active, delivered (working)| waiting (avaliable for work) | blocked (need user approval) | exited, stale, unknown (dead)
-        context: tool name, msg sender etc.
+
+## EVENT/INSTANCE QUERY
+watch - historical, from events table (NDJSON stream)
+types:
+- message: from,scope,recipients...
+- status: active/delivered=working, waiting=ready for work, blocked=need user approval, exited/stale/unknown=dead
+- life: action: created|started|stopped|launched|exited
+
+list - current, from instances table (NDJSON snapshot)
+- read_receipts, hcom_connected, status, wait_timeout...
+
 Usage:
-    hcom watch --type status --last 50  # (most recent 50 status events)
-    hcom list --json | jq 'select(has("_self") | not) | .[] | select(.status_age_seconds < 300)' # Filter with jq
-    sqlite3 ~/.hcom/hcom.db "SELECT * FROM events WHERE type='message' LIMIT 20"  # Direct SQL
-    hcom watch --wait 60 --type status | while read -r e; do... (exit 0=match, 1=timeout) (use --wait instead of sleep)
+hcom list --json | jq '.[] | select(.status_age_seconds < 300)' # Filter stale instances
+hcom watch --sql "type = 'life'" | jq ....
+sqlite3 ~/.hcom/hcom.db "SELECT * FROM..."  # Direct SQL (2 tables: instances & events)
 
-BEHAVIOUR:
+Always use watch --wait with --sql instead of sleep:
+Wrong: sleep 10 && hcom list && sleep 10 && hcom list && sleep 10 && hcom list
+Right: hcom watch --wait 60 --sql "type = 'status' AND json_extract(data, '$.status') = 'waiting'" # blocks until specific event or timeout (exit 0=match, 1=timeout, 2=error, 3=interrupted by @mention)
+
+
+## BEHAVIOUR
 - All instances receive HCOM SESSION CONFIG info automatically
-- Instances can't do anything when idle—they are awoken when they receive a message (like push notifications, no need for manual 'sleep' commands)
-- Task tool subagents (Task, Explore, Plan, custom agents/<name>.md, etc.) inherit parent attributes, i.e., start/stop state and name (john → john-general-purpose-1)
+- Idle/waiting instances can't do anything except wake on message delivery
+- Task tool subagents inherit their parents hcom state/name (john → john-general-purpose-1)
 
-COORDINATION:
-- Instances need explicit instructions/structure about what to do and when/how they should use hcom to effectively coordinate/collaborate
-- Define (in initial prompt, system prompt, HCOM_AGENT, HCOM_HINTS, etc.) precisely what each instance should and should not do in terms of roles and responsibilities
-- Context Sharing: Encourage instances to use markdown files to share large pieces of information between them
-- Define structured message passing logic between agents rather than free-form chat where possible, as this reduces hallucination cascading
-- To orchestrate instances yourself, use --append-system-prompt "prioritize messages from <your_hcom_alias>" when launching instances
-- You should generally always use a system prompt (via HCOM_AGENT or --append-system-prompt etc.) unless theres a good reason not to
-- Use coordination patterns where possible ie. peer review, controller-worker, pipeline, hub-spoke, parallel execution, async tasks, planner->coder->reviewer, iterative loops, tdd, ideally verify/reviewer/critique always included etc
-- Consider using source and subshell to launch if easier, ie long text difficult for command line: (source long-custom-vars.env && hcom 1)
 
-ENVIRONMENT VARIABLES
+## COORDINATION
+- Define explicit roles/responsibilities/instructions (via system prompt, initial prompt, HCOM_AGENT, HCOM_HINTS) - how each instance should communicate (what, when, why, etc) hcom and what they should/shouldn't do. It is needed for effective collaboration.
+- Share large context via markdown files - create md in folder -> hcom send 'everyone read shared-context.md'
+- Use structured message passing over free-form chat (reduces hallucination cascading)
+- To orchestrate instances yourself, use --append-system-prompt "prioritize messages from <your_hcom_alias>"
+- Use system prompts (HCOM_AGENT, --append-system-prompt, etc) unless there's a good reason not to
+- For long args or to manage multiple launch profiles: source long-custom-vars.env && hcom 1
 
-#### HCOM_TAG
 
-Description: Give launched instances a prefix in their alias, i.e., {{tag}}-{{alias}}
+## ENVIRONMENT VARIABLES
 
-Uses: Group, isolate, or label instances
+### HCOM_TAG
 
-Group or label example:
-`hcom send "@api check the logs"` targets all api-* instances
+#### Different groups on the same project:
+HCOM_TAG=backend hcom 3 && HCOM_TAG=frontend hcom 3
+Instances use @mention tag for inside group and @mention alias (found via hcom list) or broadcast for outside group
 
-Isolate multiple groups example:
+#### Isolated via one central coordinator
+Make sure all instances running are launched with: --append-system-prompt "always use @<coordinator_alias> when sending hcom messages"
+Coordinator can route messages: instance_a <-> coordinator <-> instance_b
+Or coordinator can not route (ie paralell execution): coordinator 1<->many instances
+
+#### Isolate multiple groups:
 for label in frontend-team backend-team; do
-  HCOM_TAG=$label hcom 2 claude --append-system-prompt "always use @$label"
-done
+  HCOM_TAG=$label hcom 2 claude --append-system-prompt "always use @$label [and/or @coordinator_alias]"
 
 Notes:
 - Tags are letters, numbers, and hyphens only
-- To isolate single instances, use --system-prompt 'always use @bigboss when sending hcom messages' for all active instances, or set similar text via HCOM_HINTS
 
 
-#### HCOM_AGENT
-
-Description: Automatically load system prompts from markdown files (.claude/agents/{{name}}.md and ~/.claude/...)
-
-.claude/agents/*.md files are YAML frontmatter files created by users/Claude for use as Task tool subagents in Claude Code. HCOM can load them as regular instances.
+### HCOM_AGENT
+.claude/agents/*.md are YAML frontmatter files created by user/Claude for use as Task tool subagents.
+HCOM can load them as regular instances. You can create them dynamically.
 
 File format:
 ```markdown
 ---
 model: sonnet
-tools: Bash,Read,Write
+tools: Bash,Write,WebSearch
 ---
-You are a senior code reviewer focusing on security and performance...
+You are a senior code reviewer focusing on...
 ```
 
 HCOM_AGENT parses the file and merges with Claude args:
-- --model
-- --allowedTools
-- --system-prompt (or --append-system-prompt)
+--model
+--allowedTools
+--system-prompt (or --append-system-prompt)
 
 Notes:
 - Filename: lowercase letters and hyphens only
-- Multiple comma-separated agents multiply instance count: HCOM_AGENT=reviewer,tester hcom 2 == 4 instances (2 per agent)
+- Multiple comma-separated: HCOM_AGENT=reviewer,tester hcom 1 == 2 instances (1 reviewer, 1 tester)
 
 
-#### HCOM_HINTS
-
-Description: Append extra context/instructions to every message delivered to instances in format: "message | [hints]"
-
+### HCOM_HINTS
 Uses: Behavioral guidelines, context reminders, formatting requests, workflow hints
 
 
-#### HCOM_TIMEOUT and HCOM_SUBAGENT_TIMEOUT
-
-Description: Control how long instances stay connected to HCOM when idle
-
-After timeout (default 30min or 30s for subagents), instances can no longer receive HCOM messages and their status is marked as 'stale'. There's no downside to longer timeouts generally—HCOM polling uses <0.1% CPU. You can keep timeouts long and use `hcom stop {{alias}}` when done.
+### HCOM_TIMEOUT and HCOM_SUBAGENT_TIMEOUT
+After timeout (default 30min, 30s for subagents), instances can't receive messages, marked 'stale'. No downside to longer timeouts (polling <0.1% CPU). Use default or long timeout and `hcom stop {{alias}}` to stop early if needed.
 
 Timeout behavior:
-- Normal terminal instances: Process still running and terminal window open, user must send new prompt to restart HCOM
-- Headless instances: Die and can only be restarted with `hcom 1 claude --resume <sessionid>`
-- Task tool subagents: Die and all siblings die and can only be resumed by parent instance (launched at same time, i.e., multiple Task tool uses in parallel). Task tool subagents are not asynchronous—main instance must wait for subagents to finish before taking any action—so the default timeout is 30 seconds.
+- Normal: terminal stays open, process still running, user must send prompt for instance to re-join hcom connection
+- Headless: dies, can only be restarted with --resume <sessionid>
+- Subagents: die and all siblings die, their parent must resume. Non-asynchronous (parent waits for completion). Default 30s.
 
 Notes:
-- Timer resets on ANY activity (receiving/sending messages, tool use)
+- Timer resets on any activity (messages, tool use)
 - Stale instances cannot be manually restarted with `hcom start {{alias}}`
 
 
-#### HCOM_TERMINAL
-
-Purpose: Customize terminal launching behavior
-
-Options:
-1. 'new' (default): Launches platform-specific terminal
-   - macOS: Terminal.app | Windows & WSL: Windows Terminal | Linux: gnome-terminal, konsole, xterm
-
-2. 'here': Runs in current terminal
-   - For one instance only
-   - Blocks until Claude exits
-   - YOU cannot use 'HCOM_TERMINAL=here' - Claude cannot launch claude within itself, must be in a new or custom terminal
-
-3. 'print': Prints launch script without executing (for debugging)
-
-4. 'custom {{script}}': Use preferred terminal emulator
-   - Must include {{script}} placeholder which gets replaced with script path
-   - Example: HCOM_TERMINAL='open -n -a kitty.app --args bash "{{script}}"' hcom 1
-
-Notes:
-- Headless and Task tool subagents ignore HCOM_TERMINAL
+### HCOM_TERMINAL
+- You cannot use HCOM_TERMINAL=here (Claude can't launch itself, no TTY, needs new terminal)
+- Custom must include {{script}} placeholder. Example: HCOM_TERMINAL='open -n -a kitty.app --args bash "{{script}}"' hcom 1
+- Headless and task tool subagents ignore HCOM_TERMINAL
 
 
-#### HCOM_CLAUDE_ARGS
+### HCOM_CLAUDE_ARGS
+Run 'claude --help' for all flags. Syntax: hcom 1 claude [options] [command] [prompt]
 
-Description: Default Claude args for all launched instances
-
-Run 'claude --help' to see all flags/options/commands: 'hcom 1 claude [options] [command] [prompt]'
-
-HCOM_CLAUDE_ARGS are merged with CLI args, with CLI taking precedence on a per-flag basis:
-- Config: HCOM_CLAUDE_ARGS='--model sonnet "hello"'
+Merging with CLI: Per-flag precedence
+- Example: HCOM_CLAUDE_ARGS='--model sonnet "hello"'
 - Run: hcom 1 claude --model opus
-- Result: --model opus "hello"
+- Result: --model opus "hello" (CLI --model wins, positional "hello" inherited from env)
+
+Precedence:
+1. Env var level: config.env HCOM_CLAUDE_ARGS < shell HCOM_CLAUDE_ARGS (overrides the complete string)
+2. CLI level: env HCOM_CLAUDE_ARGS < CLI args (overrides per flag individually)
+   - Positionals inherited from env if not provided at CLI
+   - Empty string "" deletes env positional initial prompt: `hcom 1 claude ""`
 
 Notes:
-- You can use --system-prompt or --append-system-prompt for headless instances, but only --append-system-prompt for normal instances
+- Both --system-prompt and --append-system-prompt work in interactive and headless modes (since Claude Code v2.0.14)
+- Use --append-system-prompt to add to Claude Code's default behavior
+- Use --system-prompt to completely replace the system prompt
+- Complex args/quoting? Use: source my-launch.env
 
+#### Configuration Notes
 
-Configuration Notes
+Env var precedence (per variable): HCOM defaults < config.env < shell env vars
 
-- Precedence: config.env < shell env vars < HCOM defaults
-- Empty string "" deletes config.env positional prompt: hcom 1 claude ""
-- Values from config.env are applied to every launch. To enable consistent behavior regardless of config, pass all ENV vars. Empty env vars clear values.
+Each resolves independently:
+- HCOM_TAG in config.env only → config.env wins
+- HCOM_TAG in both → shell wins
+- Empty (`HCOM_TAG=""`) clears config.env value
+
+Behavior:
+- config.env applies to every launch
+- Explicitly use all ENV vars in custom.env files and remember to override values inline if needed
+
 
 ------"""
+
 
 
 def notify_instance(instance_name: str, timeout: float = 0.05) -> None:

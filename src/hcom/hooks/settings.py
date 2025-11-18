@@ -24,12 +24,14 @@ HOOK_CONFIGS = [
 # Derived from HOOK_CONFIGS - guaranteed to stay in sync
 ACTIVE_HOOK_TYPES = [cfg[0] for cfg in HOOK_CONFIGS]
 HOOK_COMMANDS = [cfg[2] for cfg in HOOK_CONFIGS]
-LEGACY_HOOK_TYPES = ACTIVE_HOOK_TYPES
-LEGACY_HOOK_COMMANDS = HOOK_COMMANDS  # For backwards compatibility
+
+# NOTE: If you remove a hook type from HOOK_CONFIGS in the future, add it to a
+# LEGACY_HOOK_TYPES list for cleanup: LEGACY_HOOK_TYPES = ACTIVE_HOOK_TYPES + ['RemovedHook']
+# Then use LEGACY_HOOK_TYPES in _remove_hcom_hooks_from_settings() to clean up old installations.
 
 # Hook removal patterns - used by _remove_hcom_hooks_from_settings()
-# Dynamically build from LEGACY_HOOK_COMMANDS to match current and legacy hook formats
-_HOOK_ARGS_PATTERN = '|'.join(LEGACY_HOOK_COMMANDS)
+# Dynamically build from HOOK_COMMANDS to match current and legacy hook formats
+_HOOK_ARGS_PATTERN = '|'.join(HOOK_COMMANDS)
 HCOM_HOOK_PATTERNS = [
     re.compile(r'\$\{?HCOM'),                                # Current: Environment variable ${HCOM:-...}
     re.compile(r'\bHCOM_ACTIVE.*hcom\.py'),                 # LEGACY: Unix HCOM_ACTIVE conditional
@@ -64,8 +66,8 @@ def _remove_hcom_hooks_from_settings(settings: dict[str, Any]) -> None:
     if not isinstance(settings['hooks'], dict):
         return
 
-    # Check all hook types including PostToolUse for backward compatibility cleanup
-    for event in LEGACY_HOOK_TYPES:
+    # Check all active hook types for cleanup
+    for event in ACTIVE_HOOK_TYPES:
         if event not in settings['hooks']:
             continue
 

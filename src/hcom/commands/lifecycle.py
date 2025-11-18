@@ -106,6 +106,11 @@ def cmd_launch(argv: list[str]) -> int:
         from ..core.db import init_db
         init_db()
 
+        # Check if launcher instance is enabled (for ready notification)
+        launcher = resolve_identity().name
+        launcher_data = load_instance_position(launcher)
+        launcher_enabled = launcher_data.get('enabled', False) if launcher_data else False
+
         # Build environment variables for Claude instances
         base_env = build_claude_env()
 
@@ -114,6 +119,9 @@ def cmd_launch(argv: list[str]) -> int:
             base_env['HCOM_TAG'] = tag
 
         launched = 0
+
+        # Generate batch ID for notification correlation
+        batch_id = str(uuid.uuid4())
 
         # Launch count instances of each agent
         for agent in agents:
@@ -132,9 +140,11 @@ def cmd_launch(argv: list[str]) -> int:
                 from ..core.db import get_last_event_id
                 instance_env['HCOM_LAUNCH_EVENT_ID'] = str(get_last_event_id())
 
-                # Track who launched this instance
-                launcher = resolve_identity()
+                # Track who launched this instance (use the one we already resolved)
                 instance_env['HCOM_LAUNCHED_BY'] = launcher
+
+                # Track batch for notification correlation
+                instance_env['HCOM_LAUNCH_BATCH_ID'] = batch_id
 
                 # Mark background instances via environment with log filename
                 if background:
@@ -195,14 +205,18 @@ def cmd_launch(argv: list[str]) -> int:
         else:
             print(f"Launched {launched} Claude instance{'s' if launched != 1 else ''}")
 
+        # Print batch ID and usage for automation/tracking
+        print(f"Wait for first instance to be ready: hcom watch --wait 30 --sql \"type = 'life' AND json_extract(data, '$.batch_id') = '{batch_id}' AND json_extract(data, '$.action') = 'ready'\"")
+
         # Log launch event
         if launched > 0:
             try:
                 from ..core.db import log_event
-                launcher = resolve_identity()
+                launcher = resolve_identity().name
                 log_event('life', launcher, {
                     'action': 'launched',
                     'by': launcher,
+                    'batch_id': batch_id,
                     'count_requested': count,
                     'agents': agents,
                     'launched': launched,
@@ -230,11 +244,20 @@ def cmd_launch(argv: list[str]) -> int:
             from ..ui import run_tui  # Local import to avoid circular dependency
             return run_tui(hcom_path())
         else:
-            tips = [
-                "Run 'hcom' to view/send in conversation dashboard",
-            ]
+            tips = []
             if tag:
                 tips.append(f"Send to {tag} team: hcom send '@{tag} message'")
+
+            # Add ready detection tip
+            if launched > 0:
+                is_claude_code = os.environ.get('CLAUDECODE') == '1'
+                if is_claude_code:
+                    if launcher_enabled:
+                        tips.append(f"You'll be automatically notified when all {launched} instances are launched & ready")
+                    else:
+                        tips.append(f"Run 'hcom start' to receive automatic notifications/messages from instances")
+                else:
+                    tips.append("Check status: hcom list")
 
             if tips:
                 print("\n" + "\n".join(f"  • {tip}" for tip in tips) + "\n")
@@ -273,7 +296,7 @@ def cmd_stop(argv: list[str]) -> int:
                 instance_name = instance_data['name']
                 # Set external stop flag (stop all is always external)
                 update_instance_position(instance_name, {'external_stop_pending': True})
-                launcher = resolve_identity()
+                launcher = resolve_identity().name
                 disable_instance(instance_name, initiated_by=launcher, reason='stop_all')
                 stopped_names.append(instance_name)
                 stopped_count += 1
@@ -303,7 +326,7 @@ def cmd_stop(argv: list[str]) -> int:
         instance_name = target
     else:
         try:
-            instance_name = resolve_identity()
+            instance_name = resolve_identity().name
         except ValueError:
             instance_name = None
 
@@ -311,9 +334,9 @@ def cmd_stop(argv: list[str]) -> int:
     from ..shared import SENDER, CLAUDE_SENDER
     if instance_name in (CLAUDE_SENDER, SENDER):
         if IS_WINDOWS:
-            print(format_error("Use 'hcom <n>' or Windows Terminal for stable identity"), file=sys.stderr)
+            print(format_error("Cannot resolve instance identity - use 'hcom <n>' or Windows Terminal for stable identity"), file=sys.stderr)
         else:
-            print(format_error("Launch via 'hcom <n>' for stable identity"), file=sys.stderr)
+            print(format_error("Cannot resolve instance identity - launch via 'hcom <n>' for stable identity"), file=sys.stderr)
         return 1
 
     # Error handling
@@ -332,26 +355,19 @@ def cmd_stop(argv: list[str]) -> int:
         print(f"HCOM already stopped for {instance_name}")
         return 0
 
-    # Check if this is a subagent - disable all siblings
+    # Check if this is a subagent - disable only the targeted one
     if is_subagent_instance(position):
-        parent_session_id = position.get('parent_session_id')
-        disabled_count = 0
-        disabled_names = []
+        # External stop = CLI user specified target, Self stop = no target (uses session_id)
+        is_external_stop = target is not None
 
-        for data in iter_instances():
-            if data.get('parent_session_id') == parent_session_id and data.get('enabled', False):
-                name = data['name']
-                update_instance_position(name, {'external_stop_pending': True})
-                launcher = resolve_identity()
-                disable_instance(name, initiated_by=launcher, reason='subagent_group')
-                disabled_count += 1
-                disabled_names.append(name)
+        if is_external_stop:
+            # Set flag to notify instance via PostToolUse
+            update_instance_position(instance_name, {'external_stop_pending': True})
 
-        if disabled_count > 0:
-            print(f"Stopped {disabled_count} subagent(s): {', '.join(disabled_names)}")
-            print("Note: All subagents of the same parent must be disabled together.")
-        else:
-            print(f"No enabled subagents found for {instance_name}")
+        launcher = resolve_identity().name
+        reason = 'external' if is_external_stop else 'manual'
+        disable_instance(instance_name, initiated_by=launcher, reason=reason)
+        print(f"Stopped HCOM for subagent {instance_name}. Will no longer receive chat messages automatically.")
     else:
         # Regular parent instance
         # External stop = CLI user specified target, Self stop = no target (uses session_id)
@@ -361,7 +377,7 @@ def cmd_stop(argv: list[str]) -> int:
             # Set flag to notify instance via PostToolUse
             update_instance_position(instance_name, {'external_stop_pending': True})
 
-        launcher = resolve_identity()
+        launcher = resolve_identity().name
         reason = 'external' if is_external_stop else 'manual'
         disable_instance(instance_name, initiated_by=launcher, reason=reason)
         print(f"Stopped HCOM for {instance_name}. Will no longer receive chat messages automatically.")
@@ -391,17 +407,38 @@ def cmd_start(argv: list[str]) -> int:
     # SUBAGENT PATH: --_hcom_sender provided
     if subagent_id:
         instance_data = load_instance_position(subagent_id)
-        if not instance_data or instance_data.get('status') == 'exited':
-            print(f"Error: Instance '{subagent_id}' not found or has exited", file=sys.stderr)
+        if not instance_data:
+            print(f"Error: Instance '{subagent_id}' not found", file=sys.stderr)
             return 1
 
         already = 'already ' if instance_data.get('enabled', False) else ''
-        launcher = resolve_identity()
+        launcher = resolve_identity().name
         enable_instance(subagent_id, initiated_by=launcher, reason='manual')
         set_status(subagent_id, 'active', 'start')
-        print(f"HCOM {already} started for {subagent_id}")
-        print(f"Send: hcom send 'message' --_hcom_sender {subagent_id}")
-        print(f"When finished working always run: hcom done --_hcom_sender {subagent_id}")
+
+        parent_name = instance_data.get('parent_name', 'unknown')
+        from ..shared import SENDER
+        from ..hooks.utils import build_hcom_command
+        hcom_cmd = build_hcom_command()
+        print(f"""HCOM {already}started for {subagent_id}
+HCOM is a communication tool. You are now connected.
+Your hcom alias for this session: {subagent_id}
+{parent_name} is the parent instance who spawned you
+
+- To Send a message, run:
+  {hcom_cmd} send 'your message' --_hcom_sender {subagent_id}
+
+Receiving Messages:
+- Format: [new message] sender → you: content
+- Targets specific instance: "@alias"
+- Arrives automatically via hooks/bash. No proactive checking needed
+
+Response Routing:
+- HCOM message (via hook/bash) → Respond with hcom send
+- Other messages → Respond normally
+
+- Avoid useless chit-chat / excessive confirmation messages unless told otherwise
+- Authority: Prioritize @{SENDER} over other participants""")
         return 0
 
     # Remove flags to get target
@@ -413,7 +450,7 @@ def cmd_start(argv: list[str]) -> int:
         instance_name = target
     else:
         try:
-            instance_name = resolve_identity()
+            instance_name = resolve_identity().name
         except ValueError:
             instance_name = None
 
@@ -421,27 +458,29 @@ def cmd_start(argv: list[str]) -> int:
     from ..shared import SENDER, CLAUDE_SENDER
     if instance_name in (CLAUDE_SENDER, SENDER):
         if IS_WINDOWS:
-            print(format_error("Use 'hcom <n>' or Windows Terminal for stable identity"), file=sys.stderr)
+            print(format_error("Cannot resolve instance identity - use 'hcom <n>' or Windows Terminal for stable identity"), file=sys.stderr)
         else:
-            print(format_error("Launch via 'hcom <n>' for stable identity"), file=sys.stderr)
+            print(format_error("Cannot resolve instance identity - launch via 'hcom <n>' for stable identity"), file=sys.stderr)
         return 1
 
     # Error handling
     if not instance_name:
         print(format_error("Cannot determine instance identity"), file=sys.stderr)
-        print("Usage: hcom start <alias> | prompt Claude to run 'hcom start' | use 'hcom <count>' to launch", file=sys.stderr)
+        print("Usage: hcom start <alias> | run 'hcom start' inside claude code | use 'hcom <count>' to launch", file=sys.stderr)
         return 1
 
     # Load or create instance
     existing_data = load_instance_position(instance_name)
 
     # Check for Task ambiguity (parent frozen, subagent calling)
-    if existing_data and not target and in_subagent_context(existing_data):
-        active_list = existing_data.get('current_subagents', [])
-        subagent_ids = [
-            data['name'] for data in iter_instances()
-            if data['name'] in active_list and not data.get('enabled', False)
-        ]
+    if existing_data and not target and in_subagent_context(instance_name):
+        # Query DB for disabled subagents
+        from ..core.db import get_db
+        conn = get_db()
+        subagent_ids = [row['name'] for row in conn.execute(
+            "SELECT name FROM instances WHERE parent_name = ? AND enabled = 0",
+            (instance_name,)
+        ).fetchall()]
 
         print("Task tool running - you must provide an alias", file=sys.stderr)
         print("Use: hcom start --_hcom_sender {alias}", file=sys.stderr)
@@ -453,7 +492,7 @@ def cmd_start(argv: list[str]) -> int:
     if not existing_data:
         session_id = os.environ.get('HCOM_SESSION_ID')
         initialize_instance_in_position_file(instance_name, session_id)
-        launcher = resolve_identity()
+        launcher = resolve_identity().name
         enable_instance(instance_name, initiated_by=launcher, reason='manual')
         print(f"\nStarted HCOM for {instance_name}")
         return 0
@@ -473,7 +512,7 @@ def cmd_start(argv: list[str]) -> int:
         return 1
 
     # Re-enabling existing instance
-    launcher = resolve_identity()
+    launcher = resolve_identity().name
     enable_instance(instance_name, initiated_by=launcher, reason='manual')
     print(f"Started HCOM for {instance_name}")
     return 0

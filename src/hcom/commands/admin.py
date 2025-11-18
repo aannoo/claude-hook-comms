@@ -8,8 +8,7 @@ from datetime import datetime
 from typing import Any
 from .utils import get_help_text, format_error
 from ..core.paths import hcom_path, SCRIPTS_DIR, LOGS_DIR, ARCHIVE_DIR
-from ..core.instances import get_instance_status
-from ..core.db import iter_instances
+from ..core.instances import get_instance_status, is_external_sender
 from ..shared import STATUS_ICONS
 
 
@@ -33,30 +32,38 @@ def cmd_help() -> int:
 
 
 def cmd_watch(argv: list[str]) -> int:
-    """Query events from SQLite: hcom watch [--type TYPE] [--instance NAME] [--last N] [--wait SEC]"""
+    """Query events from SQLite: hcom watch [--last N] [--wait SEC] [--sql EXPR]"""
     from ..core.db import get_db, init_db, get_last_event_id
 
     init_db()  # Ensure schema exists
 
     # Parse arguments
-    event_type = None
-    instance_filter = None
     last_n = 20  # Default: last 20 events
     wait_timeout = None
+    sql_where = None
 
     i = 0
     while i < len(argv):
-        if argv[i] == '--type' and i + 1 < len(argv):
-            event_type = argv[i + 1]
+        if argv[i] == '--last' and i + 1 < len(argv):
+            try:
+                last_n = int(argv[i + 1])
+            except ValueError:
+                print(f"Error: --last must be an integer, got '{argv[i + 1]}'", file=sys.stderr)
+                return 1
             i += 2
-        elif argv[i] == '--instance' and i + 1 < len(argv):
-            instance_filter = argv[i + 1]
-            i += 2
-        elif argv[i] == '--last' and i + 1 < len(argv):
-            last_n = int(argv[i + 1])
-            i += 2
-        elif argv[i] == '--wait' and i + 1 < len(argv):
-            wait_timeout = int(argv[i + 1])
+        elif argv[i] == '--wait':
+            if i + 1 < len(argv) and not argv[i + 1].startswith('--'):
+                try:
+                    wait_timeout = int(argv[i + 1])
+                except ValueError:
+                    print(f"Error: --wait must be an integer, got '{argv[i + 1]}'", file=sys.stderr)
+                    return 1
+                i += 2
+            else:
+                wait_timeout = 60  # Default: 60 seconds
+                i += 1
+        elif argv[i] == '--sql' and i + 1 < len(argv):
+            sql_where = argv[i + 1]
             i += 2
         else:
             i += 1
@@ -64,27 +71,55 @@ def cmd_watch(argv: list[str]) -> int:
     # Build base query for filters
     db = get_db()
     filter_query = ""
-    params = []
 
-    if event_type:
-        filter_query += " AND type = ?"
-        params.append(event_type)
-
-    if instance_filter:
-        filter_query += " AND instance = ?"
-        params.append(instance_filter)
+    # Add user SQL WHERE clause directly (no validation needed)
+    # Note: SQL injection is not a security concern in hcom's threat model.
+    # User (or ai) owns ~/.hcom/hcom.db and can already run: sqlite3 ~/.hcom/hcom.db "anything"
+    # Validation would block legitimate queries while providing no actual security.
+    if sql_where:
+        filter_query += f" AND ({sql_where})"
 
     # Wait mode: block until matching event or timeout
     if wait_timeout:
+        # Check for matching events in last 10s (race condition window)
+        from datetime import timezone
+        lookback_timestamp = datetime.fromtimestamp(time.time() - 10, tz=timezone.utc).isoformat()
+        lookback_query = f"SELECT * FROM events WHERE timestamp > ?{filter_query} ORDER BY id DESC LIMIT 1"
+
+        try:
+            lookback_row = db.execute(lookback_query, [lookback_timestamp]).fetchone()
+        except Exception as e:
+            print(f"Error in SQL WHERE clause: {e}", file=sys.stderr)
+            return 2
+
+        if lookback_row:
+            try:
+                event = {
+                    'ts': lookback_row['timestamp'],
+                    'type': lookback_row['type'],
+                    'instance': lookback_row['instance'],
+                    'data': json.loads(lookback_row['data'])
+                }
+                # Found recent matching event, return immediately
+                print(json.dumps(event))
+                return 0
+            except (json.JSONDecodeError, TypeError):
+                pass  # Ignore corrupt event, continue to wait loop
+
         start_time = time.time()
         last_id = get_last_event_id()
 
         while time.time() - start_time < wait_timeout:
             query = f"SELECT * FROM events WHERE id > ?{filter_query} ORDER BY id"
-            rows = db.execute(query, [last_id] + params).fetchall()
+
+            try:
+                rows = db.execute(query, [last_id]).fetchall()
+            except Exception as e:
+                print(f"Error in SQL WHERE clause: {e}", file=sys.stderr)
+                return 2
 
             if rows:
-                # Print matching events and exit success
+                # Process matching events
                 for row in rows:
                     try:
                         event = {
@@ -93,12 +128,30 @@ def cmd_watch(argv: list[str]) -> int:
                             'instance': row['instance'],
                             'data': json.loads(row['data'])
                         }
+
+                        # Event matches all conditions, print and exit
                         print(json.dumps(event))
+                        return 0
+
                     except (json.JSONDecodeError, TypeError) as e:
                         # Skip corrupt events, log to stderr
                         print(f"Warning: Skipping corrupt event ID {row['id']}: {e}", file=sys.stderr)
                         continue
-                return 0
+
+                # All events processed, update last_id and continue waiting
+                last_id = rows[-1]['id']
+
+            # Check if current instance received @mention (interrupt wait)
+            from .utils import resolve_identity
+            from ..core.messages import get_unread_messages
+
+            identity = resolve_identity()
+            if identity.kind == 'instance':
+                messages, _ = get_unread_messages(identity.name, update_position=False)
+                if messages:
+                    # Interrupted by @mention, exit early
+                    # PostToolUse will deliver the message
+                    return 3
 
             time.sleep(0.1)
 
@@ -110,7 +163,11 @@ def cmd_watch(argv: list[str]) -> int:
     query += " ORDER BY id DESC"
     query += f" LIMIT {last_n}"
 
-    rows = db.execute(query, params).fetchall()
+    try:
+        rows = db.execute(query).fetchall()
+    except Exception as e:
+        print(f"Error in SQL WHERE clause: {e}", file=sys.stderr)
+        return 2
     # Reverse to chronological order
     for row in reversed(rows):
         try:
@@ -129,22 +186,32 @@ def cmd_watch(argv: list[str]) -> int:
 
 
 def cmd_list(argv: list[str]) -> int:
-    """List instances: hcom list [--json] [--verbose]"""
+    """List instances: hcom list [--json] [-v|--verbose]"""
     from .utils import resolve_identity
     from ..core.instances import load_instance_position
     from ..core.messages import get_read_receipts
+    from ..core.db import get_db
     from ..shared import SENDER, CLAUDE_SENDER
 
-    json_output = '--json' in argv
-    verbose_output = '--verbose' in argv
+    # Parse arguments
+    json_output = False
+    verbose_output = False
+
+    for arg in argv:
+        if arg == '--json':
+            json_output = True
+        elif arg in ['-v', '--verbose']:
+            verbose_output = True
 
     # Resolve current instance identity
-    current_alias = resolve_identity()
+    identity = resolve_identity()
+    current_alias = identity.name
+    sender_identity = identity
 
     # Load read receipts for all contexts (bigboss, john, instances)
     # Limit based on verbose flag: 3 messages if verbose, 1 otherwise
     read_limit = 3 if verbose_output else 1
-    read_receipts = get_read_receipts(current_alias, limit=read_limit)
+    read_receipts = get_read_receipts(sender_identity, limit=read_limit)
 
     # Only show connection status for actual instances (not CLI/fallback)
     show_connection = current_alias not in (SENDER, CLAUDE_SENDER)
@@ -153,11 +220,13 @@ def cmd_list(argv: list[str]) -> int:
         current_data = load_instance_position(current_alias)
         current_enabled = current_data.get('enabled', False) if current_data else False
 
-    # Sort by creation time (newest first) - same as TUI
-    sorted_instances = sorted(
-        iter_instances(),
-        key=lambda x: -x.get('created_at', 0.0)
-    )
+    # Query all instances
+    db = get_db()
+    query = "SELECT * FROM instances WHERE previously_enabled = 1 ORDER BY created_at DESC"
+    rows = db.execute(query).fetchall()
+
+    # Convert rows to dictionaries
+    sorted_instances = [dict(row) for row in rows]
 
     if json_output:
         # JSON per line - _self entry first always
@@ -185,11 +254,16 @@ def cmd_list(argv: list[str]) -> int:
                     "description": description,
                     "headless": bool(data.get("background", False)),
                     "wait_timeout": data.get("wait_timeout", 1800),
+                    "session_id": data.get("session_id", ""),
+                    "directory": data.get("directory", ""),
+                    "parent_name": data.get("parent_name") or None,
+                    "agent_id": data.get("agent_id") or None,
+                    "background_log_file": data.get("background_log_file") or None,
+                    "transcript_path": data.get("transcript_path") or None,
+                    "created_at": data.get("created_at"),
+                    "tcp_mode": bool(data.get("tcp_mode", False)),
                 }
             }
-            if verbose_output:
-                payload[name]["session_id"] = data.get("session_id", "")
-                payload[name]["directory"] = data.get("directory", "")
             print(json.dumps(payload))
     else:
         # Human-readable - show header with alias and read receipts
@@ -228,16 +302,78 @@ def cmd_list(argv: list[str]) -> int:
             age_display = f"{age_str} ago" if age_str else ""
             desc_sep = ": " if description else ""
 
-            # Add [headless] badge
-            headless_badge = " [headless]" if data.get("background", False) else ""
+            # Add badges
+            headless_badge = "[headless]" if data.get("background", False) else ""
+            external_badge = "[external]" if is_external_sender(data) else ""
+            badge_parts = [b for b in [headless_badge, external_badge] if b]
+            badge_str = (" " + " ".join(badge_parts)) if badge_parts else ""
+            name_with_badges = f"{name}{badge_str}"
+
+            # Main status line
+            print(f"{icon} {name_with_badges:30} {state}  {age_display}{desc_sep}{description}")
 
             if verbose_output:
-                directory = data.get("directory", "unknown")
-                session_id = data.get("session_id", "")
+                # Multi-line detailed view
+                import os
+
+                # Format fields
+                session_id = data.get("session_id", "(none)")
+                directory = data.get("directory", "(none)")
                 timeout = data.get("wait_timeout", 1800)
-                print(f"{icon} {name:15}{headless_badge} {state}  {age_display}{desc_sep}{description} (dir: {directory}, session_id: {session_id}, timeout: {timeout}s)")
-            else:
-                print(f"{icon} {name:15}{headless_badge} {state}  {age_display}{desc_sep}{description}")
+
+                parent = data.get("parent_name") or "(none)"
+
+                # Format paths (shorten with ~)
+                log_file = data.get("background_log_file")
+                if log_file:
+                    log_file = log_file.replace(os.path.expanduser("~"), "~")
+                else:
+                    log_file = "(none)"
+
+                transcript = data.get("transcript_path")
+                if transcript:
+                    transcript = transcript.replace(os.path.expanduser("~"), "~")
+                else:
+                    transcript = "(none)"
+
+                # Format created_at timestamp
+                created_ts = data.get("created_at")
+                if created_ts:
+                    created_seconds = time.time() - created_ts
+                    if created_seconds < 60:
+                        created = f"{int(created_seconds)}s ago"
+                    elif created_seconds < 3600:
+                        created = f"{int(created_seconds / 60)}m ago"
+                    elif created_seconds < 86400:
+                        created = f"{int(created_seconds / 3600)}h ago"
+                    else:
+                        created = f"{int(created_seconds / 86400)}d ago"
+                else:
+                    created = "(unknown)"
+
+                # Format tcp_mode
+                tcp = "TCP" if data.get("tcp_mode") else "polling"
+
+                # Get subagent agentId if this is a subagent
+                agent_id = None
+                if parent != "(none)":
+                    # This is a subagent - get agentId from its own data
+                    agent_id = data.get("agent_id") or "(none)"
+
+                # Print indented details
+                print(f"    session_id:   {session_id}")
+                print(f"    created:      {created}")
+                print(f"    directory:    {directory}")
+                print(f"    timeout:      {timeout}s")
+                if parent != "(none)":
+                    print(f"    parent:       {parent}")
+                    print(f"    agent_id:     {agent_id}")
+                print(f"    tcp_mode:     {tcp}")
+                if log_file != "(none)":
+                    print(f"    headless log: {log_file}")
+                print(f"    transcript:   {transcript}")
+                print()  # Blank line between instances
+
 
     return 0
 
@@ -256,7 +392,9 @@ def clear() -> int:
 
     scripts_dir = hcom_path(SCRIPTS_DIR)
     if scripts_dir.exists():
-        sum(1 for f in scripts_dir.glob('*') if f.is_file() and f.stat().st_mtime < cutoff_time_24h and f.unlink(missing_ok=True) is None)
+        for f in scripts_dir.glob('*'):
+            if f.is_file() and f.stat().st_mtime < cutoff_time_24h:
+                f.unlink(missing_ok=True)
 
     # Rotate hooks.log at 1MB
     logs_dir = hcom_path(LOGS_DIR)
@@ -267,7 +405,9 @@ def clear() -> int:
 
     # Clean background logs older than 30 days
     if logs_dir.exists():
-        sum(1 for f in logs_dir.glob('background_*.log') if f.stat().st_mtime < cutoff_time_30d and f.unlink(missing_ok=True) is None)
+        for f in logs_dir.glob('background_*.log'):
+            if f.stat().st_mtime < cutoff_time_30d:
+                f.unlink(missing_ok=True)
 
     # Check if DB exists
     if not db_file.exists():

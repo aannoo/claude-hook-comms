@@ -104,11 +104,16 @@ class ManageScreen:
 
             # Calculate dynamic name column width based on actual names
             max_instance_name_len = max((len(name) for name, _ in sorted_instances), default=0)
-            # Check if any instance has background marker
+            # Check if any instance has badges
+            from ..core.instances import is_external_sender
             has_background = any(info.get('data', {}).get('background', False) for _, info in sorted_instances)
-            bg_marker_len = 11 if has_background else 0  # " [headless]"
+            has_external = any(is_external_sender(info.get('data', {})) for _, info in sorted_instances)
+            # Calculate max badge length: " [headless]" (11) + " [external]" (11) = 22
+            badge_len = 0
+            if has_background: badge_len += 11
+            if has_external: badge_len += 11
             # Add space for state symbol on cursor row (2 chars: " +")
-            name_col_width = max_instance_name_len + bg_marker_len + 2
+            name_col_width = max_instance_name_len + badge_len + 2
             # Set bounds: min 20, max based on terminal width
             # Reserve: 2 (icon) + 10 (age) + 2 (sep) + 30 (desc min) = 44
             max_name_width = max(20, width - 44)
@@ -133,10 +138,13 @@ class ManageScreen:
                 age_width = 10
                 age_padded = age_str.rjust(age_width)
 
-                # Background indicator - include in name before padding
+                # Badges - include in name before padding
                 is_background = info.get('data', {}).get('background', False)
+                is_external = is_external_sender(info.get('data', {}))
                 bg_marker_text = " [headless]" if is_background else ""
-                bg_marker_visible_len = 11 if is_background else 0  # " [headless]" = 11 chars
+                ext_marker_text = " [external]" if is_external else ""
+                badges = bg_marker_text + ext_marker_text
+                badge_visible_len = len(bg_marker_text) + len(ext_marker_text)
 
                 # Timeout warning indicator
                 timeout_marker = ""
@@ -158,7 +166,7 @@ class ManageScreen:
 
                 # Smart truncate name to fit in dynamic column width
                 # Available: name_col_width - bg_marker_len - (2 for " +/-" on cursor row)
-                max_name_len = name_col_width - bg_marker_visible_len - 2  # Leave 2 chars for " +" or " -"
+                max_name_len = name_col_width - badge_visible_len - 2  # Leave 2 chars for " +" or " -"
                 display_name = smart_truncate_name(name, max_name_len)
 
                 # State indicator (only on cursor row)
@@ -173,12 +181,12 @@ class ManageScreen:
                     else:
                         state_symbol = "-"
                         state_color = color
-                    # Format: name [headless] +/-
-                    name_with_marker = f"{display_name}{bg_marker_text} {state_symbol}"
+                    # Format: name [badges] +/-
+                    name_with_marker = f"{display_name}{badges} {state_symbol}"
                     name_padded = ansi_ljust(name_with_marker, name_col_width)
                 else:
-                    # Format: name [headless]
-                    name_with_marker = f"{display_name}{bg_marker_text}"
+                    # Format: name [badges]
+                    name_with_marker = f"{display_name}{badges}"
                     name_padded = ansi_ljust(name_with_marker, name_col_width)
 
                 # Description separator - only show if description exists
@@ -188,12 +196,12 @@ class ManageScreen:
                 weight = BOLD if enabled else DIM
 
                 if absolute_idx == self.state.cursor:
-                    # Highlighted row - Format: icon name [headless] +/-  age ago: description [timeout]
+                    # Highlighted row - Format: icon name [badges] +/-  age ago: description [timeout]
                     line = f"{BG_CHARCOAL}{color}{icon} {weight}{color}{name_padded}{RESET}{BG_CHARCOAL}{weight}{FG_GRAY}{age_padded}{desc_sep}{display_text}{timeout_marker}{RESET}"
                     line = truncate_ansi(line, width)
                     line = bg_ljust(line, width, BG_CHARCOAL)
                 else:
-                    # Normal row - Format: icon name [headless]  age ago: description [timeout]
+                    # Normal row - Format: icon name [badges]  age ago: description [timeout]
                     line = f"{color}{icon}{RESET} {weight}{color}{name_padded}{RESET}{weight}{FG_GRAY}{age_padded}{desc_sep}{display_text}{timeout_marker}{RESET}"
                     line = truncate_ansi(line, width)
 
@@ -234,18 +242,21 @@ class ManageScreen:
         # Separator
         lines.append(f"{FG_GRAY}{'─' * width}{RESET}")
 
-        # Messages - compact format with word wrap
+        # Messages - Slack-style format with sender on separate line
         if self.state.messages:
             all_wrapped_lines = []
 
-            # Find longest sender name for alignment - dynamic with reasonable max
-            max_sender_len = max((len(sender) for _, sender, _ in self.state.messages), default=12)
-            # Reserve: 5 (time) + 1 (space) + sender + 1 (space) + 50 (msg min) = 57 + sender
-            # Only expand sender column when width > 69 to avoid jumpiness with narrow terminals
-            max_sender_width = max(12, width - 57) if width > 69 else 12
-            max_sender_len = min(max_sender_len, max_sender_width)
+            # Get instance read positions for read receipt calculation
+            instance_reads = {}
+            try:
+                from ..core.db import get_db
+                conn = get_db()
+                rows = conn.execute("SELECT name, last_event_id FROM instances WHERE previously_enabled = 1").fetchall()
+                instance_reads = {row['name']: row['last_event_id'] for row in rows}
+            except Exception:
+                pass  # No read receipts if DB query fails
 
-            for time_str, sender, message in self.state.messages:
+            for time_str, sender, message, recipients, event_id in self.state.messages:
                 # Format timestamp
                 try:
                     from datetime import datetime
@@ -257,8 +268,45 @@ class ManageScreen:
                 except Exception:
                     display_time = time_str[:5] if len(time_str) >= 5 else time_str
 
-                # Smart truncate sender (prefix + suffix with middle ellipsis)
-                sender_display = smart_truncate_name(sender, max_sender_len)
+                # Build recipient list with read receipts (width-aware truncation)
+                recipient_str = ""
+                if recipients:
+                    # Calculate available width for recipients
+                    # Format: "HH:MM sender → recipients"
+                    base_len = len(display_time) + 1 + len(sender) + 3  # +1 space, +3 for " → "
+                    available = width - base_len - 5  # Reserve 5 chars for potential "+N more"
+
+                    recipient_parts = []
+                    current_len = 0
+                    shown = 0
+
+                    for recipient in recipients:
+                        # Check if recipient has read this message
+                        has_read = instance_reads.get(recipient, 0) >= event_id
+                        tick = " ✓" if has_read else ""
+                        part = f"{recipient}{tick}"
+
+                        # Calculate length with separator
+                        part_len = ansi_len(part) + (2 if shown > 0 else 0)  # +2 for ", "
+
+                        if current_len + part_len <= available:
+                            recipient_parts.append(part)
+                            current_len += part_len
+                            shown += 1
+                        else:
+                            break
+
+                    if recipient_parts:
+                        recipient_str = ", ".join(recipient_parts)
+                        remaining = len(recipients) - shown
+                        if remaining > 0:
+                            recipient_str += f" {FG_GRAY}+{remaining} more{RESET}"
+                        recipient_str = f" {FG_GRAY}→{RESET} {recipient_str}"
+
+                # Header line: timestamp + sender + recipients (truncated to width)
+                header = f"{FG_GRAY}{display_time}{RESET} {BOLD}{sender}{RESET}{recipient_str}"
+                header = truncate_ansi(header, width)
+                all_wrapped_lines.append(header)
 
                 # Replace literal newlines with space for preview
                 display_message = message.replace('\n', ' ')
@@ -267,28 +315,25 @@ class ManageScreen:
                 if '@' in display_message:
                     display_message = re.sub(r'(@[\w\-_]+)', f'{BOLD}\\1{RESET}{FG_LIGHTGRAY}', display_message)
 
-                # Calculate available width for message (reserve space for time + sender + spacing)
-                # Format: "HH:MM sender message"
-                prefix_len = 5 + 1 + max_sender_len + 1  # time + space + sender + space
-                max_msg_len = width - prefix_len
+                # Message lines with indent (6 spaces for visual balance)
+                indent = '      '
+                max_msg_len = width - len(indent)
 
                 # Wrap message text
                 if max_msg_len > 0:
                     wrapper = AnsiTextWrapper(width=max_msg_len)
                     wrapped = wrapper.wrap(display_message)
 
-                    # Add timestamp/sender to first line, indent continuation lines manually
-                    # Add color to each line so truncation doesn't lose formatting
-                    indent = ' ' * prefix_len
-                    for i, wrapped_line in enumerate(wrapped):
-                        if i == 0:
-                            line = f"{FG_GRAY}{display_time}{RESET} {sender_display:<{max_sender_len}} {FG_LIGHTGRAY}{wrapped_line}{RESET}"
-                        else:
-                            line = f"{indent}{FG_LIGHTGRAY}{wrapped_line}{RESET}"
+                    # All message lines indented uniformly
+                    for wrapped_line in wrapped:
+                        line = f"{indent}{FG_LIGHTGRAY}{wrapped_line}{RESET}"
                         all_wrapped_lines.append(line)
                 else:
                     # Fallback if width too small
-                    all_wrapped_lines.append(f"{FG_GRAY}{display_time}{RESET} {sender_display:<{max_sender_len}}")
+                    all_wrapped_lines.append(f"{indent}{FG_LIGHTGRAY}{display_message[:width-len(indent)]}{RESET}")
+
+                # Blank line after each message (for separation)
+                all_wrapped_lines.append('')
 
             # Take last N lines to fit available space (mid-message truncation)
             visible_lines = all_wrapped_lines[-message_rows:] if len(all_wrapped_lines) > message_rows else all_wrapped_lines

@@ -48,10 +48,12 @@ class UIState:
     launch_count: str = "1"
     launch_prompt: str = ""
     launch_system_prompt: str = ""
+    launch_append_system_prompt: str = ""
     launch_background: bool = False
     launch_field: LaunchField = LaunchField.COUNT
     launch_prompt_cursor: int = 0
     launch_system_prompt_cursor: int = 0
+    launch_append_system_prompt_cursor: int = 0
     config_field_cursors: dict = field(default_factory=dict)
 
     # Config state
@@ -90,3 +92,8 @@ class UIState:
     # Rendering cache
     last_event_id: int = 0
     last_message_time: float = 0.0
+
+    # LOG filtering
+    log_filter: str = ""                   # Current filter query (empty = inactive)
+    log_filter_cursor: int = 0             # Cursor position in filter input
+    log_event_type: str = "all"            # Event type filter: "all", "message", "status", "life"

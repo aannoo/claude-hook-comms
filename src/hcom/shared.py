@@ -7,8 +7,10 @@ import platform
 import re
 import os
 from pathlib import Path
+from dataclasses import dataclass
+from typing import Literal
 
-__version__ = "0.6.3"
+__version__ = "0.6.4"
 
 # ===== Platform Detection =====
 IS_WINDOWS = sys.platform == 'win32'
@@ -59,26 +61,53 @@ AGENT_NAME_PATTERN = re.compile(r'^[a-z-]+$')
 # Sender constants
 SENDER = 'bigboss'  # CLI sender identity
 CLAUDE_SENDER = 'john'  # Fallback when no session_id/MAPID available (edge case in Windows or potential rare claude code thing)
+SYSTEM_SENDER = 'hcom'  # System notification identity (launcher, watchdog, etc)
 SENDER_EMOJI = '🐳' # Legacy whale, unused but kept here to remind me about cake intake
 MAX_MESSAGES_PER_DELIVERY = 50
 MAX_MESSAGE_SIZE = 1048576  # 1MB
+
+# ===== Message Identity =====
+@dataclass
+class SenderIdentity:
+    """Sender identity for message routing.
+
+    Single identity (name) with kind for filtering.
+    NO routing_id - namespace managed via sender_kind in event data.
+    """
+    kind: Literal['external', 'instance', 'system']
+    name: str  # Display name (stored in events.instance)
+    instance_data: dict | None = None  # For kind='instance' only
+
+    @property
+    def broadcasts(self) -> bool:
+        """External and system senders broadcast to everyone."""
+        return self.kind in ('external', 'system')
+
+    @property
+    def group_id(self) -> str | None:
+        """Group session ID for routing (session-based group membership)."""
+        from hcom.core.helpers import get_group_session_id
+        return get_group_session_id(self.instance_data)
 
 # ===== Hook Constants =====
 # Stop hook polling interval
 STOP_HOOK_POLL_INTERVAL = 0.1  # 100ms between stop hook polls
 
+# HCOM invocation pattern - matches all ways to invoke hcom
+# Supports: hcom, uvx hcom, python -m hcom, python hcom.py, python hcom.pyz, /path/to/hcom.py[z]
+HCOM_INVOCATION_PATTERN = r'(?:uvx\s+)?hcom|python3?\s+-m\s+hcom|(?:python3?\s+)?\S*hcom\.pyz?'
+
 # PreToolUse hook pattern - matches hcom commands for session_id injection and auto-approval
 # - hcom send (any args)
 # - hcom stop (no args) | hcom start (no args or --_hcom_sender only)
 # - hcom help | hcom --help | hcom -h
-# - hcom list (with optional --json, --verbose)
-# - hcom watch (with optional --type, --instance, --last, --wait)
-# Supports: hcom, uvx hcom, python -m hcom, python hcom.py, python hcom.pyz, /path/to/hcom.py[z]
-# Negative lookahead ensures stop/start/done not followed by alias targets (except --_hcom_sender)
+# - hcom list (with optional --json, -v, --verbose, --sql)
+# - hcom watch (with optional --last, --wait, --sql)
+# Negative lookahead ensures stop/start not followed by alias targets (except --_hcom_sender)
 # Allows shell operators (2>&1, >/dev/null, |, &&) but blocks identifier-like targets (myalias, 123abc)
 HCOM_COMMAND_PATTERN = re.compile(
-    r'((?:uvx\s+)?hcom|python3?\s+-m\s+hcom|(?:python3?\s+)?\S*hcom\.pyz?)\s+'
-    r'(?:send\b|stop(?!\s+(?:[a-zA-Z_]|[0-9]+[a-zA-Z_])[-\w]*(?:\s|$))|start(?:\s+--_hcom_sender\s+\S+)?(?!\s+(?:[a-zA-Z_]|[0-9]+[a-zA-Z_])[-\w]*(?:\s|$))|done(?:\s+--_hcom_sender\s+\S+)?(?!\s+(?:[a-zA-Z_]|[0-9]+[a-zA-Z_])[-\w]*(?:\s|$))|(?:help|--help|-h)\b|--new-terminal\b|list\b|watch\b)'
+    rf'({HCOM_INVOCATION_PATTERN})\s+'
+    r'(?:send\b|stop(?!\s+(?:[a-zA-Z_]|[0-9]+[a-zA-Z_])[-\w]*(?:\s|$))|start(?:\s+--_hcom_sender\s+\S+)?(?!\s+(?:[a-zA-Z_]|[0-9]+[a-zA-Z_])[-\w]*(?:\s|$))|(?:help|--help|-h)\b|--new-terminal\b|list\b|watch\b)'
 )
 
 # ===== Core ANSI Codes =====
@@ -145,8 +174,7 @@ DEFAULT_CONFIG_HEADER = [
     "#   HCOM_HINTS - Text appended to all messages received by instances",
     "#   HCOM_TAG - Group tag for instances (creates tag-* instances)",
     "#   HCOM_AGENT - Claude code subagent from .claude/agents/, comma-separated for multiple",
-    "#   HCOM_CLAUDE_ARGS - Default Claude args (e.g., '-p --model sonnet-4')",
-    "#",
+    "#   HCOM_CLAUDE_ARGS - Default Claude args (e.g., '-p --model sonnet')",
     "#",
     "ANTHROPIC_MODEL=",
     "CLAUDE_CODE_SUBAGENT_MODEL=",
@@ -352,6 +380,8 @@ from .claude_args import (
 )
 
 __all__ = [
+    # Message identity
+    'SenderIdentity',
     # Re-exported from claude_args (backward compatibility for ui.py)
     'ClaudeArgsSpec',
     'resolve_claude_args',

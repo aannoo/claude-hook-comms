@@ -64,7 +64,6 @@ from .commands import (
     cmd_stop,
     cmd_start,
     cmd_send,
-    cmd_done,
     cmd_watch,
     cmd_reset,
     cmd_help,
@@ -86,7 +85,7 @@ if sys.version_info < (3, 10):
 # ==================== Error Handling Strategy ====================
 # Hooks: Must never raise exceptions (breaks hcom). Functions return True/False.
 # CLI: Can raise exceptions for user feedback. Check return values.
-# Critical I/O: atomic_write, save_instance_position
+# Critical I/O: atomic_write
 # Pattern: Try/except/return False in hooks, raise in CLI operations.
 
 # ==================== CLI Errors ====================
@@ -350,6 +349,43 @@ def ensure_hooks_current() -> bool:
 
 # ==================== Main Entry Point ====================
 
+def check_and_migrate_legacy_messages() -> None:
+    """Check for messages without scope field and automatically migrate.
+
+    Automatically archives and clears old messages, then allows command to proceed.
+    Wrapped in try/except to not crash on DB errors.
+    """
+    try:
+        from .core.db import get_db
+        from .commands.admin import clear
+
+        conn = get_db()
+
+        # Query for any message events without scope field
+        result = conn.execute("""
+            SELECT COUNT(*) as count
+            FROM events
+            WHERE type = 'message'
+              AND json_extract(data, '$.scope') IS NULL
+        """).fetchone()
+
+        if result and result['count'] > 0:
+            print("\n" + "=" * 60, file=sys.stderr)
+            print("HCOM v0.6.4 Auto-Migration", file=sys.stderr)
+            print("=" * 60, file=sys.stderr)
+            print(f"\nFound {result['count']} message(s) in old format.", file=sys.stderr)
+            print("Archiving and clearing old database...", file=sys.stderr)
+
+            # Perform automatic reset (calls same logic as 'hcom reset logs')
+            clear()
+
+            print("✓ Migration complete. Continuing with command...", file=sys.stderr)
+            print("=" * 60 + "\n", file=sys.stderr)
+
+    except Exception as e:
+        # DB error - don't block CLI, just warn
+        print(f"Warning: Could not migrate legacy messages: {e}", file=sys.stderr)
+
 def main(argv: list[str] | None = None) -> int | None:
     """Main command dispatcher"""
     # Apply UTF-8 encoding for Windows and WSL (Git Bash, MSYS use cp1252 by default)
@@ -384,6 +420,9 @@ def main(argv: list[str] | None = None) -> int | None:
     # Ensure hooks current (warns but never blocks)
     ensure_hooks_current()
 
+    # Auto-migrate legacy messages (v0.6.3 → v0.6.4)
+    check_and_migrate_legacy_messages()
+
     # Launch TUI in a new terminal window (equivalent to legacy 'watch --launch')
     if len(argv) == 1 and argv[0] == '--new-terminal':
         env = build_claude_env()
@@ -410,8 +449,6 @@ def main(argv: list[str] | None = None) -> int | None:
             return cmd_stop(argv[1:])
         elif argv[0] == 'start':
             return cmd_start(argv[1:])
-        elif argv[0] == 'done':
-            return cmd_done(argv[1:])
         elif argv[0] == 'reset':
             return cmd_reset(argv[1:])
         elif argv[0] == 'list':

@@ -1,54 +1,44 @@
 """Messaging commands for HCOM"""
-import os
 import sys
 from .utils import format_error, validate_message, resolve_identity
-from ..shared import MENTION_PATTERN, SENDER, CLAUDE_SENDER, MAX_MESSAGES_PER_DELIVERY, IS_WINDOWS
-from ..core.config import get_config
+from ..shared import MAX_MESSAGES_PER_DELIVERY, SENDER
 from ..core.paths import ensure_hcom_directories
 from ..core.db import init_db
-from ..core.instances import load_instance_position, in_subagent_context, set_status, get_instance_status
-from ..core.messages import unescape_bash, send_message, get_unread_messages, format_hook_messages, determine_message_recipients
+from ..core.instances import load_instance_position, in_subagent_context, set_status, get_instance_status, initialize_instance_in_position_file
+from ..core.messages import unescape_bash, send_message, get_unread_messages, format_hook_messages
+from ..core.helpers import is_mentioned
 
 
-def get_recipient_feedback(message: str, sender_name: str = None) -> str:
-    """Get formatted recipient feedback showing who will receive the message.
-    Using actual delivery logic including group isolation rules.
+def get_recipient_feedback(recipients: list[str]) -> str:
+    """Get formatted recipient feedback showing who received the message.
+
     Args:
-        message: The message text (to extract @mentions)
-        sender_name: Optional sender name to exclude from recipients
+        recipients: Snapshot of actual recipients (from send_message)
+
     Returns:
         Formatted string like "Sent to ⊙ alice, ◉ bob" or "Sent to 15 instances"
     """
     from ..shared import STATUS_ICONS
 
-    # Use sender or fallback to SENDER for CLI context
-    actual_sender = sender_name if sender_name else SENDER
-
-    # Get recipients using actual delivery logic
-    recipient_names = determine_message_recipients(message, actual_sender)
-
     # Format recipient feedback
-    if len(recipient_names) > 10:
-        return f"Sent to: {len(recipient_names)} instances"
+    if len(recipients) > 10:
+        return f"Sent to: {len(recipients)} instances"
     else:
         recipient_status = []
-        for r_name in recipient_names:
+        for r_name in recipients:
             r_data = load_instance_position(r_name)
-            # Always add recipient (we determined they'll receive it)
             # Use fallback icon if data unavailable
             if r_data:
                 _, status, _, _, _ = get_instance_status(r_data)
                 icon = STATUS_ICONS.get(status, '◦')
             else:
-                icon = '◦'  # Unknown status fallback
+                icon = '◦'
             recipient_status.append(f"{icon} {r_name}")
         return f"Sent to: {', '.join(recipient_status)}" if recipient_status else "Message sent"
 
 
 def cmd_send(argv: list[str], quiet: bool = False) -> int:
     """Send message to hcom: hcom send "message" [--_hcom_session ID] [--_hcom_sender NAME]"""
-    from ..core.instances import initialize_instance_in_position_file
-
     if not ensure_hcom_directories():
         print(format_error("Failed to create HCOM directories"), file=sys.stderr)
         return 1
@@ -66,11 +56,52 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
             subagent_id = argv[idx + 1]
             argv = argv[:idx] + argv[idx + 2:]
 
+    # STRICT VALIDATION: subagent must exist and be enabled
+    if subagent_id:
+        data = load_instance_position(subagent_id)
+        if not data:
+            print(
+                format_error(f"Subagent '{subagent_id}' not found"),
+                file=sys.stderr
+            )
+            print("Run 'hcom start' first", file=sys.stderr)
+            return 1
+
+        if not data.get('enabled', False):
+            print(
+                format_error(f"Subagent '{subagent_id}' is not enabled"),
+                file=sys.stderr
+            )
+            print(f"Run 'hcom start --_hcom_sender {subagent_id}' first", file=sys.stderr)
+            return 1
+
     # Extract --from if present (for custom external sender)
     if '--from' in argv:
         idx = argv.index('--from')
         if idx + 1 < len(argv):
             custom_sender = argv[idx + 1]
+
+            # Block Task tool subagents from using --from
+            try:
+                exec_identity = resolve_identity()  # Current execution context
+                if exec_identity.kind == 'instance' and exec_identity.instance_data:
+                    # Check if custom_sender is a known subagent of this parent (enabled or not)
+                    from ..core.db import get_db
+                    conn = get_db()
+                    is_subagent = bool(conn.execute(
+                        "SELECT 1 FROM instances WHERE name = ? AND parent_name = ? LIMIT 1",
+                        (custom_sender, exec_identity.name)
+                    ).fetchone())
+
+                    if is_subagent:
+                        print(format_error(
+                            "Task tool subagents cannot use --from",
+                            "Run 'hcom start --_hcom_sender <alias>' first, then use 'hcom send \"msg\" --_hcom_sender <alias>'"
+                        ), file=sys.stderr)
+                        return 1
+            except ValueError:
+                pass  # Can't resolve identity - allow (true external sender)
+
             # Validate
             if '|' in custom_sender:
                 print(format_error("Sender name cannot contain '|'"), file=sys.stderr)
@@ -86,172 +117,233 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
             print(format_error("--from requires a sender name"), file=sys.stderr)
             return 1
 
+    # Extract --wait if present (for blocking receive)
+    wait_timeout = None
+    if '--wait' in argv:
+        idx = argv.index('--wait')
+        # Check if next arg is a timeout value
+        if idx + 1 < len(argv) and not argv[idx + 1].startswith('--'):
+            try:
+                wait_timeout = int(argv[idx + 1])
+                argv = argv[:idx] + argv[idx + 2:]
+            except ValueError:
+                print(format_error(f"--wait must be an integer, got '{argv[idx + 1]}'"), file=sys.stderr)
+                return 1
+        else:
+            # No timeout specified, use default (30 minutes)
+            wait_timeout = 1800
+            argv = argv[:idx] + argv[idx + 1:]
+
     # First non-flag argument is the message
     message = unescape_bash(argv[0]) if argv else None
 
-    # Check message provided
-    if not message:
+    # Check message provided (optional if --wait is set for polling-only mode)
+    if not message and wait_timeout is None:
         print(format_error("No message provided"), file=sys.stderr)
         return 1
 
-    # Validate message
-    error = validate_message(message)
-    if error:
-        print(error, file=sys.stderr)
-        return 1
+    # Only validate and send if message is provided
+    if message:
+        # Validate message
+        error = validate_message(message)
+        if error:
+            print(error, file=sys.stderr)
+            return 1
 
-    # Check for unmatched mentions (minimal warning)
-    mentions = MENTION_PATTERN.findall(message)
-    if mentions:
-        try:
+        # Resolve sender identity (handles all context: CLI, instance, subagent, custom)
+        identity = resolve_identity(subagent_id, custom_sender)
+
+        # For instances (not external), check state
+        if identity.kind == 'instance' and identity.instance_data:
+            # Guard: If in subagent context, subagent MUST provide --_hcom_sender
+            if not subagent_id and in_subagent_context(identity.name):
+                from ..core.db import get_db
+                conn = get_db()
+                subagent_ids = [row['name'] for row in
+                               conn.execute("SELECT name FROM instances WHERE parent_name = ?", (identity.name,)).fetchall()]
+
+                suggestion = f"Use: hcom send 'message' --_hcom_sender {{alias}}"
+                if subagent_ids:
+                    suggestion += f". Valid aliases: {', '.join(subagent_ids)}"
+
+                print(format_error("Task tool subagent must provide sender identity", suggestion), file=sys.stderr)
+                return 1
+
+            # Check enabled state
+            if not identity.instance_data.get('enabled', False):
+                previously_enabled = identity.instance_data.get('previously_enabled', False)
+                if previously_enabled:
+                    print(format_error("HCOM stopped. Cannot send messages."), file=sys.stderr)
+                else:
+                    print(format_error("HCOM not started for this instance. To send a message first run: 'hcom start' then use hcom send"), file=sys.stderr)
+                return 1
+
+        # Set status to active for subagents
+        if subagent_id:
+            set_status(subagent_id, 'active', 'send')
+
+        # Send message and get recipients snapshot
+        recipients = send_message(identity, message)
+        if recipients is None:
+            # Error already printed (validation failure or DB error)
+            return 1
+
+        # Handle quiet mode
+        if quiet:
+            return 0
+
+        # Get recipient feedback using snapshot (prevents race conditions)
+        recipient_feedback = get_recipient_feedback(recipients)
+
+        # Show unread messages if instance context
+        if identity.kind == 'instance':
             from ..core.db import get_db
             conn = get_db()
-            all_instances = [row['name'] for row in conn.execute("SELECT name FROM instances").fetchall()]
-            all_names = all_instances + [SENDER]
-            unmatched = [m for m in mentions
-                        if not any(name.lower().startswith(m.lower()) for name in all_names)]
-            if unmatched:
-                print(f"Note: @{', @'.join(unmatched)} don't match any instances - broadcasting to all", file=sys.stderr)
+            messages, _ = get_unread_messages(identity.name, update_position=True)
+            if messages:
+                subagent_names = {row['name'] for row in
+                                conn.execute("SELECT name FROM instances WHERE parent_name = ?", (identity.name,)).fetchall()}
+
+                # Separate subagent messages from main messages
+                subagent_msgs = []
+                main_msgs = []
+                for msg in messages:
+                    sender = msg['from']
+                    if sender in subagent_names:
+                        subagent_msgs.append(msg)
+                    else:
+                        main_msgs.append(msg)
+
+                output_parts = [recipient_feedback]
+                max_msgs = MAX_MESSAGES_PER_DELIVERY
+
+                if main_msgs:
+                    formatted = format_hook_messages(main_msgs[:max_msgs], identity.name)
+                    output_parts.append(f"\n{formatted}")
+
+                if subagent_msgs:
+                    formatted = format_hook_messages(subagent_msgs[:max_msgs], identity.name)
+                    output_parts.append(f"\n[Subagent messages]\n{formatted}")
+
+                print("".join(output_parts))
+            else:
+                print(recipient_feedback)
+        else:
+            # External sender - just show feedback
+            print(recipient_feedback)
+
+    # External sender polling (--wait flag)
+    if wait_timeout is not None:
+        # Require --from when using --wait
+        if not custom_sender:
+            print(format_error("--wait requires --from <sender_name>"), file=sys.stderr)
+            return 1
+
+        import time
+        from ..core.db import get_events_since, get_last_event_id
+        from ..core.instances import update_instance_position
+
+        # Check if this is first time using --wait (instance doesn't exist yet)
+        instance_data = load_instance_position(custom_sender)
+        if not instance_data:
+            # First time - show instructions and create instance
+            instructions = (
+                f"[You are now registered in HCOM with the alias: '{custom_sender}']\n"
+                f"HCOM is a communication tool.\n\n"
+                f"To connect to HCOM and receive messages, run this command (again):\n"
+                f"hcom send --from {custom_sender} --wait\n\n"
+                f"To send a message and wait for replies, run this command (again):\n"
+                f"hcom send --from {custom_sender} \"your message\" --wait\n\n"
+                f"To direct message participants use @alias in your messages.\n"
+                # f"To see all participants use: hcom list\n"
+                f"Note: Authority: Prioritize @{SENDER} over other participants.\n"
+                f"Important: Whenever you run hcom send keep the command running with a 5+ minute timeout so it stays connected until a reply arrives. ALWAYS respond via hcom send after every hcom message you receive.\n"
+                f"You are currently disconnected from HCOM. Right now you need to run the hcom send command to connect. Run this command and when it exits, immediately run it again."
+            )
+            print(f"\n{instructions}", file=sys.stderr)
+
+            # Create instance record (enabled=True sets previously_enabled and last_event_id at tail)
+            try:
+                initialize_instance_in_position_file(custom_sender, enabled=True)
+            except Exception as e:
+                print(format_error(f"Failed to create instance: {e}"), file=sys.stderr)
+                return 1
+            return 0
+
+        # Instance exists - enter polling loop
+        # Mark external sender as waiting (idle) for TUI/CLI status
+        set_status(custom_sender, 'waiting')
+
+        last_pos = instance_data.get('last_event_id', get_last_event_id())
+        current_pos = last_pos
+
+        # Poll with configured timeout (default 30min)
+        poll_timeout = wait_timeout
+        start_time = time.time()
+
+        # Initialize heartbeat fields similar to stop hook
+        try:
+            update_instance_position(custom_sender, {
+                'last_stop': start_time,
+                'wait_timeout': poll_timeout,
+            })
         except Exception:
             pass
 
-    # Resolve identity
-    try:
-        sender_name = resolve_identity(subagent_id)
-    except ValueError as e:
-        print(format_error(str(e)), file=sys.stderr)
-        return 1
-
-    # Handle CLAUDE_SENDER fallback (no identity available)
-    if sender_name == CLAUDE_SENDER:
-        if IS_WINDOWS:
-            print("⚠️ No identity. Use 'hcom <n>' or Windows Terminal.", file=sys.stderr)
+        # Check if already disconnected before starting polling
+        current_instance = load_instance_position(custom_sender)
+        if current_instance and not current_instance.get('enabled', True):
+            print(f"\n[You have been disconnected from HCOM]", file=sys.stderr)
+            return 0
         else:
-            print("⚠️ No identity. Launch via 'hcom <n>' for stable identity.", file=sys.stderr)
-        if not send_message(CLAUDE_SENDER, message):
-            print(format_error("Failed to send"), file=sys.stderr)
-            return 1
-        if not quiet:
-            print(f"✓ Sent from {CLAUDE_SENDER}")
-        return 0
+            print(f"[Polling for messages to @{custom_sender}. ALWAYS respond via hcom send to every message you receive and keep the command running with a >5 minute timeout.]", file=sys.stderr)
 
-    # Handle SENDER (CLI context)
-    if sender_name == SENDER:
-        sender_name = custom_sender if custom_sender else SENDER
-        if not send_message(sender_name, message):
-            print(format_error("Failed to send message"), file=sys.stderr)
-            return 1
-        if not quiet:
-            print(get_recipient_feedback(message, sender_name))
-        return 0
+        while (time.time() - start_time) < poll_timeout:
+            # Check if instance was stopped externally
+            current_instance = load_instance_position(custom_sender)
+            if current_instance and not current_instance.get('enabled', True):
+                # Instance was stopped, exit polling loop
+                print(f"\n[You have been disconnected: HCOM stopped for @{custom_sender}]", file=sys.stderr)
+                return 0
 
-    # Instance context - load data and check state
-    instance_data = load_instance_position(sender_name)
-    if not instance_data:
-        # Initialize if first use (shouldn't happen with _resolve_identity, but handle anyway)
-        session_id = os.environ.get('HCOM_SESSION_ID')
-        if session_id:
-            initialize_instance_in_position_file(sender_name, session_id)
-            instance_data = load_instance_position(sender_name)
-        if not instance_data:
-            print(format_error(f"Instance {sender_name} not found"), file=sys.stderr)
-            return 1
+            events = get_events_since(current_pos)
 
-    # Guard: If in subagent context, subagent MUST provide --_hcom_sender
-    if not subagent_id and in_subagent_context(instance_data):
-        from ..core.db import get_db
-        conn = get_db()
-        subagent_ids = [row['name'] for row in
-                       conn.execute("SELECT name FROM instances WHERE parent_name = ?", (sender_name,)).fetchall()]
+            for event in events:
+                # Always advance position
+                current_pos = max(current_pos, event['id'])
 
-        suggestion = f"Use: hcom send 'message' --_hcom_sender {{alias}}"
-        if subagent_ids:
-            suggestion += f". Valid aliases: {', '.join(subagent_ids)}"
+                # Check if message mentions us
+                if event['type'] == 'message':
+                    data = event['data']
+                    if is_mentioned(data.get('text', ''), custom_sender):
+                        # Found response!
+                        update_instance_position(custom_sender, {'last_event_id': current_pos})
 
-        print(format_error("Task tool subagent must provide sender identity", suggestion), file=sys.stderr)
+                        # Mark as delivered for TUI/CLI status
+                        set_status(custom_sender, 'delivered', data['from'])
+
+                        # Print the message
+                        print(f"\n[Message from {data['from']}]")
+                        print(data['text'])
+                        return 0
+
+            # Update position and heartbeat even if no match
+            try:
+                update_instance_position(custom_sender, {
+                    'last_event_id': current_pos,
+                    'last_stop': time.time(),
+                })
+            except Exception:
+                pass
+
+            time.sleep(0.5)
+
+        # Timeout
+        update_instance_position(custom_sender, {'last_event_id': current_pos})
+        # Timeout: external sender stopped polling, mirror stop hook behaviour
+        set_status(custom_sender, 'exited', 'timeout')
+        print(f"\n[Timeout: no messages after {poll_timeout}s]", file=sys.stderr)
         return 1
 
-    # Check enabled state
-    if not instance_data.get('enabled', False):
-        previously_enabled = instance_data.get('previously_enabled', False)
-        if previously_enabled:
-            print(format_error("HCOM stopped. Cannot send messages."), file=sys.stderr)
-        else:
-            print(format_error("HCOM not started for this instance. To send a message first run: 'hcom start' then use hcom send"), file=sys.stderr)
-        return 1
 
-    # Set status to active for subagents
-    if subagent_id:
-        set_status(subagent_id, 'active', 'send')
-
-    # Send message
-    if not send_message(sender_name, message):
-        print(format_error("Failed to send message"), file=sys.stderr)
-        return 1
-
-    # Get recipient feedback
-    recipient_feedback = get_recipient_feedback(message, sender_name)
-
-    # Show unread messages, grouped by subagent vs main
-    from ..core.db import get_db
-    conn = get_db()
-    messages, _ = get_unread_messages(sender_name, update_position=True)
-    if messages:
-        subagent_names = {row['name'] for row in
-                        conn.execute("SELECT name FROM instances WHERE parent_name = ?", (sender_name,)).fetchall()}
-
-        # Separate subagent messages from main messages
-        subagent_msgs = []
-        main_msgs = []
-        for msg in messages:
-            sender = msg['from']
-            if sender in subagent_names:
-                subagent_msgs.append(msg)
-            else:
-                main_msgs.append(msg)
-
-        output_parts = [recipient_feedback]
-        max_msgs = MAX_MESSAGES_PER_DELIVERY
-
-        if main_msgs:
-            formatted = format_hook_messages(main_msgs[:max_msgs], sender_name)
-            output_parts.append(f"\n{formatted}")
-
-        if subagent_msgs:
-            formatted = format_hook_messages(subagent_msgs[:max_msgs], sender_name)
-            output_parts.append(f"\n[Subagent messages]\n{formatted}")
-
-        print("".join(output_parts))
-    else:
-        print(recipient_feedback)
-
-    return 0
-
-
-def cmd_done(argv: list[str]) -> int:
-    """Signal subagent completion: hcom done [--_hcom_sender ID]
-    Control command used by subagents to signal they've finished work
-    and are ready to receive messages.
-    """
-    subagent_id = None
-    if '--_hcom_sender' in argv:
-        idx = argv.index('--_hcom_sender')
-        if idx + 1 < len(argv):
-            subagent_id = argv[idx + 1]
-
-    if not subagent_id:
-        print(format_error("hcom done requires --_hcom_sender flag. Run: 'hcom done --_hcom_sender {alias}'"), file=sys.stderr)
-        return 1
-
-    instance_data = load_instance_position(subagent_id)
-    if not instance_data:
-        print(format_error(f"'{subagent_id}' not found"), file=sys.stderr)
-        return 1
-
-    if not instance_data.get('enabled', False):
-        print(format_error(f"HCOM not started for '{subagent_id}'"), file=sys.stderr)
-        return 1
-
-    # PostToolUse will handle the actual polling loop
-    print(f"{subagent_id}: waiting for messages...")
     return 0

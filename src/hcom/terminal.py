@@ -185,9 +185,6 @@ def build_claude_command(agent_content: str | None = None, claude_args: list[str
     # Extract user's system prompt flags
     cleaned_args, user_append, user_system = extract_system_prompt_args(claude_args or [])
 
-    # Detect print mode
-    is_print_mode = bool(cleaned_args and any(arg in cleaned_args for arg in ['-p', '--print']))
-
     # Add model if specified and not already in cleaned_args
     if model:
         if not has_claude_arg(cleaned_args, ['--model'], ('--model=',)):
@@ -195,8 +192,8 @@ def build_claude_command(agent_content: str | None = None, claude_args: list[str
 
     # Add allowed tools if specified and not already in cleaned_args
     if tools:
-        if not has_claude_arg(cleaned_args, ['--allowedTools', '--allowed-tools'],
-                              ('--allowedTools=', '--allowed-tools=')):
+        if not has_claude_arg(cleaned_args, ['--allowedTools', '--allowed-tools', '--allowedtools'],
+                              ('--allowedTools=', '--allowed-tools=', '--allowedtools=')):
             cmd_parts.extend(['--allowedTools', tools])
 
     # Add cleaned user args (system prompt flags removed, but positionals/prompt included)
@@ -204,20 +201,34 @@ def build_claude_command(agent_content: str | None = None, claude_args: list[str
         for arg in cleaned_args:
             cmd_parts.append(shlex.quote(arg))
 
-    # Merge and apply system prompts
-    merged_content, flag = merge_system_prompts(user_append, user_system, agent_content, prefer_system_flag=is_print_mode)
+    # Merge and apply system prompts (agent content + user flags)
+    system_value, append_value = merge_system_prompts(user_append, user_system, agent_content)
 
-    if merged_content:
-        # Write merged content to temp file
+    if system_value:
+        # Write system prompt to temp file
         scripts_dir = hcom_path(SCRIPTS_DIR)
         temp_file = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.txt', delete=False,
-                                              prefix='hcom_agent_', dir=str(scripts_dir))
-        temp_file.write(merged_content)
+                                              prefix='hcom_system_', dir=str(scripts_dir))
+        temp_file.write(system_value)
         temp_file.close()
         temp_file_path = temp_file.name
 
-        cmd_parts.append(flag)
+        cmd_parts.append('--system-prompt')
         cmd_parts.append(f'"$(cat {shlex.quote(temp_file_path)})"')
+
+    if append_value:
+        # Write append prompt to temp file
+        scripts_dir = hcom_path(SCRIPTS_DIR)
+        append_file = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.txt', delete=False,
+                                                prefix='hcom_append_', dir=str(scripts_dir))
+        append_file.write(append_value)
+        append_file.close()
+        # Track both temp files for cleanup (only return first for legacy compatibility)
+        if not temp_file_path:
+            temp_file_path = append_file.name
+
+        cmd_parts.append('--append-system-prompt')
+        cmd_parts.append(f'"$(cat {shlex.quote(append_file.name)})"')
 
     return ' '.join(cmd_parts), temp_file_path
 

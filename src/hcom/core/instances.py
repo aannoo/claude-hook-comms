@@ -4,12 +4,19 @@ from pathlib import Path
 from typing import Any
 import time
 import os
-import sys
 
 from ..shared import format_age
 
 # Configuration
 SKIP_HISTORY = True  # New instances start at current log position (skip old messages)
+
+def is_external_sender(instance_data: dict[str, Any]) -> bool:
+    """Check if instance is an external sender (created via --from).
+    External senders have empty/null session_id and mapid (no Claude hooks).
+    Subagents have parent_session_id, so are not external even without session_id/mapid."""
+    if instance_data.get('parent_session_id'):
+        return False
+    return not instance_data.get('session_id') and not instance_data.get('mapid')
 
 # ==================== Core Instance I/O ====================
 
@@ -18,70 +25,6 @@ def load_instance_position(instance_name: str) -> dict[str, Any]:
     from .db import get_instance
     data = get_instance(instance_name)
     return data if data else {}
-
-def save_instance_position(instance_name: str, data: dict[str, Any]) -> bool:
-    """Save instance data with smart UPSERT (merge with existing or create new).
-
-    SEMANTICS:
-    - If instance exists: Merge data into existing (preserves unspecified fields)
-    - If instance new: Fill defaults for missing fields
-
-    This preserves backwards compatibility with callers passing partial dicts.
-
-    Returns True on success, False on failure.
-    """
-    from .db import save_instance, get_instance
-
-    # Check if instance exists
-    existing = get_instance(instance_name)
-
-    if existing:
-        # MERGE: Update only provided fields, preserve existing values
-        merged = existing.copy()
-        merged.update(data)
-        complete_data = merged
-    else:
-        # NEW: Fill defaults for missing fields
-        defaults = {
-            "name": instance_name,
-            "session_id": None,
-            "mapid": "",
-            "parent_session_id": None,
-            "parent_name": None,
-            "created_at": time.time(),
-            "directory": str(Path.cwd()),
-            "last_event_id": 0,
-            "enabled": 0,
-            "previously_enabled": 0,
-            "status": "unknown",
-            "status_time": 0,
-            "status_context": "",
-            "last_stop": 0,
-            "transcript_path": "",
-            "tcp_mode": 0,
-            "wait_timeout": 1800,
-            "notify_port": None,
-            "background": 0,
-            "background_log_file": "",
-            "notification_message": "",
-            "alias_announced": 0,
-            "launch_context_announced": 0,
-            "external_stop_pending": 0,
-            "session_ended": 0,
-            "current_subagents": [],
-            "subagent_mappings": {}
-        }
-        # Merge: data overrides defaults
-        complete_data = {**defaults, **data}
-
-    # Convert booleans to integers for SQLite
-    for bool_field in ['enabled', 'previously_enabled', 'tcp_mode', 'background',
-                       'alias_announced', 'launch_context_announced',
-                       'external_stop_pending', 'session_ended']:
-        if bool_field in complete_data and isinstance(complete_data[bool_field], bool):
-            complete_data[bool_field] = int(complete_data[bool_field])
-
-    return save_instance(instance_name, complete_data)
 
 def update_instance_position(instance_name: str, update_fields: dict[str, Any]) -> None:
     """Update instance position atomically (DB wrapper)
@@ -125,35 +68,23 @@ def is_subagent_instance(instance_data: dict[str, Any] | None) -> bool:
         return False
     return bool(instance_data.get('parent_session_id'))
 
-def get_group_session_id(instance_data: dict[str, Any] | None) -> str | None:
-    """Get the session_id that defines this instance's group.
-    For parents: their own session_id, for subagents: parent_session_id
-    """
-    if not instance_data:
-        return None
-    # Subagent - use parent_session_id
-    if parent_sid := instance_data.get('parent_session_id'):
-        return parent_sid
-    # Parent - use own session_id
-    return instance_data.get('session_id')
+def in_subagent_context(instance_name: str) -> bool:
+    """Check if parent has active Task running.
 
-def in_same_group(sender_data: dict[str, Any] | None, receiver_data: dict[str, Any] | None) -> bool:
-    """Check if sender and receiver are in same group (share session_id)"""
-    sender_group = get_group_session_id(sender_data)
-    receiver_group = get_group_session_id(receiver_data)
-    if not sender_group or not receiver_group:
-        return False
-    return sender_group == receiver_group
+    Returns True when parent is in Task context:
+    - Parent's status_context is 'Task' (set immediately when Task tool runs)
+    - Used for security guards and functional behavior (message delivery)
 
-def in_subagent_context(instance_data: dict[str, Any] | None) -> bool:
-    """Check if hook (or any code) is being called from subagent context (not parent).
-    Returns True when parent has current_subagents list, meaning:
-    - A subagent is calling this code (parent is frozen during Task)
-    - instance_data is the parent's data (hooks resolve to parent session_id)
+    This activates immediately in PreToolUse, before any subagent commands execute.
     """
-    if not instance_data:
-        return False
-    return bool(instance_data.get('current_subagents'))
+    from ..core.db import get_db
+
+    conn = get_db()
+    row = conn.execute(
+        "SELECT status_context FROM instances WHERE name = ? LIMIT 1",
+        (instance_name,)
+    ).fetchone()
+    return bool(row and row['status_context'] == 'Task')
 
 # ==================== Status Functions ====================
 
@@ -174,16 +105,6 @@ def get_instance_status(pos_data: dict[str, Any]) -> tuple[bool, str, str, str, 
 
     now = int(time.time())
     age = now - status_time if status_time else 0
-
-    # Subagent-specific status detection
-    if pos_data.get('parent_session_id'):
-        # Subagent in done polling loop: status='active' but heartbeat still updating
-        # PreToolUse sets all subagents to 'active', but one in polling loop has fresh heartbeat
-        if status == 'active' and enabled:
-            heartbeat_age = now - pos_data.get('last_stop', 0)
-            if heartbeat_age < 1.5:  # Heartbeat active (1s poll interval + margin)
-                status = 'waiting'
-                age = heartbeat_age
 
     # Heartbeat timeout check: instance was waiting but heartbeat died
     # This detects terminated instances (closed window/crashed) that were idle
@@ -242,6 +163,11 @@ def get_status_description(status: str, context: str = '') -> str:
 
 def set_status(instance_name: str, status: str, context: str = ''):
     """Set instance status with timestamp and log status change event"""
+    from .db import log_event
+    # Check if transitioning from unknown (for ready event)
+    current_data = load_instance_position(instance_name)
+    was_unknown = current_data.get('status', 'unknown') == 'unknown' if current_data else True
+
     # Update instance file
     update_instance_position(instance_name, {
         'status': status,
@@ -249,9 +175,88 @@ def set_status(instance_name: str, status: str, context: str = ''):
         'status_context': context
     })
 
+    if was_unknown and status != 'unknown':
+        try:
+            launcher = os.environ.get('HCOM_LAUNCHED_BY', 'unknown')
+            batch_id = os.environ.get('HCOM_LAUNCH_BATCH_ID')
+
+            event_data = {
+                'action': 'ready',
+                'by': launcher,
+                'status': status,
+                'context': context
+            }
+            if batch_id:
+                event_data['batch_id'] = batch_id
+
+            log_event(
+                event_type='life',
+                instance=instance_name,
+                data=event_data
+            )
+
+            # Check if this is the last instance from a launch batch
+            if launcher != 'unknown' and batch_id:
+                from .db import get_db
+                import json
+                db = get_db()
+
+                # Find the launch event for this batch
+                launch_event = db.execute("""
+                    SELECT data FROM events
+                    WHERE type = 'life'
+                      AND instance = ?
+                      AND json_extract(data, '$.action') = 'launched'
+                      AND json_extract(data, '$.batch_id') = ?
+                    LIMIT 1
+                """, (launcher, batch_id)).fetchone()
+
+                if launch_event:
+                    launch_data = json.loads(launch_event['data'])
+                    expected_count = launch_data.get('launched', 0)
+
+                    if expected_count > 0:
+                        # Count ready events with matching batch_id
+                        ready_count = db.execute("""
+                            SELECT COUNT(*) as count FROM events
+                            WHERE type = 'life'
+                              AND json_extract(data, '$.action') = 'ready'
+                              AND json_extract(data, '$.batch_id') = ?
+                        """, (batch_id,)).fetchone()['count']
+
+                        # If this is the last one, send notification to launcher
+                        if ready_count >= expected_count:
+                            # Check if notification already sent (idempotency)
+                            existing = db.execute("""
+                                SELECT 1 FROM events
+                                WHERE type = 'message'
+                                  AND instance = 'sys_[hcom-launcher]'
+                                  AND json_extract(data, '$.text') LIKE ?
+                                LIMIT 1
+                            """, (f'%batch: {batch_id}%',)).fetchone()
+
+                            if not existing:
+                                from .messages import send_system_message
+
+                                # Get instance names from this batch
+                                ready_instances = db.execute("""
+                                    SELECT DISTINCT instance FROM events
+                                    WHERE type = 'life'
+                                      AND json_extract(data, '$.action') = 'ready'
+                                      AND json_extract(data, '$.batch_id') = ?
+                                """, (batch_id,)).fetchall()
+
+                                instances_list = ", ".join(row['instance'] for row in ready_instances)
+
+                                send_system_message(
+                                    '[hcom-launcher]',
+                                    f"@{launcher} All {expected_count} instances ready: {instances_list} (| batch: {batch_id})"
+                                )
+        except Exception:
+            pass  # Silent - don't break hooks on notification failure
+
     # Log status change event (best-effort, non-blocking)
     try:
-        from .db import log_event
         log_event(
             event_type='status',
             instance=instance_name,
@@ -326,14 +331,9 @@ def get_display_name(session_id: str | None, tag: str | None = None, collision_a
         collision_word = words[collision_hash % len(words)]
         base_name = f"{base_name}{collision_word}"
 
-    # Add tag prefix if provided
+    # Add tag prefix if provided (config validation ensures tag is safe)
     if tag:
-        sanitized_tag = ''.join(c for c in tag if c not in '|\n\r\t')
-        if not sanitized_tag:
-            raise ValueError("Tag contains only invalid characters")
-        if sanitized_tag != tag:
-            print(f"Warning: Tag contained invalid characters, sanitized to '{sanitized_tag}'", file=sys.stderr)
-        return f"{sanitized_tag}-{base_name}"
+        return f"{tag}-{base_name}"
 
     return base_name
 
@@ -398,6 +398,17 @@ def initialize_instance_in_position_file(instance_name: str, session_id: str | N
                 updates['previously_enabled'] = int(enabled)
             if mapid is not None:
                 updates['mapid'] = mapid
+
+            # Fix last_event_id for placeholders that never participated (SKIP_HISTORY fix)
+            # Check previously_enabled instead of last_event_id==0 because placeholders
+            # could have been created with any old event ID value
+            if SKIP_HISTORY and not existing.get('previously_enabled', False):
+                launch_event_id_str = os.environ.get('HCOM_LAUNCH_EVENT_ID')
+                if launch_event_id_str:
+                    updates['last_event_id'] = int(launch_event_id_str)
+                else:
+                    updates['last_event_id'] = get_last_event_id()
+
             if updates:
                 from .db import update_instance
                 update_instance(instance_name, updates)
@@ -434,11 +445,8 @@ def initialize_instance_in_position_file(instance_name: str, session_id: str | N
             "session_id": session_id if session_id else None,  # NULL not empty string
             "mapid": mapid or "",
             "transcript_path": "",
-            "notification_message": "",
             "alias_announced": 0,
-            "tag": None,
-            "current_subagents": [],
-            "subagent_mappings": {}
+            "tag": None
         }
 
         # Add parent_session_id and parent_name for subagents
@@ -501,12 +509,9 @@ def enable_instance(instance_name: str, initiated_by: str = 'unknown', reason: s
 
 __all__ = [
     'load_instance_position',
-    'save_instance_position',
     'update_instance_position',
     'is_parent_instance',
     'is_subagent_instance',
-    'get_group_session_id',
-    'in_same_group',
     'in_subagent_context',
     'get_instance_status',
     'get_status_description',

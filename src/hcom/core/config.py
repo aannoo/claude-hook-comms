@@ -10,11 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from .paths import hcom_path, atomic_write, CONFIG_FILE
-from .migration import needs_migration, backup_and_remove_config
 from ..shared import (
     __version__,
     parse_env_file, parse_env_value, format_env_value,
     DEFAULT_CONFIG_HEADER, DEFAULT_CONFIG_DEFAULTS,
+    AGENT_NAME_PATTERN,
 )
 
 # ==================== Config Constants ====================
@@ -136,7 +136,7 @@ class HcomConfig:
         elif self.agent:  # Non-empty
             for agent_name in self.agent.split(','):
                 agent_name = agent_name.strip()
-                if agent_name and not re.match(r'^[a-z-]+$', agent_name):
+                if agent_name and not AGENT_NAME_PATTERN.match(agent_name):
                     set_error(
                         'agent',
                         f"agent '{agent_name}' must match pattern ^[a-z-]+$ "
@@ -175,13 +175,6 @@ class HcomConfig:
 
         # Parse config file once
         file_config = parse_env_file(config_path) if config_path.exists() else {}
-
-        # Auto-migrate from HCOM_PROMPT (0.5.0) to HCOM_CLAUDE_ARGS
-        if needs_migration(file_config):
-            print(f"Migrating config to {__version__}...")
-            backup_and_remove_config(config_path)  # Backup and delete old config
-            _write_default_config(config_path)  # Write new defaults
-            file_config = parse_env_file(config_path)  # Re-parse new config
 
         def get_var(key: str) -> str | None:
             """Get variable with precedence: env → file"""
