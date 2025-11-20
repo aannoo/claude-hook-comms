@@ -35,9 +35,12 @@ def update_instance_position(instance_name: str, update_fields: dict[str, Any]) 
     from ..hooks.utils import log_hook_error
 
     try:
-        # Auto-vivify if needed
+        # Auto-vivify if needed - capture session_id/MAPID for Windows compatibility
         if not get_instance(instance_name):
-            initialize_instance_in_position_file(instance_name)
+            from ..shared import MAPID
+            import os
+            session_id = os.environ.get('HCOM_SESSION_ID')
+            initialize_instance_in_position_file(instance_name, session_id, mapid=MAPID)
 
         # Convert booleans to integers for SQLite
         update_copy = update_fields.copy()
@@ -99,33 +102,33 @@ def get_instance_status(pos_data: dict[str, Any]) -> tuple[bool, str, str, str, 
     These are orthogonal - can be disabled but still active.
     """
     enabled = pos_data.get('enabled', False)
-    status = pos_data.get('status', 'unknown')
+    status = pos_data.get('status', 'inactive')
     status_time = pos_data.get('status_time', 0)
     status_context = pos_data.get('status_context', '')
 
     now = int(time.time())
     age = now - status_time if status_time else 0
 
-    # Heartbeat timeout check: instance was waiting but heartbeat died
+    # Heartbeat timeout check: instance was idle but heartbeat died
     # This detects terminated instances (closed window/crashed) that were idle
-    if status == 'waiting':
+    if status == 'idle':
         heartbeat_age = now - pos_data.get('last_stop', 0)
         tcp_mode = pos_data.get('tcp_mode', False)
         threshold = 40 if tcp_mode else 2
         if heartbeat_age > threshold:
-            status_context = status  # Save what it was doing
-            status = 'stale'
+            status = 'inactive'
+            status_context = 'stale:idle'
             age = heartbeat_age
-
     # Activity timeout check: no status updates for extended period
     # This detects terminated instances that were active/blocked/etc when closed
-    if status not in ['exited', 'stale']:
+    elif status not in ['inactive']:
         timeout = pos_data.get('wait_timeout', 1800)
         min_threshold = max(timeout + 60, 600)  # Timeout + 1min buffer, minimum 10min
         status_age = now - status_time if status_time else 0
         if status_age > min_threshold:
-            status_context = status  # Save what it was doing
-            status = 'stale'
+            prev_status = status  # Capture before changing
+            status = 'inactive'
+            status_context = f'stale:{prev_status}'
             age = status_age
 
     # Build description from status and context
@@ -135,31 +138,39 @@ def get_instance_status(pos_data: dict[str, Any]) -> tuple[bool, str, str, str, 
 
 
 def get_status_description(status: str, context: str = '') -> str:
-    """Build human-readable status description"""
+    """Build human-readable status description from status + metadata tokens
+
+    Metadata token format:
+    - deliver:{sender} - message delivery
+    - tool:{name} - tool execution
+    - exit:{reason} - exit states (timeout, orphaned, task_completed, disabled, clear)
+    - stale:{prev_status} - stale detection preserving previous state
+    - unknown - unknown state
+    - Empty string - simple idle (no context needed)
+    """
     if status == 'active':
-        return f"{context} executing" if context else "active"
-    elif status == 'delivered':
-        return f"msg from {context}" if context else "message delivered"
-    elif status == 'waiting':
+        if context.startswith('deliver:'):
+            sender = context[8:]  # "deliver:alice" → "alice"
+            return f"active: msg from {sender}"
+        elif context.startswith('tool:'):
+            tool = context[5:]  # "tool:Bash" → "Bash"
+            return f"{tool} executing"
+        return context if context else "active"
+    elif status == 'idle':
         return "idle"
     elif status == 'blocked':
-        return f"{context}" if context else "permission needed"
-    elif status == 'exited':
-        return f"exited: {context}" if context else "exited"
-    elif status == 'stale':
-        # Show what it was doing when it went stale
-        if context == 'waiting':
-            return "idle [stale]"
-        elif context == 'active':
-            return "active [stale]"
-        elif context == 'blocked':
-            return "blocked [stale]"
-        elif context == 'delivered':
-            return "delivered [stale]"
-        else:
-            return "stale"
-    else:
-        return "unknown"
+        return context if context else "permission needed"
+    elif status == 'inactive':
+        if context.startswith('stale:'):
+            prev = context[6:]  # "stale:idle" → "idle"
+            return f"{prev} [stale]" if prev else "stale"
+        elif context.startswith('exit:'):
+            reason = context[5:]  # "exit:timeout" → "timeout"
+            return f"exited: {reason}"
+        elif context == 'unknown':
+            return "unknown"
+        return context if context else "inactive"
+    return "unknown"
 
 def set_status(instance_name: str, status: str, context: str = ''):
     """Set instance status with timestamp and log status change event"""

@@ -90,12 +90,14 @@ class HcomTUI:
         self.state.flash_message = msg
         self.state.flash_until = time.time() + duration
         self.state.flash_color = color
+        self.state.frame_dirty = True
 
     def flash_error(self, msg: str, duration: float = 10.0):
         """Show error flash in red"""
         self.state.flash_message = msg
         self.state.flash_until = time.time() + duration
         self.state.flash_color = 'red'
+        self.state.frame_dirty = True
 
     def parse_validation_errors(self, error_str: str):
         """Parse ValueError message from HcomConfig into field-specific errors"""
@@ -169,32 +171,40 @@ class HcomTUI:
     def stop_all_instances(self):
         """Stop all enabled instances"""
         try:
-            stopped_count = 0
-            for name, info in self.state.instances.items():
-                if info['data'].get('enabled', False):
-                    cmd_stop([name])
-                    stopped_count += 1
+            # Count enabled instances before stopping
+            enabled_before = sum(1 for info in self.state.instances.values() if info['data'].get('enabled', False))
 
-            if stopped_count > 0:
-                self.flash(f"Stopped all ({stopped_count} instances)")
+            # Use cmd_stop(['all']) which handles all instances atomically
+            result = cmd_stop(['all'])
+            if result == 0:
+                self.load_status()
+                # Count how many were actually stopped
+                enabled_after = sum(1 for info in self.state.instances.values() if info['data'].get('enabled', False))
+                stopped_count = enabled_before - enabled_after
+
+                if stopped_count > 0:
+                    self.flash(f"Stopped {stopped_count} instance{'s' if stopped_count != 1 else ''}")
+                else:
+                    self.flash("No instances to stop")
             else:
-                self.flash("No instances to stop")
-
-            self.load_status()
+                self.flash_error("Failed to stop instances")
         except Exception as e:
             self.flash_error(f"Error: {str(e)}")
 
     def reset_logs(self):
         """Reset logs (archive and clear)"""
         try:
-            cmd_reset(['logs'])
-            # Clear message state
-            self.state.messages = []
-            self.state.last_event_id = 0
-            # Reload to clear instance list from display
-            self.load_status()
-            archive_path = f"{Path.home()}/.hcom/archive/"
-            self.flash(f"Logs and instance list archived to {archive_path}", duration=10.0)
+            result = cmd_reset(['logs'])
+            if result == 0:
+                # Clear message state
+                self.state.messages = []
+                self.state.last_event_id = 0
+                # Reload to clear instance list from display
+                self.load_status()
+                archive_path = f"{Path.home()}/.hcom/archive/"
+                self.flash(f"Logs and instance list archived to {archive_path}", duration=10.0)
+            else:
+                self.flash_error("Failed to reset logs")
         except Exception as e:
             self.flash_error(f"Error: {str(e)}")
 
@@ -234,8 +244,10 @@ class HcomTUI:
                         if self.mode == Mode.LAUNCH:
                             self.save_launch_state()
                         self.handle_tab()
+                        self.state.frame_dirty = True
                     else:
                         self.handle_key(key)
+                        self.state.frame_dirty = True
 
             return 0
         except KeyboardInterrupt:
@@ -453,6 +465,8 @@ class HcomTUI:
         except FileNotFoundError:
             self.state.config_mtime = 0.0
 
+        self.state.frame_dirty = True
+
         # Restore in-progress edit if field changed externally
         if active_field and active_field[0]:
             key, value, cursor = active_field
@@ -521,26 +535,36 @@ class HcomTUI:
         """Update state (status, messages)"""
         now = time.time()
 
+        # Clear expired flash messages
+        if self.state.flash_message and now >= self.state.flash_until:
+            self.state.flash_message = None
+            self.state.frame_dirty = True
+
         # Update status every 0.5 seconds
         if now - self.last_status_update >= 0.5:
             self.load_status()
             self.last_status_update = now
+            self.state.frame_dirty = True
 
         # Clear pending toggle after timeout
         if self.state.pending_toggle and (now - self.state.pending_toggle_time) > self.CONFIRMATION_TIMEOUT:
             self.state.pending_toggle = None
+            self.state.frame_dirty = True
 
         # Clear completed toggle display after 2s (match flash default)
         if self.state.completed_toggle and (now - self.state.completed_toggle_time) >= 2.0:
             self.state.completed_toggle = None
+            self.state.frame_dirty = True
 
         # Clear pending stop all after timeout
         if self.state.pending_stop_all and (now - self.state.pending_stop_all_time) > self.CONFIRMATION_TIMEOUT:
             self.state.pending_stop_all = False
+            self.state.frame_dirty = True
 
         # Clear pending reset after timeout
         if self.state.pending_reset and (now - self.state.pending_reset_time) > self.CONFIRMATION_TIMEOUT:
             self.state.pending_reset = False
+            self.state.frame_dirty = True
 
         # Periodic config reload check (only in Launch mode)
         if self.mode == Mode.LAUNCH:
@@ -591,6 +615,7 @@ class HcomTUI:
                         self.state.last_message_time = 0.0
 
                     self.state.last_event_id = current_max_id
+                    self.state.frame_dirty = True
             except Exception as e:
                 # DB query failed - flash error and keep existing messages
                 self.flash_error(f"Message load failed: {e}", duration=5.0)
@@ -685,6 +710,10 @@ class HcomTUI:
 
     def render(self):
         """Render current screen"""
+        # Skip rebuild if nothing changed
+        if not self.state.frame_dirty:
+            return
+
         cols, rows = get_terminal_size()
         # Adapt to any terminal size
         rows = max(10, rows)
@@ -732,11 +761,11 @@ class HcomTUI:
             elif self.state.pending_stop_all:
                 footer = f"{FG_GRAY}ctrl+a: confirm stop all  esc: cancel{RESET}"
             elif self.state.pending_reset:
-                footer = f"{FG_GRAY}ctrl+r: confirm reset  esc: cancel{RESET}"
+                footer = f"{FG_GRAY}ctrl+r: confirm clear  esc: cancel{RESET}"
             elif self.state.pending_toggle:
                 footer = f"{FG_GRAY}enter: confirm  esc: cancel{RESET}"
             else:
-                footer = f"{FG_GRAY}tab: switch  @: mention  enter: toggle  ctrl+a: stop all  ctrl+r: reset{RESET}"
+                footer = f"{FG_GRAY}tab: switch  @: mention  enter: toggle  ctrl+a: stop all  ctrl+r: clear{RESET}"
         elif self.mode == Mode.LAUNCH:
             footer = self.launch_screen.get_footer()
         frame.append(truncate_ansi(footer, cols))
@@ -751,6 +780,9 @@ class HcomTUI:
             sys.stdout.flush()
             self.last_frame = frame
 
+        # Frame rebuilt - clear dirty flag
+        self.state.frame_dirty = False
+
     def handle_tab(self):
         """Cycle between Manage, Launch, and native Log view"""
         if self.mode == Mode.MANAGE:
@@ -764,14 +796,21 @@ class HcomTUI:
             self.mode = Mode.MANAGE
             self.flash("Manage Instances")
 
-    def format_multiline_log(self, display_time: str, sender: str, message: str) -> List[str]:
-        """Format log message with multiline support (indented continuation lines)"""
+    def format_multiline_log(self, display_time: str, sender: str, message: str, type_prefix: str = '', sender_padded: str = '') -> List[str]:
+        """Format log message with multiline support (indented continuation lines)
+        Format: time name: [type] content
+        """
+        display_sender = sender_padded if sender_padded else sender
+
         if '\n' not in message:
-            return [f"{FG_GRAY}{display_time}{RESET} {FG_ORANGE}{sender}{RESET}: {message}"]
+            return [f"{DIM}{FG_GRAY}{display_time}{RESET} {BOLD}{FG_ORANGE}{display_sender}{RESET}: {type_prefix}{message}"]
 
         lines = message.split('\n')
-        result = [f"{FG_GRAY}{display_time}{RESET} {FG_ORANGE}{sender}{RESET}: {lines[0]}"]
-        indent = ' ' * (len(display_time) + len(sender) + 2)
+        result = [f"{DIM}{FG_GRAY}{display_time}{RESET} {BOLD}{FG_ORANGE}{display_sender}{RESET}: {type_prefix}{lines[0]}"]
+        # Calculate indent: time + sender + ": [message] "
+        # type_prefix is "[message] " (10 chars)
+        type_prefix_len = len(type_prefix)
+        indent = ' ' * (len(display_time) + len(display_sender) + 2 + type_prefix_len)
         result.extend(indent + line for line in lines[1:])
         return result
 
@@ -780,9 +819,11 @@ class HcomTUI:
         time_str = msg.get('timestamp', '')
         sender = msg.get('from', '')
         message = msg.get('message', '')
+        type_prefix = msg.get('type_prefix', '')
+        sender_padded = msg.get('from_padded', '')
         display_time = format_timestamp(time_str)
 
-        for line in self.format_multiline_log(display_time, sender, message):
+        for line in self.format_multiline_log(display_time, sender, message, type_prefix, sender_padded):
             print(line)
         print()  # Empty line between messages
 
@@ -851,41 +892,54 @@ class HcomTUI:
             return False
 
     def render_event(self, event: dict):
-        """Render event by type with defensive defaults"""
+        """Render event by type with defensive defaults
+        Format: time name: [type] content
+        """
         event_type = event.get('type', 'unknown')
         timestamp = event.get('timestamp', '')
         instance = event.get('instance', '?')
         data = event.get('data', {})
 
+        # Always show type label in brackets
+        type_labels = {
+            'message': 'message',
+            'status': 'status',
+            'life': 'life'
+        }
+        type_label = type_labels.get(event_type, event_type)
+
         if event_type == 'message':
-            # Reuse existing render_log_message
+            # Format: time name: [message] content
             msg = {
                 'timestamp': timestamp,
                 'from': data.get('from', '?'),
-                'message': data.get('text', '')
+                'message': data.get('text', ''),
+                'type_prefix': f"{FG_GRAY}[{type_label}]{RESET} ",
+                'from_padded': instance
             }
             self.render_log_message(msg)
 
         elif event_type == 'status':
-            # status: {status: "active", context: "Bash"}
+            # Format: time name: [status] status, context
             status = data.get('status', '?')
             context = data.get('context', '')
-            ctx = f" {context}" if context else ""
-            print(f"{FG_GRAY}{format_timestamp(timestamp)}{RESET} "
-                  f"{FG_CYAN}{instance}{RESET}: {status}{ctx}")
+            # Add comma before context if present
+            ctx = f", {context}" if context else ""
+            print(f"{DIM}{FG_GRAY}{format_timestamp(timestamp)}{RESET} "
+                  f"{BOLD}{FG_CYAN}{instance}{RESET}: {FG_GRAY}[{type_label}]{RESET} {status}{ctx}")
             print()  # Empty line between events
 
         elif event_type == 'life':
-            # life: {action: "created|started|stopped|exited"}
+            # Format: time name: [life] action
             action = data.get('action', '?')
-            print(f"{FG_GRAY}{format_timestamp(timestamp)}{RESET} "
-                  f"{FG_YELLOW}{instance}{RESET}: {action}")
+            print(f"{DIM}{FG_GRAY}{format_timestamp(timestamp)}{RESET} "
+                  f"{BOLD}{FG_YELLOW}{instance}{RESET}: {FG_GRAY}[{type_label}]{RESET} {action}")
             print()  # Empty line between events
 
         else:
             # Unknown type - generic fallback
-            print(f"{FG_GRAY}{format_timestamp(timestamp)}{RESET} "
-                  f"{instance} [{event_type}]: {data}")
+            print(f"{DIM}{FG_GRAY}{format_timestamp(timestamp)}{RESET} "
+                  f"{BOLD}{instance}{RESET}: {FG_GRAY}[{event_type}]{RESET} {data}")
             print()  # Empty line between events
 
     def render_event_safe(self, event: dict):
@@ -918,15 +972,16 @@ class HcomTUI:
             sys.stdout.write('\033[2J\033[H')
             sys.stdout.flush()
 
-            # Determine event type to load (None = all types)
-            event_type = None if self.state.log_event_type == "all" else self.state.log_event_type
-
-            # Load events with error boundary
-            has_events = False
+            # Initialize counts
             matched_count = 0
             total_count = 0
-            rendered_lines = 0  # Track lines rendered for padding calculation
+
+            # Re-render all messages
             try:
+                # Get all messages matching current filter
+                # Note: We use a fresh query here to ensure we have everything
+                # even if the incremental updates missed something
+                event_type = None if self.state.log_event_type == "all" else self.state.log_event_type
                 events = get_events_since(0, event_type=event_type)
                 total_count = len(events)
                 has_events = bool(events)

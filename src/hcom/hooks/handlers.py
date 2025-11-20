@@ -28,27 +28,15 @@ from ..core.instances import initialize_instance_in_position_file
 
 
 def handle_pretooluse(hook_data: dict[str, Any], instance_name: str) -> None:
-    """Handle PreToolUse hook - status tracking, auto-approve, subagent setup
+    """Handle PreToolUse hook - auto-approve first (fast path), then status tracking and Task setup
 
-    Status tracking is context-specific, but auto-approve and Task setup always run.
+    Fast path: Auto-approve hcom commands without loading instance (enables vanilla `hcom start`)
+    Slow path: Load instance, track status, setup Task subagents
     """
-    instance_data = load_instance_position(instance_name)
     tool_name = hook_data.get('tool_name', '')
 
-    # 1. Status tracking (context-specific)
-    if instance_data and instance_data.get('enabled', False):
-        # Skip status updates when parent is frozen during Task execution
-        if not in_subagent_context(instance_name):
-            has_sender_flag = False
-            if tool_name == 'Bash':
-                command = hook_data.get('tool_input', {}).get('command', '')
-                has_sender_flag = '--_hcom_sender' in command
-
-            if not has_sender_flag:
-                # Only update parent status (individual semantics - no group updates)
-                parent.update_status(instance_name, tool_name)
-
-    # 2. Auto-approve hcom commands (always runs - needed for subagent hcom commands)
+    # FAST PATH: Auto-approve hcom commands (no instance needed)
+    # This runs before instance check to allow vanilla instances to run `hcom start`
     if tool_name == 'Bash':
         tool_input = hook_data.get('tool_input', {})
         command = tool_input.get('command', '')
@@ -64,7 +52,25 @@ def handle_pretooluse(hook_data: dict[str, Any], instance_name: str) -> None:
                 print(json.dumps(output, ensure_ascii=False))
                 sys.exit(0)
 
-    # 3. Task setup (always runs - parents create subagents)
+    # Everything else requires instance to exist
+    instance_data = load_instance_position(instance_name)
+    if not instance_data:
+        sys.exit(0)  # No instance = vanilla without hcom command, exit
+
+    # 1. Status tracking (context-specific)
+    if instance_data.get('enabled', False):
+        # Skip status updates when parent is frozen during Task execution
+        if not in_subagent_context(instance_name):
+            has_sender_flag = False
+            if tool_name == 'Bash':
+                command = hook_data.get('tool_input', {}).get('command', '')
+                has_sender_flag = '--_hcom_sender' in command
+
+            if not has_sender_flag:
+                # Only update parent status (individual semantics - no group updates)
+                parent.update_status(instance_name, tool_name)
+
+    # 2. Task setup (always runs - parents create subagents)
     if tool_name == 'Task':
         parent.setup_task_subagent(hook_data, instance_name, instance_data)
 
@@ -80,6 +86,10 @@ def handle_posttooluse(hook_data: dict[str, Any], instance_name: str) -> None:
 
     # Load instance_data once for routing decisions
     instance_data = load_instance_position(instance_name)
+
+    # Defensive check: instance should exist (vanilla already gated)
+    if not instance_data:
+        sys.exit(0)
 
     # Subagent-specific Bash commands (only if in subagent context)
     # Default parent (instance_data already loaded)
@@ -100,11 +110,11 @@ def handle_notify(hook_data: dict[str, Any], instance_name: str, updates: dict[s
     """Handle Notification hook - filter generic messages, then route"""
     message = hook_data.get('message', '')
 
-    # Filter generic "waiting for input" when already waiting
+    # Filter generic "waiting for input" when already idle
     if message == "Claude is waiting for your input":
         current_status = instance_data.get('status', '') if instance_data else ''
-        if current_status == 'waiting':
-            return  # Instance is idle, Stop hook will maintain waiting status
+        if current_status == 'idle':
+            return  # Instance is idle, Stop hook will maintain idle status
 
     # Individual semantics - all instances use same notify handler
     parent.notify(hook_data, instance_name, updates, instance_data)
@@ -116,8 +126,11 @@ def handle_userpromptsubmit(hook_data: dict[str, Any], instance_name: str, updat
 
 
 def handle_sessionstart(hook_data: dict[str, Any]) -> None:
-    """Handle SessionStart hook - write session ID to env file & show initial msg"""
+    """Handle SessionStart hook - write session ID to env file, create instance for HCOM-launched, show initial msg"""
     # Write session ID to CLAUDE_ENV_FILE for automatic identity resolution
+    # NOTE: CLAUDE_ENV_FILE only works on Unix (Claude Code doesn't source it on Windows).
+    # Windows vanilla instances must use MAPID fallback for identity resolution.
+    # Windows HCOM-launched instances get HCOM_LAUNCH_TOKEN via launch env.
     session_id = hook_data.get('session_id')
     env_file = os.environ.get('CLAUDE_ENV_FILE')
 
@@ -125,6 +138,38 @@ def handle_sessionstart(hook_data: dict[str, Any]) -> None:
         try:
             with open(env_file, 'a', newline='\n') as f:
                 f.write(f'\nexport HCOM_SESSION_ID={session_id}\n')
+        except Exception:
+            # Fail silently - hook safety
+            pass
+
+    # Store MAPID → session_id mapping for Windows bash command identity resolution
+    from ..shared import MAPID
+    if session_id and MAPID:
+        try:
+            from ..core.db import get_db
+            import time
+            conn = get_db()
+            conn.execute(
+                "INSERT OR REPLACE INTO mapid_sessions (mapid, session_id, updated_at) VALUES (?, ?, ?)",
+                (MAPID, session_id, time.time())
+            )
+            conn.commit()
+        except Exception:
+            # Fail silently - hook safety
+            pass
+
+    # Create instance for HCOM-launched (explicit opt-in via launch)
+    if os.environ.get('HCOM_LAUNCHED') == '1' and session_id:
+        try:
+            from ..core.instances import resolve_instance_name
+            # Use resolve_instance_name for collision handling (not get_display_name)
+            instance_name, _ = resolve_instance_name(session_id, get_config().tag)
+            initialize_instance_in_position_file(
+                instance_name,
+                session_id=session_id,
+                mapid=MAPID,
+                enabled=True  # HCOM-launched = opted in
+            )
         except Exception:
             # Fail silently - hook safety
             pass

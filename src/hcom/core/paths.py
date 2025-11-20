@@ -25,7 +25,18 @@ ARCHIVE_DIR = "archive"
 def hcom_path(*parts: str, ensure_parent: bool = False) -> Path:
     """Build path under ~/.hcom (or HCOM_DIR if set)"""
     base = os.environ.get('HCOM_DIR')  # Override base directory (for per-project isolation)
-    path = Path(base) if base else (Path.home() / ".hcom")
+    if base:
+        # Validate HCOM_DIR to prevent path traversal (strict for security)
+        # HCOM_DIR is for testing/isolation - no legitimate use for '..' in path
+        # Use absolute paths like /tmp/hcom-test instead of relative paths
+        if '..' in base:
+            raise ValueError("HCOM_DIR cannot contain '..' (path traversal risk)")
+        base_path = Path(base)
+        if not base_path.is_absolute():
+            raise ValueError("HCOM_DIR must be an absolute path")
+        path = base_path.resolve()
+    else:
+        path = Path.home() / ".hcom"
     if parts:
         path = path.joinpath(*parts)
     if ensure_parent:
@@ -50,14 +61,17 @@ def atomic_write(filepath: str | Path, content: str) -> bool:
     filepath = Path(filepath) if not isinstance(filepath, Path) else filepath
     filepath.parent.mkdir(parents=True, exist_ok=True)
 
-    for attempt in range(3):
-        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False, dir=filepath.parent, suffix='.tmp') as tmp:
-            tmp.write(content)
-            tmp.flush()
-            os.fsync(tmp.fileno())
+    # Create temp file once (outside retry loop to prevent leaks)
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False, dir=filepath.parent, suffix='.tmp') as tmp:
+        tmp.write(content)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_name = tmp.name
 
+    # Retry only the replace operation
+    for attempt in range(3):
         try:
-            os.replace(tmp.name, filepath)
+            os.replace(tmp_name, filepath)
             return True
         except PermissionError:
             if IS_WINDOWS and attempt < 2:
@@ -65,13 +79,13 @@ def atomic_write(filepath: str | Path, content: str) -> bool:
                 continue
             else:
                 try: # Clean up temp file on final failure
-                    Path(tmp.name).unlink()
+                    Path(tmp_name).unlink()
                 except (FileNotFoundError, PermissionError, OSError):
                     pass
                 return False
         except Exception:
             try: # Clean up temp file on any other error
-                os.unlink(tmp.name)
+                os.unlink(tmp_name)
             except (FileNotFoundError, PermissionError, OSError):
                 pass
             return False

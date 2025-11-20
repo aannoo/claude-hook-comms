@@ -43,6 +43,10 @@ class UIState:
     message_buffer: str = ""
     message_cursor_pos: int = 0
     instance_scroll_pos: int = 0
+    show_instance_detail: Optional[str] = None  # Instance name to show detail for (cleared on cursor move/ESC)
+
+    # Rendering optimization
+    frame_dirty: bool = True  # Frame needs rebuild (set when data/cursor/input changes)
 
     # Launch screen state
     launch_count: str = "1"

@@ -10,22 +10,25 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Literal
 
-__version__ = "0.6.4"
+__version__ = "0.6.5"
 
 # ===== Platform Detection =====
 IS_WINDOWS = sys.platform == 'win32'
 CREATE_NO_WINDOW = 0x08000000  # Windows: prevent console window creation
 
 # ===== Terminal Identity =====
-# Windows/cross-platform terminal session identifier
+# Windows terminal session identifier fallback
 # Used for command identity resolution when HCOM_SESSION_ID not available
+# (CLAUDE_ENV_FILE sourcing works on Unix but not Windows)
 MAPID = (
-    os.environ.get('HCOM_LAUNCH_TOKEN')
-    or os.environ.get('WT_SESSION')
-    or os.environ.get('WEZTERM_PANE')
-    or os.environ.get('WAVETERM_BLOCKID')
-    or os.environ.get('KITTY_WINDOW_ID')
-    or os.environ.get('TMUX_PANE')
+    os.environ.get('HCOM_LAUNCH_TOKEN')     # hcom-set, always unique
+    or os.environ.get('WT_SESSION')         # Windows Terminal (native)
+    or os.environ.get('ConEmuHWND')         # ConEmu/Cmder (native)
+    or os.environ.get('WEZTERM_PANE')       # WezTerm (cross-platform)
+    or os.environ.get('ALACRITTY_WINDOW_ID') # Alacritty (cross-platform)
+    or os.environ.get('WAVETERM_BLOCKID')   # Wave Terminal
+    or os.environ.get('ZELLIJ_SESSION_NAME') # Zellij (cross-platform)
+    or os.environ.get('TMUX_PANE')          # tmux (Git Bash/WSL)
 )
 
 def is_wsl() -> bool:
@@ -195,28 +198,22 @@ DEFAULT_CONFIG_DEFAULTS = [
 # 'enabled' field is separate from status (participation vs activity)
 
 # Valid status values
-STATUS_VALUES = ['active', 'delivered', 'waiting', 'blocked', 'exited', 'stale', 'unknown']
+STATUS_VALUES = ['active', 'idle', 'blocked', 'inactive']
 
 # Status icons
 STATUS_ICONS = {
     'active': '▶',
-    'delivered': '▷',
-    'waiting': '◉',
+    'idle': '◉',
     'blocked': '■',
-    'exited': '○',
-    'stale': '⊙',
-    'unknown': '◦'
+    'inactive': '○',
 }
 
 # Status colors (foreground)
 STATUS_COLORS = {
     'active': FG_GREEN,
-    'delivered': FG_CYAN,
-    'waiting': FG_BLUE,
+    'idle': FG_BLUE,
     'blocked': FG_RED,
-    'exited': FG_GRAY,
-    'stale': FG_STALE,
-    'unknown': FG_GRAY
+    'inactive': FG_GRAY,
 }
 
 # STATUS_MAP for watch command (foreground color, icon)
@@ -228,12 +225,9 @@ STATUS_MAP = {
 # Background colors for statusline display blocks
 STATUS_BG_COLORS = {
     'active': BG_GREEN,
-    'delivered': BG_CYAN,
-    'waiting': BG_BLUE,
+    'idle': BG_BLUE,
     'blocked': BG_RED,
-    'exited': BG_GRAY,
-    'stale': BG_STALE,
-    'unknown': BG_GRAY
+    'inactive': BG_GRAY,
 }
 
 # Background color map for TUI statusline (background color, icon)
@@ -243,10 +237,7 @@ STATUS_BG_MAP = {
 }
 
 # Display order (priority-based sorting)
-STATUS_ORDER = [
-    "active", "delivered", "waiting",
-    "blocked", "stale", "exited", "unknown"
-]
+STATUS_ORDER = ["active", "idle", "blocked", "inactive"]
 
 # TUI-specific (alias for STATUS_COLORS)
 STATUS_FG = STATUS_COLORS

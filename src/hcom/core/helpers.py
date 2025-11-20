@@ -51,30 +51,39 @@ def validate_scope(scope: str) -> None:
         )
 
 def is_mentioned(text: str, name: str) -> bool:
-    """Check if @name appears in text (case-insensitive, proper word boundaries).
+    """Check if instance name is @-mentioned in text using prefix matching.
+
+    Uses same prefix matching logic as compute_scope() for consistency.
+    This allows @api to match instances like "api-worker-1" and "api-worker-2".
 
     Args:
         text: Text to search in
         name: Instance name to look for (without @ prefix)
 
     Returns:
-        True if @name is mentioned, False otherwise
+        True if @mention prefix-matches name, False otherwise
 
     Examples:
         >>> is_mentioned("Hey @john, can you help?", "john")
         True
-        >>> is_mentioned("Hey @John, can you help?", "john")  # case-insensitive
+        >>> is_mentioned("Hey @john, can you help?", "johnsmith")  # prefix match
         True
+        >>> is_mentioned("Hey @johnsmith, test", "john")  # doesn't match
+        False
         >>> is_mentioned("email@john.com", "john")  # not a mention
         False
-        >>> is_mentioned("@johnsmith test", "john")  # not a mention (partial)
-        False
     """
-    # Match @ followed by name, not preceded/followed by word chars
-    # (?<!\w) = negative lookbehind for word char
-    # (?!\w) = negative lookahead for word char
-    pattern = r'(?<!\w)@' + re.escape(name) + r'(?!\w)'
-    return re.search(pattern, text, re.IGNORECASE) is not None
+    from ..shared import MENTION_PATTERN
+
+    # Extract all @mentions from text
+    mentions = MENTION_PATTERN.findall(text)
+
+    # Check if any mention prefix-matches the instance name (case-insensitive)
+    for mention in mentions:
+        if name.lower().startswith(mention.lower()):
+            return True
+
+    return False
 
 __all__ = [
     'VALID_SCOPES',

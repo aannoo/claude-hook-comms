@@ -29,7 +29,7 @@ from .utils import (
 
 def update_status(instance_name: str, tool_name: str) -> None:
     """Update parent status"""
-    set_status(instance_name, 'active', tool_name)
+    set_status(instance_name, 'active', f'tool:{tool_name}')
 
 
 def setup_task_subagent(hook_data: dict[str, Any], instance_name: str, instance_data: dict[str, Any] | None) -> None:
@@ -65,7 +65,7 @@ def stop(hook_data: dict[str, Any], instance_name: str, updates: dict[str, Any],
         print(json.dumps(output, ensure_ascii=False))
 
     if timed_out:
-        set_status(instance_name, 'exited')
+        set_status(instance_name, 'inactive', 'exit:timeout')
 
     sys.exit(exit_code)
 
@@ -229,7 +229,7 @@ def _get_posttooluse_messages(instance_name: str, instance_data: dict[str, Any] 
         return None
 
     formatted = format_hook_messages(messages, instance_name)
-    set_status(instance_name, 'delivered', messages[0]['from'])
+    set_status(instance_name, 'active', f"deliver:{messages[0]['from']}")
 
     return {
         "systemMessage": formatted,
@@ -291,45 +291,25 @@ def userpromptsubmit(hook_data: dict[str, Any], instance_name: str, updates: dic
         conn = get_db()
         # Only process non-exited subagents (skip historical ones)
         subagents = conn.execute(
-            "SELECT name FROM instances WHERE parent_name = ? AND status != 'exited'",
+            "SELECT name FROM instances WHERE parent_name = ? AND NOT (status = 'inactive' AND status_context LIKE 'exit:%')",
             (instance_name,)
         ).fetchall()
         for row in subagents:
             disable_instance(row['name'], initiated_by=instance_name, reason='orphaned')
-            set_status(row['name'], 'exited', 'orphaned')
+            set_status(row['name'], 'inactive', 'exit:orphaned')
 
-    # Persist updates (transcript_path, directory, tag, etc.) unconditionally
-    update_instance_position(instance_name, updates)
-
-    # Set status to active (user submitted prompt)
-    set_status(instance_name, 'active', 'prompt')
-
-    # Build message based on what happened
+    # Show bootstrap if not already announced (HCOM-launched instances only)
+    # Vanilla instances get bootstrap in PostToolUse after cmd_start creates instance
+    show_bootstrap = False
     msg = None
 
-    # Determine if this is an HCOM-launched instance
-    is_hcom_launched = os.environ.get('HCOM_LAUNCHED') == '1'
-
-    # Show bootstrap if not already announced
     if not alias_announced:
-        if is_hcom_launched:
-            # HCOM-launched instance - show bootstrap immediately
+        # Only HCOM-launched instances show bootstrap in UserPromptSubmit
+        if os.environ.get('HCOM_LAUNCHED') == '1':
             msg = build_hcom_bootstrap_text(instance_name)
-            update_instance_position(instance_name, {'alias_announced': True})
-        else:
-            # Vanilla Claude instance - check if user is about to run an hcom command
-            user_prompt = hook_data.get('prompt', '')
-            hcom_command_pattern = r'\bhcom\s+\w+'
-            if re.search(hcom_command_pattern, user_prompt, re.IGNORECASE):
-                # Bootstrap not shown yet - show it preemptively before hcom command runs
-                msg = "[HCOM COMMAND DETECTED]\n\n"
-                msg += build_hcom_bootstrap_text(instance_name)
-                update_instance_position(instance_name, {'alias_announced': True})
+            show_bootstrap = True
 
-    # Add resume status note if we showed bootstrap for a matched resume
-    if msg and is_matched_resume:
-        if is_enabled:
-            msg += "\n[HCOM Session resumed. Your alias and conversation history preserved.]"
+    # Show message if needed
     if msg:
         output = {
             "hookSpecificOutput": {
@@ -338,6 +318,17 @@ def userpromptsubmit(hook_data: dict[str, Any], instance_name: str, updates: dic
             }
         }
         print(json.dumps(output), file=sys.stdout)
+
+    # Mark bootstrap as shown
+    if show_bootstrap:
+        update_instance_position(instance_name, {'alias_announced': True})
+
+    # Persist updates (transcript_path, directory, tag, etc.)
+    if updates:
+        update_instance_position(instance_name, updates)
+
+    # Set status to active (user submitted prompt)
+    set_status(instance_name, 'active', 'tool:prompt')
 
 
 def notify(hook_data: dict[str, Any], instance_name: str, updates: dict[str, Any], instance_data: dict[str, Any] | None) -> None:
@@ -359,8 +350,8 @@ def sessionend(hook_data: dict[str, Any], instance_name: str, updates: dict[str,
     # Set session_ended flag to tell Stop hook to exit
     updates['session_ended'] = True
 
-    # Set status to exited with reason as context (reason: clear, logout, prompt_input_exit, other)
-    set_status(instance_name, 'exited', reason)
+    # Set status to inactive with reason as context (reason: clear, logout, prompt_input_exit, other)
+    set_status(instance_name, 'inactive', f'exit:{reason}')
 
     try:
         update_instance_position(instance_name, updates)

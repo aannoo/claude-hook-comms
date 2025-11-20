@@ -334,21 +334,17 @@ def cmd_stop(argv: list[str]) -> int:
     from ..shared import SENDER, CLAUDE_SENDER
     if instance_name in (CLAUDE_SENDER, SENDER):
         if IS_WINDOWS:
-            print(format_error("Cannot resolve instance identity - use 'hcom <n>' or Windows Terminal for stable identity"), file=sys.stderr)
+            raise CLIError("Cannot resolve instance identity - use 'hcom <n>' or Windows Terminal for stable identity")
         else:
-            print(format_error("Cannot resolve instance identity - launch via 'hcom <n>' for stable identity"), file=sys.stderr)
-        return 1
+            raise CLIError("Cannot resolve instance identity - launch via 'hcom <n>' for stable identity")
 
     # Error handling
     if not instance_name:
-        print(format_error("Cannot determine instance identity"), file=sys.stderr)
-        print("Usage: hcom stop <alias> | hcom stop all | prompt Claude to run 'hcom stop'", file=sys.stderr)
-        return 1
+        raise CLIError("Cannot determine instance identity\nUsage: hcom stop <alias> | hcom stop all | prompt Claude to run 'hcom stop'")
 
     position = load_instance_position(instance_name)
     if not position:
-        print(format_error(f"Instance '{instance_name}' not found"), file=sys.stderr)
-        return 1
+        raise CLIError(f"Instance '{instance_name}' not found")
 
     # Skip already stopped instances
     if not position.get('enabled', False):
@@ -414,7 +410,7 @@ def cmd_start(argv: list[str]) -> int:
         already = 'already ' if instance_data.get('enabled', False) else ''
         launcher = resolve_identity().name
         enable_instance(subagent_id, initiated_by=launcher, reason='manual')
-        set_status(subagent_id, 'active', 'start')
+        set_status(subagent_id, 'active', 'tool:start')
 
         parent_name = instance_data.get('parent_name', 'unknown')
         from ..shared import SENDER
@@ -490,8 +486,21 @@ Response Routing:
 
     # Create instance if it doesn't exist (opt-in for vanilla instances)
     if not existing_data:
+        from ..shared import MAPID
         session_id = os.environ.get('HCOM_SESSION_ID')
-        initialize_instance_in_position_file(instance_name, session_id)
+
+        # Windows fallback: Look up session_id via MAPID mapping
+        if not session_id and MAPID:
+            from ..core.db import get_db
+            conn = get_db()
+            row = conn.execute(
+                "SELECT session_id FROM mapid_sessions WHERE mapid = ?",
+                (MAPID,)
+            ).fetchone()
+            session_id = row['session_id'] if row else None
+
+        # Pass both session_id (Unix) and MAPID (Windows) for cross-platform identity
+        initialize_instance_in_position_file(instance_name, session_id, mapid=MAPID)
         launcher = resolve_identity().name
         enable_instance(instance_name, initiated_by=launcher, reason='manual')
         print(f"\nStarted HCOM for {instance_name}")
@@ -505,11 +514,10 @@ Response Routing:
     # Check if background instance has exited permanently
     if existing_data.get('session_ended') and existing_data.get('background'):
         session = existing_data.get('session_id', '')
-        print(f"Cannot start {instance_name}: headless instance has exited permanently", file=sys.stderr)
-        print(f"Headless instances terminate when stopped and cannot be restarted", file=sys.stderr)
+        msg = f"Cannot start HCOM for {instance_name}: headless instance has exited permanently\n"
         if session:
-            print(f"Resume conversation with same alias: hcom 1 claude -p --resume {session}", file=sys.stderr)
-        return 1
+            msg += f"\nResume conversation with same hcom identity: hcom 1 claude -p --resume {session}"
+        raise CLIError(msg)
 
     # Re-enabling existing instance
     launcher = resolve_identity().name

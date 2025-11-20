@@ -621,10 +621,13 @@ class LaunchScreen:
             if is_confirming:
                 # Execute config reset
                 try:
-                    cmd_reset(['config'])
-                    self.tui.load_config_from_file()
-                    self.tui.load_launch_state()
-                    self.tui.flash("Config reset to defaults")
+                    result = cmd_reset(['config'])
+                    if result == 0:
+                        self.tui.load_config_from_file()
+                        self.tui.load_launch_state()
+                        self.tui.flash("Config reset to defaults")
+                    else:
+                        self.tui.flash_error("Failed to reset config")
                 except Exception as e:
                     self.tui.flash_error(f"Reset failed: {str(e)}")
                 finally:

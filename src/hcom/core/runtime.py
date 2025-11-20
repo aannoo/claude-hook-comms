@@ -83,12 +83,9 @@ Receiving Messages:
 
 Status Indicators:
 - ▶ active (working on task)
-- ▷ delivered (received message, working)
-- ◉ waiting (idle, ready for work)
+- ◉ idle (ready for work)
 - ■ blocked (needs user approval)
-- ○ exited (session ended)
-- ⊙ stale (timeout, can't receive messages)
-- ◦ unknown (status unavailable)
+- ○ inactive (session ended, timeout, stale)
 
 Response Routing:
 - HCOM message (via hook/bash) → Respond with hcom send
@@ -140,8 +137,8 @@ Current ~/.hcom/config.env values have been set to:{config_display}
 watch - historical, from events table (NDJSON stream)
 types:
 - message: from,scope,recipients...
-- status: active/delivered=working, waiting=ready for work, blocked=need user approval, exited/stale/unknown=dead
-- life: action: created|started|stopped|launched|exited
+- status: active=working, idle=ready, blocked=needs approval, inactive=dead
+- life: action: created|started|stopped|launched|ready
 
 list - current, from instances table (NDJSON snapshot)
 - read_receipts, hcom_connected, status, wait_timeout...
@@ -153,12 +150,12 @@ sqlite3 ~/.hcom/hcom.db "SELECT * FROM..."  # Direct SQL (2 tables: instances & 
 
 Always use watch --wait with --sql instead of sleep:
 Wrong: sleep 10 && hcom list && sleep 10 && hcom list && sleep 10 && hcom list
-Right: hcom watch --wait 60 --sql "type = 'status' AND json_extract(data, '$.status') = 'waiting'" # blocks until specific event or timeout (exit 0=match, 1=timeout, 2=error, 3=interrupted by @mention)
+Right: hcom watch --wait 60 --sql "type = 'status' AND json_extract(data, '$.status') = 'idle'" # blocks until specific event or timeout (exit 0=match, 1=timeout, 2=error, 3=interrupted by @mention)
 
 
 ## BEHAVIOUR
 - All instances receive HCOM SESSION CONFIG info automatically
-- Idle/waiting instances can't do anything except wake on message delivery
+- Idle instances can't do anything except wake on message delivery
 - Task tool subagents inherit their parents hcom state/name (john → john-general-purpose-1)
 
 
@@ -220,7 +217,7 @@ Uses: Behavioral guidelines, context reminders, formatting requests, workflow hi
 
 
 ### HCOM_TIMEOUT and HCOM_SUBAGENT_TIMEOUT
-After timeout (default 30min, 30s for subagents), instances can't receive messages, marked 'stale'. No downside to longer timeouts (polling <0.1% CPU). Use default or long timeout and `hcom stop {{alias}}` to stop early if needed.
+After timeout (default 30min, 30s for subagents), instances can't receive messages, marked stale (status=inactive). No downside to longer timeouts (polling <0.1% CPU). Use default or long timeout and `hcom stop {{alias}}` to stop early if needed.
 
 Timeout behavior:
 - Normal: terminal stays open, process still running, user must send prompt for instance to re-join hcom connection

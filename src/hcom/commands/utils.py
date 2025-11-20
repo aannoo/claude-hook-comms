@@ -124,19 +124,37 @@ def resolve_identity(subagent_id: str | None = None, custom_from: str | None = N
     if os.environ.get('CLAUDECODE') != '1':
         return SenderIdentity(kind='external', name=SENDER, instance_data=None)
 
-    # Inside Claude: try session_id
+    # Inside Claude: try session_id (Unix only - CLAUDE_ENV_FILE doesn't work on Windows)
     session_id = os.environ.get('HCOM_SESSION_ID')
     if session_id:
         name, data = resolve_instance_name(session_id, get_config().tag)
-        if data:
-            return SenderIdentity(kind='instance', name=name, instance_data=data)
+        # Return instance identity (data may be None if not opted in yet)
+        return SenderIdentity(kind='instance', name=name, instance_data=data)
 
-    # Try MAPID
+    # Try MAPID (Windows fallback - terminal session ID like WT_SESSION)
     if MAPID:
-        from ..core.db import get_instance_by_mapid
+        from ..core.db import get_instance_by_mapid, get_db
+        from ..core.instances import resolve_instance_name
+
+        # First try to find existing instance by MAPID
         data = get_instance_by_mapid(MAPID)
         if data:
             return SenderIdentity(kind='instance', name=data['name'], instance_data=data)
+
+        # No instance for this MAPID - look up session_id from mapping
+        # This handles Windows resume in different terminal (MAPID changes but session_id stays same)
+        conn = get_db()
+        row = conn.execute(
+            "SELECT session_id FROM mapid_sessions WHERE mapid = ?",
+            (MAPID,)
+        ).fetchone()
+
+        if row:
+            # Found session_id mapping - use it for consistent naming across terminals
+            session_id = row['session_id']
+            name, data = resolve_instance_name(session_id, get_config().tag)
+            # Return instance identity (data may be None if not opted in yet)
+            return SenderIdentity(kind='instance', name=name, instance_data=data)
 
     # No identity available - fallback to external 'john'
     return SenderIdentity(kind='external', name=CLAUDE_SENDER, instance_data=None)

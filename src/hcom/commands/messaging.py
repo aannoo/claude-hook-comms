@@ -153,6 +153,12 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
         # Resolve sender identity (handles all context: CLI, instance, subagent, custom)
         identity = resolve_identity(subagent_id, custom_sender)
 
+        # Guard: Block sends from vanilla Claude before opt-in
+        import os
+        if identity.kind == 'instance' and not identity.instance_data and os.environ.get('CLAUDECODE') == '1':
+            print(format_error("HCOM not started for this instance. Run 'hcom start' first, then use hcom send"), file=sys.stderr)
+            return 1
+
         # For instances (not external), check state
         if identity.kind == 'instance' and identity.instance_data:
             # Guard: If in subagent context, subagent MUST provide --_hcom_sender
@@ -180,7 +186,7 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
 
         # Set status to active for subagents
         if subagent_id:
-            set_status(subagent_id, 'active', 'send')
+            set_status(subagent_id, 'active', 'tool:send')
 
         # Send message and get recipients snapshot
         recipients = send_message(identity, message)
@@ -271,8 +277,8 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
             return 0
 
         # Instance exists - enter polling loop
-        # Mark external sender as waiting (idle) for TUI/CLI status
-        set_status(custom_sender, 'waiting')
+        # Mark external sender as idle for TUI/CLI status
+        set_status(custom_sender, 'idle')
 
         last_pos = instance_data.get('last_event_id', get_last_event_id())
         current_pos = last_pos
@@ -320,7 +326,7 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
                         update_instance_position(custom_sender, {'last_event_id': current_pos})
 
                         # Mark as delivered for TUI/CLI status
-                        set_status(custom_sender, 'delivered', data['from'])
+                        set_status(custom_sender, 'active', f"deliver:{data['from']}")
 
                         # Print the message
                         print(f"\n[Message from {data['from']}]")
@@ -341,7 +347,7 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
         # Timeout
         update_instance_position(custom_sender, {'last_event_id': current_pos})
         # Timeout: external sender stopped polling, mirror stop hook behaviour
-        set_status(custom_sender, 'exited', 'timeout')
+        set_status(custom_sender, 'inactive', 'exit:timeout')
         print(f"\n[Timeout: no messages after {poll_timeout}s]", file=sys.stderr)
         return 1
 

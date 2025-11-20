@@ -123,6 +123,15 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
         )
     """)
 
+    # Create MAPID → session_id mapping table for Windows identity resolution
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mapid_sessions (
+            mapid TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )
+    """)
+
     # Migrate existing databases: add mapid column if missing
     cursor = conn.execute("PRAGMA table_info(instances)")
     columns = {row['name'] for row in cursor.fetchall()}
@@ -157,6 +166,9 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON instances(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mapid ON instances(mapid) WHERE mapid != ''")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_id ON instances(agent_id) WHERE agent_id IS NOT NULL")
+
+    # Create mapid_sessions index
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mapid_sessions_updated ON mapid_sessions(updated_at DESC)")
 
     conn.commit()
 

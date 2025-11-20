@@ -42,13 +42,13 @@ def cleanup_orphaned_subagents(instance_name: str, instance_data: dict[str, Any]
     # Query by parent_name (unambiguous, works for all instances)
     # Only cleanup subagents that aren't already exited (skip historical ones)
     rows = conn.execute(
-        "SELECT name, status FROM instances WHERE parent_name = ? AND status != 'exited'",
+        "SELECT name, status FROM instances WHERE parent_name = ? AND NOT (status = 'inactive' AND status_context LIKE 'exit:%')",
         (instance_name,)
     ).fetchall()
 
     for row in rows:
         disable_instance(row['name'], initiated_by=instance_name, reason='orphaned')
-        set_status(row['name'], 'exited', 'orphaned')
+        set_status(row['name'], 'inactive', 'exit:orphaned')
 
 
 def setup_subagent_identity(instance_data: dict[str, Any] | None, instance_name: str, tool_input: dict[str, Any], session_id: str) -> dict[str, Any] | None:
@@ -244,11 +244,11 @@ def mark_task_subagents_exited(instance_name: str) -> None:
     conn = get_db()
     # Only mark non-exited subagents (skip historical ones)
     subagents = conn.execute(
-        "SELECT name FROM instances WHERE parent_name = ? AND status != 'exited'",
+        "SELECT name FROM instances WHERE parent_name = ? AND NOT (status = 'inactive' AND status_context LIKE 'exit:%')",
         (instance_name,)
     ).fetchall()
     for row in subagents:
-        set_status(row['name'], 'exited', 'task_completed')
+        set_status(row['name'], 'inactive', 'exit:task_completed')
 
 
 def handle_task_completion(instance_name: str, instance_data: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -275,7 +275,7 @@ def handle_task_completion(instance_name: str, instance_data: dict[str, Any] | N
     mark_task_subagents_exited(instance_name)
 
     # Clear Task context so parent can update status normally again
-    set_status(instance_name, 'active', 'task_completed')
+    set_status(instance_name, 'active', 'tool:task_completed')
 
     # Return output for delivery if present
     if summary := result.get('summary'):
@@ -337,7 +337,7 @@ def poll_messages(
         instance_data = load_instance_position(instance_id)
         if not instance_data or not instance_data.get('enabled', False):
             if instance_data and not instance_data.get('enabled'):
-                set_status(instance_id, 'exited', 'disabled')
+                set_status(instance_id, 'inactive', 'exit:disabled')
             return (0, None, False)
 
         # Setup TCP notification (both parent and subagent use it)
@@ -365,7 +365,7 @@ def poll_messages(
 
         # Set status BEFORE loop (visible immediately)
         update_instance_position(instance_id, {'last_stop': time.time()})
-        set_status(instance_id, 'waiting')
+        set_status(instance_id, 'idle')
 
         start = time.time()
 
@@ -377,6 +377,30 @@ def poll_messages(
                     return (0, None, False)
                 if instance_data.get('session_ended'):
                     return (0, None, False)
+
+                # Poll BEFORE select() to catch messages from PostToolUse→Stop transition gap
+                # Messages arriving while Stop hook not running already sent (failed) notifications
+                # to old/None port. Check immediately on restart to avoid 30s select() timeout.
+                messages, max_event_id = get_unread_messages(instance_id, update_position=False)
+
+                if messages:
+                    # Orphan detection - don't mark as read if Claude died
+                    if not _check_claude_alive():
+                        return (0, None, False)
+
+                    # Mark as read and deliver
+                    update_instance_position(instance_id, {'last_event_id': max_event_id})
+
+                    # Limit messages (both parent and subagent)
+                    messages = messages[:MAX_MESSAGES_PER_DELIVERY]
+                    formatted = format_hook_messages(messages, instance_id)
+                    set_status(instance_id, 'active', f"deliver:{messages[0]['from']}")
+
+                    output = {
+                        "decision": "block",
+                        "reason": formatted
+                    }
+                    return (2, output, False)
 
                 # Calculate remaining time to prevent timeout overshoot
                 remaining = timeout - (time.time() - start)
@@ -403,45 +427,17 @@ def poll_messages(
                 # Update heartbeat
                 update_instance_position(instance_id, {'last_stop': time.time()})
 
-                # Poll for messages
-                messages, max_event_id = get_unread_messages(instance_id, update_position=False)
-
-                if messages:
-                    # Orphan detection - don't mark as read if Claude died
-                    if not _check_claude_alive():
-                        return (0, None, False)
-
-                    # Mark as read and deliver
-                    update_instance_position(instance_id, {'last_event_id': max_event_id})
-
-                    # Limit messages (both parent and subagent)
-                    messages = messages[:MAX_MESSAGES_PER_DELIVERY]
-                    formatted = format_hook_messages(messages, instance_id)
-                    set_status(instance_id, 'delivered', messages[0]['from'])
-
-                    output = {
-                        "decision": "block",
-                        "reason": formatted,
-                        "systemMessage": formatted
-                    }
-                    return (2, output, False)
-
             # Timeout reached
             if disable_on_timeout:
                 update_instance_position(instance_id, {'enabled': False})
-                set_status(instance_id, 'exited', 'timeout')
+                set_status(instance_id, 'inactive', 'exit:timeout')
             return (0, None, True)
 
         finally:
-            # Cleanup TCP server - clear DB first to prevent connection attempts to closed socket
+            # Close socket but keep notify_port in DB (stale reference acceptable)
+            # Notifications to stale port fail silently (best-effort). Better than None which skips notification.
+            # Next Stop cycle updates to new port. Only clear on true exit (disabled/session ended).
             if notify_server:
-                try:
-                    update_instance_position(instance_id, {
-                        'notify_port': None,
-                        'tcp_mode': False
-                    })
-                except Exception:
-                    pass
                 try:
                     notify_server.close()
                 except Exception:

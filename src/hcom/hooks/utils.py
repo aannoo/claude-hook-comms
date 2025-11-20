@@ -138,11 +138,15 @@ def init_hook_context(hook_data: dict[str, Any], hook_type: str | None = None) -
     """
     Initialize instance context. Flow:
     1. Resolve instance name (search by session_id, generate if not found)
-    2. Create instance in DB if fresh start
-    3. Build updates dict (directory, tag, session_id, mapid, background, transcript_path)
-    4. Return (instance_name, updates, is_matched_resume)
+    2. Build updates dict (directory, tag, session_id, mapid, background, transcript_path)
+    3. Return (instance_name, updates, is_matched_resume)
+
+    Note: Instance creation now happens at boundaries:
+    - SessionStart for HCOM-launched instances
+    - cmd_start for vanilla opt-in
+    Auto-vivify in update_instance_position handles edge cases (mid-session reset, etc.)
     """
-    from ..core.instances import resolve_instance_name, initialize_instance_in_position_file
+    from ..core.instances import resolve_instance_name
     from ..shared import MAPID
 
     session_id = hook_data.get('session_id', '')
@@ -152,11 +156,7 @@ def init_hook_context(hook_data: dict[str, Any], hook_type: str | None = None) -
     # Resolve instance name - existing_data is None for fresh starts
     instance_name, existing_data = resolve_instance_name(session_id, tag)
 
-    # Initialize if fresh start (UserPromptSubmit or first hook)
-    if not existing_data:
-        initialize_instance_in_position_file(instance_name, session_id=session_id, mapid=MAPID)
-
-    # Build updates dict (CRITICAL: dispatcher relies on these fields (does it?))
+    # Build updates dict
     updates: dict[str, Any] = {
         'directory': str(Path.cwd()),
     }

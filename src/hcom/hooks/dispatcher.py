@@ -21,34 +21,40 @@ from .utils import init_hook_context, log_hook_error
 def should_skip_vanilla_instance(hook_type: str, hook_data: dict) -> bool:
     """
     Returns True if hook should exit early.
-    Vanilla instances (not HCOM-launched) exit early unless:
-    - Enabled
-    - PreToolUse (handles opt-in)
+    Vanilla instances (never opted in via previously_enabled) exit early unless:
+    - PreToolUse (handles auto-approval)
+    - HCOM-launched (opted in at launch)
     - UserPromptSubmit with hcom command in prompt (shows preemptive bootstrap)
     """
-    # PreToolUse always runs (handles toggle commands)
-    # HCOM-launched instances always run
-    if hook_type == 'pre' or os.environ.get('HCOM_LAUNCHED') == '1':
+    # PreToolUse always runs (auto-approval for hcom commands)
+    if hook_type == 'pre':
         return False
 
+    # HCOM-launched instances always run (opted in at launch)
+    if os.environ.get('HCOM_LAUNCHED') == '1':
+        return False
+
+    # Get session_id
     session_id = hook_data.get('session_id', '')
-    if not session_id:  # No session_id = can't identify instance, skip hook
-        return True
+    if not session_id:
+        return True  # No identity = skip
 
+    # Check if instance exists
     stored_name = find_instance_by_session(session_id)
-    if stored_name:
-        return False
-
-    instance_name = get_display_name(session_id, get_config().tag)
-
-    if not get_instance(instance_name):
-        # Allow UserPromptSubmit if prompt contains hcom command
-        if hook_type == 'userpromptsubmit':
-            user_prompt = hook_data.get('prompt', '')
-            return not re.search(r'\bhcom\s+\w+', user_prompt, re.IGNORECASE)
+    if not stored_name:
+        # No instance = never opted in, skip all hooks
         return True
 
-    return False
+    # Instance exists - check if ever participated
+    instance_data = get_instance(stored_name)
+    if not instance_data:
+        return True  # Shouldn't happen, but defensive
+
+    # Check previously_enabled flag
+    if not instance_data.get('previously_enabled', False):
+        return True  # Never participated = skip
+
+    return False  # Participated before = run hook
 
 
 def handle_hook(hook_type: str) -> None:
@@ -98,8 +104,9 @@ def handle_hook(hook_type: str) -> None:
 
             # Skip exited instances - frozen until restart
             status = instance_data.get('status')
-            if status == 'exited':
-                # Exception: Allow Stop hook to run when re-enabled (transitions back to 'waiting')
+            status_context = instance_data.get('status_context', '')
+            if status == 'inactive' and status_context.startswith('exit:'):
+                # Exception: Allow Stop hook to run when re-enabled (transitions back to 'idle')
                 if not (hook_type == 'poll' and instance_data.get('enabled', False)):
                     sys.exit(0)
 

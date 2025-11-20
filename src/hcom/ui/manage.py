@@ -24,7 +24,7 @@ from .input import (
 # Import from shared
 from ..shared import (
     RESET, BOLD, DIM,
-    FG_WHITE, FG_GRAY, FG_YELLOW, FG_LIGHTGRAY, FG_ORANGE, FG_GOLD,
+    FG_WHITE, FG_GRAY, FG_YELLOW, FG_LIGHTGRAY, FG_ORANGE, FG_GOLD, FG_CYAN,
     BG_CHARCOAL, BG_GRAY,
     STATUS_MAP, STATUS_FG,
 )
@@ -128,6 +128,11 @@ class ManageScreen:
                 _, icon = STATUS_MAP.get(status, (BG_GRAY, '?'))
                 color = STATUS_FG.get(status, FG_WHITE)
 
+                # Cyan coloring for delivered messages (active with deliver token)
+                status_context = info.get('data', {}).get('status_context', '')
+                if status == 'active' and status_context.startswith('deliver:'):
+                    color = FG_CYAN
+
                 # Always show description if non-empty
                 display_text = info.get('description', '')
 
@@ -148,7 +153,7 @@ class ManageScreen:
 
                 # Timeout warning indicator
                 timeout_marker = ""
-                if enabled and status == "waiting":
+                if enabled and status == "idle":
                     age_seconds = info.get('age_seconds', 0)
                     data = info.get('data', {})
                     is_subagent = bool(data.get('parent_session_id'))
@@ -242,8 +247,21 @@ class ManageScreen:
         # Separator
         lines.append(f"{FG_GRAY}{'─' * width}{RESET}")
 
+        # Instance detail section (if active) - render ABOVE messages
+        detail_rows = 0
+        if self.state.show_instance_detail:
+            detail_lines = self.build_instance_detail(self.state.show_instance_detail, width)
+            lines.extend(detail_lines)
+            detail_rows = len(detail_lines)
+            # Separator after detail
+            lines.append(f"{FG_GRAY}{'─' * width}{RESET}")
+            detail_rows += 1  # Include separator in count
+
+        # Calculate remaining message rows (subtract detail from message budget)
+        actual_message_rows = message_rows - detail_rows
+
         # Messages - Slack-style format with sender on separate line
-        if self.state.messages:
+        if self.state.messages and actual_message_rows > 0:
             all_wrapped_lines = []
 
             # Get instance read positions for read receipt calculation
@@ -336,7 +354,7 @@ class ManageScreen:
                 all_wrapped_lines.append('')
 
             # Take last N lines to fit available space (mid-message truncation)
-            visible_lines = all_wrapped_lines[-message_rows:] if len(all_wrapped_lines) > message_rows else all_wrapped_lines
+            visible_lines = all_wrapped_lines[-actual_message_rows:] if len(all_wrapped_lines) > actual_message_rows else all_wrapped_lines
             lines.extend(visible_lines)
         else:
             # ASCII art logo
@@ -346,25 +364,32 @@ class ManageScreen:
             lines.append(f"{FG_ORANGE}     ╠═╣║  ║ ║║║║{RESET}")
             lines.append(f"{FG_ORANGE}     ╩ ╩╚═╝╚═╝╩ ╩{RESET}")
 
-        # Pad messages
-        while len(lines) < instance_rows + message_rows + 1:  # +1 for separator
+        # Calculate how many lines are used before input (instances + detail + messages + separators)
+        lines_before_input = len(lines)
+
+        # Reserve space for input at bottom: input_rows + 2 separators (before + after)
+        input_section_height = input_rows + 2
+        max_lines_before_input = height - input_section_height
+
+        # Truncate message/detail area if it overflows, keeping input visible
+        if lines_before_input > max_lines_before_input:
+            lines = lines[:max_lines_before_input]
+
+        # Pad to fill space before input
+        while len(lines) < max_lines_before_input:
             lines.append('')
 
         # Separator before input
         lines.append(f"{FG_GRAY}{'─' * width}{RESET}")
 
-        # Input area (auto-wrapped)
+        # Input area (auto-wrapped) - at bottom, always visible
         input_lines = self.render_wrapped_input(width, input_rows)
         lines.extend(input_lines)
 
-        # Separator after input (before footer)
+        # Separator after input
         lines.append(f"{FG_GRAY}{'─' * width}{RESET}")
 
-        # Pad to fill height
-        while len(lines) < height:
-            lines.append('')
-
-        return lines[:height]
+        return lines
 
 
     def handle_key(self, key: str):
@@ -382,6 +407,7 @@ class ManageScreen:
                 if self.state.cursor < len(sorted_instances):
                     self.state.cursor_instance_name = sorted_instances[self.state.cursor][0]
                 self.tui.clear_all_pending_confirmations()
+                self.state.show_instance_detail = None  # Hide detail on cursor move
                 self.sync_scroll_to_cursor()
         elif key == 'DOWN':
             if sorted_instances and self.state.cursor < len(sorted_instances) - 1:
@@ -390,6 +416,7 @@ class ManageScreen:
                 if self.state.cursor < len(sorted_instances):
                     self.state.cursor_instance_name = sorted_instances[self.state.cursor][0]
                 self.tui.clear_all_pending_confirmations()
+                self.state.show_instance_detail = None  # Hide detail on cursor move
                 self.sync_scroll_to_cursor()
         elif key == '@':
             self.tui.clear_all_pending_confirmations()
@@ -416,12 +443,11 @@ class ManageScreen:
             # Move cursor right in message buffer
             self.state.message_cursor_pos = text_input_move_right(self.state.message_buffer, self.state.message_cursor_pos)
         elif key == 'ESC':
-            # Clear message buffer first, then cancel all pending confirmations
-            if self.state.message_buffer:
-                self.state.message_buffer = ""
-                self.state.message_cursor_pos = 0
-            else:
-                self.tui.clear_all_pending_confirmations()
+            # Clear everything: message buffer, detail view, and confirmations
+            self.state.message_buffer = ""
+            self.state.message_cursor_pos = 0
+            self.state.show_instance_detail = None
+            self.tui.clear_all_pending_confirmations()
         elif key == 'BACKSPACE':
             self.tui.clear_all_pending_confirmations()
             # Delete character before cursor in message buffer
@@ -460,6 +486,11 @@ class ManageScreen:
                 status = info.get('status', "unknown")
                 color = STATUS_FG.get(status, FG_WHITE)
 
+                # Cyan coloring for delivered messages (active with deliver token)
+                status_context = info.get('data', {}).get('status_context', '')
+                if status == 'active' and status_context.startswith('deliver:'):
+                    color = FG_CYAN
+
                 # Check if confirming previous toggle
                 if self.state.pending_toggle == name and (time.time() - self.state.pending_toggle_time) <= self.tui.CONFIRMATION_TIMEOUT:
                     # Execute toggle (confirmation received)
@@ -480,12 +511,14 @@ class ManageScreen:
                     finally:
                         self.state.pending_toggle = None
                 else:
-                    # Show confirmation (first press) - 10s duration
+                    # Show confirmation (first press) + show detail view
                     self.state.pending_toggle = name
                     self.state.pending_toggle_time = time.time()
+                    self.state.show_instance_detail = name  # Also show detail
                     # Name with status color, action is plain text (no color clash)
                     name_colored = f"{color}{name}{FG_WHITE}"
-                    self.tui.flash(f"Confirm {action} {name_colored}? (press Enter again)", duration=self.tui.CONFIRMATION_FLASH_DURATION, color='white')
+                    # Persistent flash (no auto-timeout) - cleared manually like detail view
+                    self.tui.flash(f"Confirm {action} {name_colored}? (press Enter again)", duration=999999, color='white')
 
         elif key == 'CTRL_A':
             # Check state before clearing
@@ -574,3 +607,89 @@ class ManageScreen:
             input_rows,
             prefix="> "
         )
+
+    def build_instance_detail(self, name: str, width: int) -> List[str]:
+        """Build instance metadata display (similar to hcom list --verbose)"""
+        import os
+        import time
+        from ..core.instances import is_external_sender
+
+        lines = []
+
+        # Get instance data
+        if name not in self.state.instances:
+            return [f"{FG_GRAY}Instance not found{RESET}"]
+
+        info = self.state.instances[name]
+        data = info['data']
+
+        # Get status color for name (same as flash message)
+        status = info.get('status', "unknown")
+        color = STATUS_FG.get(status, FG_WHITE)
+
+        # Cyan coloring for delivered messages (active with deliver token)
+        status_context = data.get('status_context', '')
+        if status == 'active' and status_context.startswith('deliver:'):
+            color = FG_CYAN
+
+        # Header: bold colored name (badges already shown in instance list)
+        header = f"{BOLD}{color}{name}{RESET}"
+        lines.append(truncate_ansi(header, width))
+
+        # Format fields
+        session_id = data.get("session_id") or "None"
+        directory = data.get("directory") or "(none)"
+        timeout = data.get("wait_timeout", 1800)
+        parent = data.get("parent_name") or None
+
+        # Format paths (shorten with ~)
+        if directory != "(none)":
+            directory = directory.replace(os.path.expanduser("~"), "~")
+
+        log_file = data.get("background_log_file")
+        if log_file:
+            log_file = log_file.replace(os.path.expanduser("~"), "~")
+
+        transcript = data.get("transcript_path")
+        if transcript:
+            transcript = transcript.replace(os.path.expanduser("~"), "~")
+        else:
+            transcript = "(none)"
+
+        # Format created_at timestamp
+        created_ts = data.get("created_at")
+        if created_ts:
+            created_seconds = time.time() - created_ts
+            if created_seconds < 60:
+                created = f"{int(created_seconds)}s ago"
+            elif created_seconds < 3600:
+                created = f"{int(created_seconds / 60)}m ago"
+            elif created_seconds < 86400:
+                created = f"{int(created_seconds / 3600)}h ago"
+            else:
+                created = f"{int(created_seconds / 86400)}d ago"
+        else:
+            created = "(unknown)"
+
+        # Format tcp_mode
+        tcp = "instant" if data.get("tcp_mode") else "polling"
+
+        # Build detail lines (truncated to terminal width)
+        lines.append(truncate_ansi(f"  session_id:   {session_id}", width))
+        lines.append(truncate_ansi(f"  created:      {created}", width))
+        lines.append(truncate_ansi(f"  directory:    {directory}", width))
+        lines.append(truncate_ansi(f"  timeout:      {timeout}s", width))
+
+        if parent:
+            agent_id = data.get("agent_id") or "(none)"
+            lines.append(truncate_ansi(f"  parent:       {parent}", width))
+            lines.append(truncate_ansi(f"  agent_id:     {agent_id}", width))
+
+        lines.append(truncate_ansi(f"  tcp_mode:     {tcp}", width))
+
+        if log_file:
+            lines.append(truncate_ansi(f"  headless log: {log_file}", width))
+
+        lines.append(truncate_ansi(f"  transcript:   {transcript}", width))
+
+        return lines

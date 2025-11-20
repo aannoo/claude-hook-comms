@@ -3,10 +3,18 @@ from __future__ import annotations
 import os
 import sys
 import select
+import re
+import unicodedata
 from typing import Optional, List
 
 # Platform detection
 IS_WINDOWS = os.name == 'nt'
+
+# ANSI escape code pattern (for stripping from pasted input)
+ANSI_RE = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
+
+# Import ANSI-aware utilities from rendering module
+from .rendering import ansi_len
 
 # Import platform-specific modules conditionally
 if IS_WINDOWS:
@@ -23,6 +31,45 @@ from ..shared import (
 
 # Constants
 MAX_INPUT_ROWS = 8  # Cap input area at N rows
+
+
+def slice_by_visual_width(text: str, max_width: int) -> tuple[str, int]:
+    """Slice text to fit within visual width, accounting for wide chars and ANSI codes.
+
+    Returns: (chunk_text, chars_consumed)
+    """
+    visual_width = 0
+    char_pos = 0
+
+    while char_pos < len(text) and visual_width < max_width:
+        # Skip ANSI codes (preserve them but don't count their width)
+        if char_pos < len(text) and text[char_pos:char_pos+1] == '\x1b':
+            match = ANSI_RE.match(text, char_pos)
+            if match:
+                char_pos = match.end()
+                continue
+
+        if char_pos >= len(text):
+            break
+
+        # Check character width
+        char = text[char_pos]
+        ea_width = unicodedata.east_asian_width(char)
+        if ea_width in ('F', 'W'):  # Fullwidth or Wide
+            char_width = 2
+        elif ea_width in ('Na', 'H', 'N', 'A'):  # Narrow, Half-width, Neutral, Ambiguous
+            char_width = 1
+        else:  # Zero-width characters (combining marks, etc.)
+            char_width = 0
+
+        # Check if it fits
+        if visual_width + char_width <= max_width:
+            visual_width += char_width
+            char_pos += 1
+        else:
+            break  # No more space
+
+    return text[:char_pos], char_pos
 
 
 class KeyboardInput:
@@ -141,8 +188,10 @@ class KeyboardInput:
 
 def text_input_insert(buffer: str, cursor: int, text: str) -> tuple[str, int]:
     """Insert text at cursor position, return (new_buffer, new_cursor)"""
-    new_buffer = buffer[:cursor] + text + buffer[cursor:]
-    new_cursor = cursor + len(text)
+    # Strip ANSI codes from pasted text (prevents cursor/layout issues)
+    clean_text = ANSI_RE.sub('', text)
+    new_buffer = buffer[:cursor] + clean_text + buffer[cursor:]
+    new_cursor = cursor + len(clean_text)
     return new_buffer, new_cursor
 
 def text_input_backspace(buffer: str, cursor: int) -> tuple[str, int]:
@@ -176,7 +225,8 @@ def calculate_text_input_rows(text: str, width: int, max_rows: int = MAX_INPUT_R
         if not line:
             total_rows += 1
         else:
-            total_rows += max(1, (len(line) + width - 1) // width)
+            # Use visual width (accounts for wide chars and ANSI codes)
+            total_rows += max(1, (ansi_len(line) + width - 1) // width)
     return min(total_rows, max_rows)
 
 
@@ -225,11 +275,17 @@ def render_text_input(buffer: str, cursor: int, width: int, max_rows: int, prefi
             line_prefix = prefix if line_idx == 0 else " " * len(prefix)
             wrapped.append(f"{FG_WHITE}{line_prefix}{RESET}")
         else:
-            # Wrap long lines
-            for chunk_idx in range(0, len(line), line_width):
-                chunk = line[chunk_idx:chunk_idx+line_width]
-                line_prefix = prefix if line_idx == 0 and chunk_idx == 0 else " " * len(prefix)
+            # Wrap long lines by visual width (handles wide chars and ANSI codes)
+            char_offset = 0
+            is_first_chunk = True
+            while char_offset < len(line):
+                chunk, consumed = slice_by_visual_width(line[char_offset:], line_width)
+                if not consumed:  # Safety: avoid infinite loop
+                    break
+                line_prefix = prefix if line_idx == 0 and is_first_chunk else " " * len(prefix)
                 wrapped.append(f"{FG_WHITE}{line_prefix}{RESET}{FG_WHITE}{chunk}{RESET}")
+                char_offset += consumed
+                is_first_chunk = False
 
     # Pad or truncate to max_rows
     result = wrapped + [''] * max(0, max_rows - len(wrapped))
